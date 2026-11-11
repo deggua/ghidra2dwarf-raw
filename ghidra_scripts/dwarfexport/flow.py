@@ -214,6 +214,21 @@ class FunctionFlow(object):
             return (t, value[1], key)
         return None
 
+    def _narrow(self, value, size):
+        """Value id of the low-order `size` bytes of `value`."""
+        if value is None or size <= 0:
+            return None
+        t = value[0]
+        key = value[1] if t == INIT else (value[2] if t in (DEF, PHI) else None)
+        if t == CONST:
+            return (CONST, value[1] & ((1 << (8 * size)) - 1), size)
+        if not (isinstance(key, tuple) and len(key) == 2 and isinstance(key[0], int)):
+            return None
+        if size >= key[1]:
+            return value
+        lo = key[0] + (key[1] - size if self.m.big_endian else 0)
+        return self._rekey(value, (lo, size))
+
     def reg_value(self, st, key):
         if key in st.regs:
             return st.regs[key]
@@ -225,7 +240,9 @@ class FunctionFlow(object):
                 v = st.regs[rk]
                 if (v is not None and rk[0] <= key[0] and key[0] + key[1] <= rk[0] + rk[1]
                         and self._is_low_part(key, rk)):
-                    return self._rekey(v, key)
+                    # the low part of the *value's* origin (v0 = copy of a0:
+                    # v0's low half holds a0's low half)
+                    return self._narrow(v, key[1])
                 return None
         return self.default(key)
 
@@ -277,7 +294,9 @@ class FunctionFlow(object):
         # "addi rD,rS,0", "ori rD,rS,0", ...).
         if opc in (PcodeOp.INT_OR, PcodeOp.INT_AND) and a == b:
             return a
-        if opc in (PcodeOp.INT_OR, PcodeOp.INT_XOR, PcodeOp.INT_ADD, PcodeOp.INT_SUB):
+        if opc in (PcodeOp.INT_OR, PcodeOp.INT_XOR, PcodeOp.INT_ADD, PcodeOp.INT_SUB,
+                   PcodeOp.INT_LEFT, PcodeOp.INT_RIGHT, PcodeOp.INT_SRIGHT):
+            # x op 0 == x (MIPS64 canonicalizes 32-bit values with "sll v,v,0")
             if b[0] == CONST and b[1] == 0:
                 return a
             if a[0] == CONST and a[1] == 0 and opc != PcodeOp.INT_SUB:
@@ -295,7 +314,8 @@ class FunctionFlow(object):
         return None
 
     # -- transfer function ---------------------------------------------------------
-    _ARITH = (PcodeOp.INT_ADD, PcodeOp.INT_SUB, PcodeOp.INT_OR, PcodeOp.INT_AND, PcodeOp.INT_XOR)
+    _ARITH = (PcodeOp.INT_ADD, PcodeOp.INT_SUB, PcodeOp.INT_OR, PcodeOp.INT_AND, PcodeOp.INT_XOR,
+              PcodeOp.INT_LEFT, PcodeOp.INT_RIGHT, PcodeOp.INT_SRIGHT)
 
     def step(self, st, off):
         """Applies the instruction at offset ``off`` to ``st`` in place."""
@@ -331,6 +351,10 @@ class FunctionFlow(object):
                     slot = st.mem.get(addr[1])
                     if slot is not None and len(out) > 2 and slot[0] == out[2]:
                         val = slot[1]
+            elif opc == PcodeOp.SUBPIECE and i1 is not None and i1[0] == "c" and i1[1] == 0:
+                # Low-order bytes of a value (e.g. MIPS64 "sw a0,.." stores
+                # the 32-bit low part of the 64-bit a0): same origin, narrower.
+                val = self._narrow(self._get(st, i0), out[2] if len(out) > 2 else 0)
             elif opc in (PcodeOp.INT_ZEXT, PcodeOp.INT_SEXT) and out[0] == "r" and i0[0] in "ru":
                 # Widening writes (x86-64 "mov ebx, edi" is RBX = zext(EBX),
                 # MIPS64/PPC64 32-bit ops sign-extend): the wide register gets
@@ -492,16 +516,19 @@ class FunctionFlow(object):
                         work.append(k)
 
         # Delay slots (MIPS, SPARC, ...): Ghidra folds the slot instruction's
-        # p-code into the branch, so the slot is never stepped on its own. A
-        # PC inside the slot (e.g. a caller frame's "return address - 1" on
-        # MIPS) sees the machine as it was before the branch.
+        # p-code into the branch, so the slot is never stepped on its own.
+        # PCs inside a slot are almost only seen as a caller frame's
+        # "return address - 1", i.e. after the slot (and the call) took
+        # effect: use the branch's out-state ("jal f; addiu s0,s0,1" means
+        # s0 no longer holds the old value while f runs).
         for i, o in enumerate(self.insns):
             depth = self.decoded[o][3]
             if depth and o in self.state_in:
+                after = self.state_out.get(o, self.state_in[o])
                 for ds in self.insns[i + 1:i + 1 + depth]:
                     if ds not in self.state_in:
-                        self.state_in[ds] = self.state_in[o]
-                        self.state_out[ds] = self.state_in[o]
+                        self.state_in[ds] = after
+                        self.state_out[ds] = after
 
     # -- prologue ---------------------------------------------------------------
     def _is_prologue_insn(self, ins, st_in):
@@ -654,12 +681,45 @@ class CfiGenerator(object):
                         break
         if cfa is None:
             return None
+        # Derive the save rules from the state at this PC: a call-preserved
+        # register (or the return address register) that no longer holds its
+        # entry value is recoverable from a stack slot holding that value.
+        # (Bookkeeping "saved"/"restored" events is wrong when a reload and a
+        # later clobber meet at a join, e.g. MIPS loops reloading ra in a
+        # delay slot and calling again.)
+        slots = {}
+        for o, (size, v) in st.mem.items():
+            if v is not None and v[0] == INIT and v[1] not in slots:
+                slots[v[1]] = (o, size)
         saved = {}
-        for k, off in st.saved.items():
+        for k in self._tracked_regs():
             num = m.dwarf_of(k)
-            if num is not None:
-                saved[num] = off - m.stackshift
+            if num is None or k == m.sp_key:
+                continue
+            slot = slots.get(k)
+            if slot is not None and slot[1] != k[1]:
+                slot = None
+            holds_entry = flow.reg_value(st, k) == (INIT, k)
+            if k == m.ra_key:
+                # Calls clobber the return address register, and GDB looks
+                # up a caller frame's rules inside its call instruction: use
+                # the save slot whenever there is one.
+                if slot is not None:
+                    saved[num] = slot[0] - m.stackshift
+            elif not holds_entry and slot is not None:
+                # Callee-saved registers survive calls; only once clobbered
+                # is the slot the place to find them.
+                saved[num] = slot[0] - m.stackshift
         return cfa[0], cfa[1], saved
+
+    def _tracked_regs(self):
+        if not hasattr(self, "_tracked"):
+            m = self.m
+            keys = [k for k in m.unaffected if m.dwarf_of(k) is not None]
+            if m.ra_key is not None:
+                keys.append(m.ra_key)
+            self._tracked = sorted(set(keys))
+        return self._tracked
 
     @staticmethod
     def _encode(prev, cur):

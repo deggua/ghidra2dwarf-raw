@@ -522,12 +522,20 @@ class Exporter(object):
         return addr is not None and addr.getAddressSpace().equals(self.space)
 
     def insn_end(self, addr):
-        """Offset just past the instruction containing addr."""
+        """Offset just past the instruction containing addr (and past its
+        delay slot(s), which execute with it)."""
         off = int(addr.getOffset())
         end = self._insn_end_cache.get(off)
         if end is None:
             ins = self.listing.getInstructionContaining(addr)
             end = int(ins.getMaxAddress().getOffset()) + 1 if ins is not None else off + 1
+            depth = ins.getDelaySlotDepth() if ins is not None else 0
+            while depth > 0 and ins is not None:
+                ins = ins.getNext()
+                if ins is None:
+                    break
+                end = int(ins.getMaxAddress().getOffset()) + 1
+                depth -= 1
             self._insn_end_cache[off] = end
         return end
 
@@ -1384,7 +1392,17 @@ class _FunctionContext(object):
         same = [k for opc, k in cands if opc == d.getOpcode()]
         keys = same or [k for _, k in cands]
         keys = list(dict.fromkeys(keys))
-        return keys[-1] if len(keys) == 1 or same else None
+        if keys:
+            return keys[-1] if len(keys) == 1 or same else None
+        # A 32-bit result written to a 64-bit register (AArch64 "add w0,.."
+        # is X0 = zext(..), MIPS64/PPC64 sign-extend): the low part.
+        wide = list(dict.fromkeys((out[1], out[2]) for opc, out, _, _, _ in dec[5]
+                                  if out is not None and out[0] == "r" and out[2] > size
+                                  and self.exp.machine.dwarf_of((out[1], out[2])) is not None))
+        if len(wide) != 1:
+            return None
+        off_, sz = wide[0]
+        return (off_ + (sz - size if self.exp.big_endian else 0), size)
 
     def instance_value(self, vn):
         """FunctionFlow value id of a register varnode instance, or None."""
@@ -1530,6 +1548,35 @@ class _FunctionContext(object):
                     result.setdefault(cur, []).append(pc)
         return result
 
+    def _unused_param_location(self, sym, storage):
+        """A parameter the decompiled code never reads (it may use the raw
+        register under another name, e.g. MIPS64 "in_a0" for the 64-bit a0
+        when the parameter is its 32-bit low part): show it wherever its
+        entry value still physically exists."""
+        if (self.flow is None or not sym.isParameter() or storage is None
+                or storage.isBadStorage() or storage.isUnassignedStorage()):
+            return None
+        vns = list(storage.getVarnodes())
+        pcs = list(self.flow.insns)
+        if len(vns) == 1 and vns[0].isRegister():
+            key = (int(vns[0].getOffset()), int(vns[0].getSize()))
+            entries = self.located_pcs(vns[0], self.flow.default(key), pcs)
+        elif all(v.isRegister() for v in vns):
+            entries = self.compound_input_pcs(storage, pcs)
+        else:
+            return None
+        if not entries:
+            return None
+        A = self.exp.A
+        merged = []
+        for st_, en, e in sorted(entries, key=lambda x: (x[2], x[0])):
+            if merged and merged[-1][2] == e and st_ <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(en, merged[-1][1]), e)
+            else:
+                merged.append((st_, en, e))
+        merged.sort(key=lambda x: x[0])
+        return ("list", [(A(a), A(a) + (b - a), e) for a, b, e in merged])
+
     def compound_input_pcs(self, storage, pcs):
         """Spans where every register piece of an input still holds its
         entry value (a torn 64-bit value is worse than <optimized out>)."""
@@ -1563,7 +1610,7 @@ class _FunctionContext(object):
 
         hv = sym.getHighVariable()
         if hv is None:
-            return None
+            return self._unused_param_location(sym, storage)
         entries = []
         whole = [(lo, hi) for lo, hi in self.ranges]
         instances = list(hv.getInstances())
@@ -1614,7 +1661,7 @@ class _FunctionContext(object):
                 continue
             entries.extend((s, t, e) for s, t in spans if t > s)
         if not entries:
-            return None
+            return self._unused_param_location(sym, storage)
 
         # Merge overlapping/adjacent spans that share a location.
         entries.sort(key=lambda x: (x[2], x[0]))

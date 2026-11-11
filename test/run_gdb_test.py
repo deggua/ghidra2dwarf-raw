@@ -59,10 +59,18 @@ def fp_probe(build):
     Some don't (x86-64 user mode misnumbers xmm registers, MIPS o32 doubles
     in FPR pairs and AArch64 big-endian vector registers read as 0); there
     the checks verify our locations instead of the values. Cached per build."""
-    cache = os.path.join(build, "fp_probe.json")
+    # Probe with an -O1 reference build: at -O0 GCC keeps arguments in stack
+    # slots, which would hide unreadable FP registers.
+    with open(os.path.join(build, "layout.json")) as f:
+        target = json.load(f)["target"]
+    probe_build = os.path.join(os.path.dirname(os.path.abspath(build)), "fpprobe-" + target)
+    cache = os.path.join(probe_build, "fp_probe.json")
     if os.path.exists(cache):
         with open(cache) as f:
             return json.load(f)
+    import build_fw
+    build_fw.build(target, "O1", probe_build)
+    build = probe_build
     port = free_port()
     cmd = qemu_command(build, port)
     qemu = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
