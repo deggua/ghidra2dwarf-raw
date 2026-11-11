@@ -41,9 +41,9 @@ TARGETS = {
                 lang="PowerPC:BE:32:default"),
     "ppc64be": _t(cross="powerpc64-linux-gnu-", isa="ppc64", base=BASE64,
                   cflags=["-mabi=elfv2", "-mcmodel=medium"], asflags=["-mabi=elfv2"],
-                  lang="PowerPC:BE:64:default", qemu="qemu-ppc64"),
+                  lang="PowerPC:BE:64:A2ALT", qemu="qemu-ppc64"),
     "ppc64le": _t(cross="powerpc64le-linux-gnu-", isa="ppc64", base=BASE64,
-                  cflags=["-mcmodel=medium"], lang="PowerPC:LE:64:default", qemu="qemu-ppc64le"),
+                  cflags=["-mcmodel=medium"], lang="PowerPC:LE:64:A2ALT", qemu="qemu-ppc64le"),
     # --- MIPS ----------------------------------------------------------------------
     "mips32be": _t(cross="mips-linux-gnu-", isa="mips", base=BASE32,
                    cflags=["-mno-abicalls", "-G0", "-march=mips32r2"], asflags=["-mno-abicalls", "-fno-pic", "-march=mips32r2"],

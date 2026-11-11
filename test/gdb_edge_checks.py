@@ -41,7 +41,7 @@ BAD = N("bad?func", "bad_func")
 LOC = N("loc?", "loc_")
 
 
-def vector_regs_misread(var, expected):
+def _unused_vector_regs_misread(var, expected):
     """True if GDB reads `var` wrong although its location is an x86 xmm
     register that does hold the expected value (GDB numbers QEMU user-mode's
     x86-64 registers differently from its DWARF register mapping)."""
@@ -99,16 +99,22 @@ def main():
 
     # --- float / double args and return ----------------------------------------
     cont_to("mix")
-    if vector_regs_misread("a", 1.5):
-        print("SKIP float/double args: GDB misnumbers vector registers over this QEMU stub "
-              "(GCC's own DWARF reads the same wrong register); location verified instead")
-        check("float arg location", "$xmm0" in run("info address a"), run("info address a"))
-        check("double arg location", "$xmm1" in run("info address b"), run("info address b"))
-    else:
+    check_eq("int arg", "c", 3)
+    if os.environ.get("FP_ARGS_OK", "1") == "1":
         check_eq("float arg in FPR", "a", 1.5)
         check_eq("double arg in FPR", "b", 2.25)
-        check_eq("int arg", "c", 3)
+    else:
+        # GCC's own debug info reads these wrong too in this GDB+QEMU setup
+        # (see run_gdb_test.fp_probe): check that we point at FP registers.
+        print("SKIP float/double arg values (unreadable in this GDB+QEMU setup even with GCC's DWARF)")
+        for v in ("a", "b"):
+            where = run("info address %s" % v)
+            check("%s located in an FP/vector register" % v,
+                  re.search(r"\$(f|d|s|v|q|xmm)\d+", where) is not None, where)
+    if os.environ.get("FP_RET_OK", "1") == "1":
         check_finish("finish returns double", 6.375)
+    else:
+        print("SKIP finish double (unreadable in this GDB+QEMU setup even with GCC's DWARF)")
 
     # --- renamed locals, stack array -----------------------------------------
     start = line_of(r"^int edge_locals\(")
@@ -151,7 +157,8 @@ def main():
     pc_var = re.search(r"(pcVar\d+)", func_text("call_ptr")).group(1)
     out = run("ptype %s" % pc_var)
     check("code * is a function pointer", "(" in out and "*" in out, out)
-    check_eq("code * value", "(unsigned long)%s == (unsigned long)&split_func" % pc_var, 1)
+    # (| 1: Thumb code pointers carry the Thumb bit, GDB's &func does not)
+    check_eq("code * value", "((unsigned long)%s | 1) == ((unsigned long)&split_func | 1)" % pc_var, 1)
     check_finish("finish call_ptr", 16)
 
     # --- custom storage -------------------------------------------------------------
@@ -210,7 +217,8 @@ def main():
         check("label without type is untyped", "unknown type" in str(e), str(e))
     check_eq("label without type, cast", "*(int *)&%s" % Q(UNTYPED), 0x1234)
     check_eq("int64", "g_i64", -5)
-    check_eq("function pointer array", "g_filters[1] == filter_offset", 1)
+    check_eq("function pointer array",
+             "((unsigned long)g_filters[1] | 1) == ((unsigned long)&filter_offset | 1)", 1)
     check_eq("bitfield a", "g_bits.a", 21)
     check_eq("bitfield b (crosses byte)", "g_bits.b", 99)
     check_eq("bitfield c", "g_bits.c", 9)

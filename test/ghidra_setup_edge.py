@@ -56,6 +56,8 @@ def find_type(name):
 
 
 def set_type(gname, dt):
+    a = A(gname)
+    listing.clearCodeUnits(a, a.add(max(dt.getLength(), SYMS[gname][1], 1) - 1), False)
     DataUtilities.createData(prog, A(gname), dt, -1, DataUtilities.ClearDataMode.CLEAR_ALL_CONFLICT_DATA)
 
 
@@ -240,8 +242,13 @@ report("custom storage: bitfield struct in a register", custom_bitfield_param)
 
 def custom_pair_param():
     f = fm.getFunctionAt(A("sum_pair"))
-    vns = storage_of(f, 0) + storage_of(f, 1)
-    st = VariableStorage(prog, ordered(vns))
+    a, b = storage_of(f, 0), storage_of(f, 1)
+    if (len(a) == 1 and len(b) == 1 and a[0].getAddress().isStackAddress()
+            and b[0].getAddress().isStackAddress() and b[0].getOffset() == a[0].getOffset() + 4):
+        # both halves on the stack (i386): one 8-byte stack varnode
+        st = VariableStorage(prog, a[0].getAddress(), 8)
+    else:
+        st = VariableStorage(prog, ordered(a + b))
     set_custom(f, [ParameterImpl("pt", find_type("point"), st, prog)])
 report("custom storage: struct split over two registers", custom_pair_param)
 

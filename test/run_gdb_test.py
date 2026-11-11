@@ -41,9 +41,59 @@ def qemu_command(build, port):
     return [t["qemu"]] + t["qemu_args"] + ["-g", str(port), os.path.join(build, "fw.elf")]
 
 
-def run(build, elf, csrc, checks=None, sanitized=False, timeout=300):
+FP_PROBE = """
+set pagination off
+set confirm off
+break mix
+continue
+printf "PROBE_ARGS %d\\n", a == 1.5 && b == 2.25
+finish
+printf "PROBE_RET %d\\n", $ == 6.375
+kill
+"""
+
+
+def fp_probe(build):
+    """Do float/double arguments and return values read correctly in this
+    GDB + QEMU combination *with GCC's own debug info* (the reference ELF)?
+    Some don't (x86-64 user mode misnumbers xmm registers, MIPS o32 doubles
+    in FPR pairs and AArch64 big-endian vector registers read as 0); there
+    the checks verify our locations instead of the values. Cached per build."""
+    cache = os.path.join(build, "fp_probe.json")
+    if os.path.exists(cache):
+        with open(cache) as f:
+            return json.load(f)
+    port = free_port()
+    cmd = qemu_command(build, port)
+    qemu = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    script = os.path.join(build, "fp_probe.gdb")
+    with open(script, "w") as f:
+        f.write(FP_PROBE)
+    try:
+        if cmd[0].startswith("qemu-system"):
+            time.sleep(0.5)
+        r = subprocess.run(["gdb-multiarch", "-q", "-nx", "-batch",
+                            "-ex", "set exec-file-mismatch off",
+                            "-ex", "file " + os.path.join(build, "fw.elf"),
+                            "-ex", "set tcp auto-retry on", "-ex", "set tcp connect-timeout 20",
+                            "-ex", "target remote :%d" % port, "-x", script],
+                           capture_output=True, text=True, timeout=120)
+        out = r.stdout + r.stderr
+    except subprocess.TimeoutExpired:
+        out = ""
+    finally:
+        qemu.kill()
+        qemu.wait()
+    res = {"args": "PROBE_ARGS 1" in out, "ret": "PROBE_RET 1" in out}
+    with open(cache, "w") as f:
+        json.dump(res, f)
+    return res
+
+
+def run(build, elf, csrc, checks=None, sanitized=False, timeout=180):
     """Returns (ok, output lines of interest, full output)."""
     checks = checks or os.path.join(HERE, "gdb_checks.py")
+    probe = fp_probe(build)
     port = free_port()
     cmd = qemu_command(build, port)
     qemu = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -60,6 +110,7 @@ def run(build, elf, csrc, checks=None, sanitized=False, timeout=300):
                     time.sleep(0.1)
         env = dict(os.environ, ELF=os.path.abspath(elf), CSRC=os.path.abspath(csrc),
                    QEMU_PORT=str(port), SANITIZED="1" if sanitized else "0",
+                   FP_ARGS_OK="1" if probe["args"] else "0", FP_RET_OK="1" if probe["ret"] else "0",
                    PYTHONIOENCODING="utf-8")
         try:
             r = subprocess.run(["gdb-multiarch", "-q", "-nx", "-batch", "-x", os.path.abspath(checks)],

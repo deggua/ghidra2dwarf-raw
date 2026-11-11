@@ -29,7 +29,7 @@ def export(build, work, opts=()):
     fw = os.path.join(HERE, "firmware")
     cmd = [os.path.join(ghidra, "support", "pyghidraRun"), "-H", os.path.join(work, "project"), "fwtest",
            "-import", os.path.join(build, "fw.bin"), "-overwrite",
-           "-loader", "BinaryLoader", "-loader-baseAddr", "0x%x" % layout["base"],
+           "-loader", "BinaryLoader", "-loader-baseAddr", "0x%x" % layout["base"], "-noanalysis",
            "-processor", layout["lang"], "-cspec", layout["cspec"],
            "-postScript", os.path.join(HERE, "ghidra_setup.py"), build,
            os.path.join(fw, "fw.h"), os.path.join(fw, "edge.h"),

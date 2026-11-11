@@ -20,7 +20,8 @@ import re
 import time
 
 from java.io import StringWriter
-from ghidra.app.decompiler import DecompInterface, DecompileOptions, ClangFuncNameToken
+from ghidra.app.decompiler import (DecompInterface, DecompileOptions, ClangFuncNameToken,
+                                   ClangCommentToken)
 from ghidra.app.decompiler.component import DecompilerUtils
 from ghidra.app.util.bin.format.dwarf import DWARFRegisterMappingsManager
 from ghidra.program.database.data import PointerTypedefInspector
@@ -71,6 +72,13 @@ class Options(object):
         # only characters that cannot be quoted at all (' and control
         # characters) are replaced with '_'.
         self.sanitize_names = False
+        # (internal) split executable blocks into code/data sections, and
+        # emit GCC-style double rows at frameless function entries
+        self.split_sections = True
+        self.frameless_rows = True
+        # ELF header e_flags; -1 = derive from the language / compiler spec
+        # (ARM EABI/BE8/float ABI, MIPS ABI+ISA, PPC64 ELFv1/ELFv2).
+        self.elf_flags = -1
         # Comma-separated function names (or entry addresses) not to
         # decompile, e.g. functions that hang the decompiler. They still get
         # symbols, ranges, CFI and a one-line prototype in the .c file.
@@ -739,7 +747,15 @@ class Exporter(object):
             flow = None
         if self.cfi is not None and flow is not None:
             self.cfi.add_function(flow, ranges)
-        self.elf_symbols.append((name, self.A(entry), size, C.STT_FUNC))
+        if self._is_thumb(func.getEntryPoint()):
+            # ARM ELF: Thumb function symbols have bit 0 set, and mapping
+            # symbols ($t/$a) tell GDB the instruction set of each region.
+            self.elf_symbols.append((name, self.A(entry) | 1, size, C.STT_FUNC))
+            self.elf_symbols.append(("$t", self.A(entry), 0, C.STT_NOTYPE, 0, C.STB_LOCAL))
+        else:
+            self.elf_symbols.append((name, self.A(entry), size, C.STT_FUNC) + self._symbol_isa_bits(func))
+            if str(self.lang.getProcessor()) == "ARM":
+                self.elf_symbols.append(("$a", self.A(entry), 0, C.STT_NOTYPE, 0, C.STB_LOCAL))
 
         self.c_lines.append("")
         self.c_lines.append("/* ---- %s @ %s ---- */" % (self.nm(name), func.getEntryPoint()))
@@ -771,6 +787,8 @@ class Exporter(object):
                 for tok in cl.getAllTokens():
                     if sig_line is None and isinstance(tok, ClangFuncNameToken):
                         sig_line = gline
+                    if isinstance(tok, ClangCommentToken):
+                        continue  # "/* WARNING: ... */" comments carry addresses too
                     a = tok.getMinAddress()
                     if a is None or not self.in_space(a):
                         continue
@@ -793,7 +811,9 @@ class Exporter(object):
         # body instruction is flagged prologue_end so GDB (>= 13) places
         # "break func" there -- for frameless functions that is the entry
         # point itself, with all arguments still in their registers.
-        pe = flow.prologue_end() if flow is not None else None
+        local_entry = (self._ppc64_local_entry(func)
+                       if str(self.lang.getProcessor()) == "PowerPC" and self.addr_size == 8 else 0)
+        pe = flow.prologue_end(local_entry) if flow is not None else None
         if pe is not None:
             body_line = addr_lines.get(pe)
             if body_line is None:
@@ -813,9 +833,17 @@ class Exporter(object):
             for a, l in rows:
                 if not compact or compact[-1][1] != l or a == pe:
                     compact.append((a, l))
-            self.stats["line_rows"] += len(compact)
-            self.dw.add_sequence([(self.A(a), l, ROW_PROLOGUE_END if a == pe else 0)
-                                  for a, l in compact], self.A(lo) + (hi - lo))
+            out_rows = [(self.A(a), l, ROW_PROLOGUE_END if a == pe else 0) for a, l in compact]
+            if (self.opts.frameless_rows and pe == entry and lo == entry and out_rows
+                    and out_rows[0][1] != sig_line):
+                # Frameless function: like GCC, emit the signature line and
+                # the first statement at the same (entry) address. GDB's
+                # line-based prologue skipping (used when stepping into a
+                # function) then stops at the entry instead of running an
+                # architecture prologue analyzer over real code.
+                out_rows.insert(0, (self.A(entry), sig_line, 0))
+            self.stats["line_rows"] += len(out_rows)
+            self.dw.add_sequence(out_rows, self.A(lo) + (hi - lo))
 
     # -- variables -------------------------------------------------------------
     def _export_variables(self, func_die, func, hf, ranges, flow):
@@ -950,8 +978,97 @@ class Exporter(object):
                      "(use 'set architecture' in GDB)" % proc)
             return 0, 0
         machine = pair[1] if self.addr_size == 8 else pair[0]
-        flags = 0x05000000 if proc == "ARM" else 0  # EABI v5
-        return machine, flags
+        if self.opts.elf_flags >= 0:
+            return machine, self.opts.elf_flags
+        return machine, self._elf_flags(proc)
+
+    def _arm_attributes(self, flags):
+        """Minimal .ARM.attributes: GDB takes the float ABI (where float/double
+        arguments and return values live) from Tag_ABI_VFP_args, not e_flags."""
+        import struct
+        from .dwarf import uleb
+        end = ">" if self.big_endian else "<"
+        attrs = uleb(28) + uleb(1 if flags & 0x400 else 0)        # Tag_ABI_VFP_args
+        file_sub = bytes([1]) + struct.pack(end + "I", 5 + len(attrs)) + attrs   # Tag_File
+        vendor = b"aeabi\0" + file_sub
+        return b"A" + struct.pack(end + "I", 4 + len(vendor)) + vendor
+
+    def _is_thumb(self, addr):
+        if str(self.lang.getProcessor()) != "ARM":
+            return False
+        ctx = self.program.getProgramContext()
+        treg = ctx.getRegister("TMode")
+        if treg is None:
+            return False
+        v = ctx.getValue(treg, addr, False)
+        return v is not None and v.intValue() == 1
+
+    def _symbol_isa_bits(self, func):
+        """Extra (st_other,) for a function symbol: PPC64 ELFv2 local entry."""
+        if str(self.lang.getProcessor()) == "PowerPC" and self.addr_size == 8:
+            le = self._ppc64_local_entry(func)
+            if le:
+                return ((3 << 5),)   # STO_PPC64_LOCAL: local entry at +8
+        return ()
+
+    def _float_regs_for_args(self):
+        cc = self.program.getCompilerSpec().getDefaultCallingConvention()
+        try:
+            for st in cc.getPotentialInputRegisterStorage(self.program):
+                for vn in st.getVarnodes():
+                    reg = self.program.getRegister(vn)
+                    if reg is not None and re.match(r"^[sdf]\d+$", str(reg.getName())):
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def _elf_flags(self, proc):
+        """e_flags GDB uses to pick the ABI (it matters for return values,
+        FPU register layout and instruction byte order)."""
+        from ghidra.program.model.lang import Endian
+        desc = self.lang.getLanguageDescription()
+        if proc == "ARM":
+            flags = 0x05000000                                  # EF_ARM_EABI_VER5
+            if self.big_endian and desc.getInstructionEndian() == Endian.LITTLE:
+                flags |= 0x00800000                             # EF_ARM_BE8
+            flags |= 0x400 if self._float_regs_for_args() else 0x200   # ABI_FLOAT_HARD/SOFT
+            return flags
+        if proc == "MIPS":
+            if self.addr_size == 8:
+                return 0x80000000                               # EF_MIPS_ARCH_64R2 (n64)
+            cspec = str(self.program.getCompilerSpec().getCompilerSpecID())
+            abi = 0x3000 if "eabi" in cspec else 0x1000         # EABI32 / O32
+            return 0x70000000 | abi                             # EF_MIPS_ARCH_32R2
+        if proc == "PowerPC" and self.addr_size == 8:
+            if not self.big_endian or self._ppc64_has_global_entries():
+                return 2                                        # ELFv2
+            return 1                                            # ELFv1 (function descriptors)
+        return 0
+
+    # ELFv2 global entry: TOC setup in r2, PC-relative (addis r2,r12,..) or
+    # absolute in non-PIC code (lis r2,..), followed by addi r2,r2,..
+    _GLOBAL_ENTRY = re.compile(r"^(addis r2,r12,|lis r2,)")
+
+    def _ppc64_local_entry(self, func):
+        """ELFv2: a function starting with a two-instruction TOC setup
+        ("addis r2,r12,..; addi r2,r2,.." or "lis r2,..; addi r2,r2,..") has a
+        local entry point 8 bytes in; local calls use it, so GDB must know
+        (symbol st_other) to put breakpoints there."""
+        ins = self.listing.getInstructionAt(func.getEntryPoint())
+        if ins is None or not self._GLOBAL_ENTRY.match(str(ins)):
+            return 0
+        nxt = ins.getNext()
+        if nxt is None or not re.match(r"^(addi|subi|addic) r2,r2,", str(nxt)):
+            return 0
+        return 8
+
+    def _ppc64_has_global_entries(self):
+        if not hasattr(self, "_ppc64_ge"):
+            self._ppc64_ge = any(self._ppc64_local_entry(f) for f in
+                                 self.program.getFunctionManager().getFunctions(True)
+                                 if not f.isExternal())
+        return self._ppc64_ge
 
     def _code_ranges(self):
         """Sorted, merged [(lo, hi)] Ghidra offsets covered by function bodies."""
@@ -1006,6 +1123,9 @@ class Exporter(object):
         elf = ElfWriter(self.addr_size == 8, self.big_endian, machine, flags, entry)
 
         code = self._code_ranges()
+        # the code run holding the most function bytes becomes ".text"
+        text_lo = max(code, key=lambda r: r[1] - r[0])[0] if code else None
+        text_done = False
         for block in self.memory.getBlocks():
             start = block.getStart()
             if not block.isLoaded() or block.isOverlay() or not self.in_space(start):
@@ -1014,13 +1134,13 @@ class Exporter(object):
             lo = int(start.getOffset())
             hi = lo + int(block.getSize())
             name = str(block.getName())
-            if block.isExecute():
+            if block.isExecute() and self.opts.split_sections:
                 # GDB classifies symbols (function vs data) by the flags of
                 # their section, and raw dumps are often one RWX block: emit
                 # code and data runs as separate sections.
                 runs = self._split_runs(lo, hi, code)
             else:
-                runs = [(lo, hi, False)]
+                runs = [(lo, hi, bool(block.isExecute()))]
             data = None
             if self.opts.embed_bytes and block.isInitialized():
                 import jpype
@@ -1028,8 +1148,22 @@ class Exporter(object):
                 block.getBytes(start, buf)
                 data = memoryview(buf).cast("B").tobytes()
             for rlo, rhi, is_code in runs:
+                if not is_code and block.isExecute() and str(self.lang.getProcessor()) == "ARM":
+                    elf.add_symbol("$d", self.A(rlo), 0, C.STT_NOTYPE, C.STB_LOCAL, C.SHN_ABS)
                 sflags = base_flags | (C.SHF_EXECINSTR if is_code else 0)
-                sname = name if is_code or not block.isExecute() else name + ".data"
+                if is_code and text_lo is not None and rlo <= text_lo < rhi and not text_done:
+                    # GDB files its DWARF function symbols under the section
+                    # named ".text" (falling back to a heuristic that can pick
+                    # a data section, which breaks "list func"/"info line
+                    # func"), so the main code run must be called .text.
+                    sname = ".text"
+                    text_done = True
+                elif is_code:
+                    sname = "%s.text" % name
+                elif block.isExecute():
+                    sname = "%s.data" % name
+                else:
+                    sname = name
                 if data is not None:
                     sec = Section(sname, C.SHT_PROGBITS, sflags, self.A(rlo), data[rlo - lo:rhi - lo])
                 else:
@@ -1038,9 +1172,16 @@ class Exporter(object):
 
         for name, data in self.dw.build():
             elf.add_section(Section(name, C.SHT_PROGBITS, data=data))
+        if str(self.lang.getProcessor()) == "ARM":
+            elf.add_section(Section(".ARM.attributes", 0x70000003, data=self._arm_attributes(flags)))
 
-        for name, value, size, stype in self.elf_symbols:
-            elf.add_symbol(self.nm(name), value, size, stype, C.STB_GLOBAL, elf.section_index_for(value))
+        for sym in self.elf_symbols:
+            name, value, size, stype = sym[:4]
+            other = sym[4] if len(sym) > 4 else 0
+            bind = sym[5] if len(sym) > 5 else C.STB_GLOBAL
+            if not name.startswith("$"):
+                name = self.nm(name)
+            elf.add_symbol(name, value, size, stype, bind, elf.section_index_for(value), other)
         elf.write(self.elf_path)
 
 

@@ -198,12 +198,35 @@ class FunctionFlow(object):
             return (SP, 0)
         return (INIT, key)
 
+    def _is_low_part(self, k, c):
+        """Is register bytes k the low-order part of register c?"""
+        if self.m.big_endian:
+            return k[0] + k[1] == c[0] + c[1]
+        return k[0] == c[0]
+
+    @staticmethod
+    def _rekey(value, key):
+        """The same value id, for another (narrower or wider) view."""
+        t = value[0]
+        if t == INIT:
+            return (INIT, key)
+        if t in (DEF, PHI):
+            return (t, value[1], key)
+        return None
+
     def reg_value(self, st, key):
         if key in st.regs:
             return st.regs[key]
         for rk in st.regs:
             if rk[0] != "u" and rk[0] < key[0] + key[1] and key[0] < rk[0] + rk[1]:
-                return None  # partially overwritten
+                # Overwritten through another view. If a containing register
+                # was written, its low part has a value of the same origin
+                # (e.g. AArch64 "add w0,.." writes X0 = zext(result)).
+                v = st.regs[rk]
+                if (v is not None and rk[0] <= key[0] and key[0] + key[1] <= rk[0] + rk[1]
+                        and self._is_low_part(key, rk)):
+                    return self._rekey(v, key)
+                return None
         return self.default(key)
 
     # Varnodes are decoded once into tuples: ("c", value, size),
@@ -422,7 +445,7 @@ class FunctionFlow(object):
                     if t is not None and body.contains(t):
                         succs.append(int(t.getOffset()))
             self.decoded[o] = (bool(ft.isCall()), bool(ft.isJump()), bool(ft.isTerminal()),
-                               None, succs, ops)
+                               int(ins.getDelaySlotDepth()), succs, ops)
         self.insns.sort()
 
         init = State()
@@ -468,6 +491,18 @@ class FunctionFlow(object):
                         queued.add(k)
                         work.append(k)
 
+        # Delay slots (MIPS, SPARC, ...): Ghidra folds the slot instruction's
+        # p-code into the branch, so the slot is never stepped on its own. A
+        # PC inside the slot (e.g. a caller frame's "return address - 1" on
+        # MIPS) sees the machine as it was before the branch.
+        for i, o in enumerate(self.insns):
+            depth = self.decoded[o][3]
+            if depth and o in self.state_in:
+                for ds in self.insns[i + 1:i + 1 + depth]:
+                    if ds not in self.state_in:
+                        self.state_in[ds] = self.state_in[o]
+                        self.state_out[ds] = self.state_in[o]
+
     # -- prologue ---------------------------------------------------------------
     def _is_prologue_insn(self, ins, st_in):
         """True if the instruction only sets up the frame: adjusts SP, saves
@@ -476,7 +511,9 @@ class FunctionFlow(object):
         st = st_in.copy()
         self.step(st, int(ins.getAddress().getOffset()))
         for k in set(st.regs) | set(st_in.regs):
-            if k[0] == "u":
+            if k[0] == "u" or self.m.dwarf_of(k) is None and not self.m.containers(k):
+                # scratch / pseudo registers (ARM mult_addr, flags): not
+                # program state a debugger shows
                 continue
             before = st_in.regs[k] if k in st_in.regs else self.default(k)
             after = st.regs[k] if k in st.regs else self.default(k)
@@ -494,12 +531,13 @@ class FunctionFlow(object):
                 return False
         return True
 
-    def prologue_end(self):
+    def prologue_end(self, skip=0):
         """Offset of the first instruction after the frame setup (the entry
-        point itself for frameless functions)."""
+        point itself for frameless functions). ``skip`` bytes at the entry
+        are always prologue (e.g. the PPC64 ELFv2 global-entry TOC setup)."""
         entry = int(self.func.getEntryPoint().getOffset())
-        off = entry
-        addr = self.func.getEntryPoint()
+        off = entry + skip
+        addr = self.func.getEntryPoint().add(skip)
         while True:
             st = self.state_in.get(off)
             ins = self.listing.getInstructionAt(addr)
@@ -539,6 +577,22 @@ class FunctionFlow(object):
         for k, v in st.regs.items():
             if v == value and k[0] != "u":
                 out.append(("reg", k))
+        # A narrow value also lives in the low part of any register holding
+        # the wider value of the same origin (MIPS64 "move s0,a0" copies the
+        # 64-bit a0 while the variable is its 32-bit low part).
+        vkey = value[1] if value[0] == INIT else (value[2] if value[0] in (DEF, PHI) else None)
+        if isinstance(vkey, tuple) and len(vkey) == 2 and isinstance(vkey[0], int):
+            for c in self.m.containers(vkey):
+                if not self._is_low_part(vkey, c):
+                    continue
+                wide = self._rekey(value, c)
+                for k, v in st.regs.items():
+                    if v == wide and k[0] != "u" and k[1] == c[1]:
+                        lo = k[0] + (k[1] - vkey[1] if self.m.big_endian else 0)
+                        out.append(("reg", (lo, vkey[1])))
+                if wide == (INIT, c) and c not in st.regs and self.reg_value(st, c) == wide:
+                    lo = c[0] + (c[1] - vkey[1] if self.m.big_endian else 0)
+                    out.append(("reg", (lo, vkey[1])))
         if value[0] == INIT and value[1] not in st.regs and isinstance(value[1][0], int):
             # untouched register still holding its entry value (unless a
             # containing/contained register was written)

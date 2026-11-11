@@ -31,7 +31,8 @@ class Section(object):
 
 
 class Symbol(object):
-    def __init__(self, name, value, size, sym_type, bind, shndx):
+    def __init__(self, name, value, size, sym_type, bind, shndx, other=0):
+        self.other = other
         self.name = name
         self.value = value
         self.size = size
@@ -56,8 +57,8 @@ class ElfWriter(object):
         return len(self.sections) - 1
 
     def add_symbol(self, name, value, size=0, sym_type=C.STT_NOTYPE,
-                   bind=C.STB_GLOBAL, shndx=C.SHN_ABS):
-        self.symbols.append(Symbol(name, value, size, sym_type, bind, shndx))
+                   bind=C.STB_GLOBAL, shndx=C.SHN_ABS, other=0):
+        self.symbols.append(Symbol(name, value, size, sym_type, bind, shndx, other))
 
     def section_index_for(self, addr):
         """Index of the allocated section containing addr, else SHN_ABS."""
@@ -96,7 +97,7 @@ class ElfWriter(object):
             fmt = self.end + "IBBHQQ"
             out += struct.pack(fmt, 0, 0, 0, 0, 0, 0)
             for s in syms:
-                out += struct.pack(fmt, add_str(s.name), (s.bind << 4) | s.type, 0,
+                out += struct.pack(fmt, add_str(s.name), (s.bind << 4) | s.type, s.other,
                                    s.shndx, s.value, s.size)
             entsize = 24
         else:
@@ -104,7 +105,7 @@ class ElfWriter(object):
             out += struct.pack(fmt, 0, 0, 0, 0, 0, 0)
             for s in syms:
                 out += struct.pack(fmt, add_str(s.name), s.value, s.size,
-                                   (s.bind << 4) | s.type, 0, s.shndx)
+                                   (s.bind << 4) | s.type, s.other, s.shndx)
             entsize = 16
         return bytes(out), bytes(strtab), first_global, entsize
 

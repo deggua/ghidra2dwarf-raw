@@ -33,9 +33,14 @@ for i, (start, size) in enumerate(LAYOUT["ram"]):
     ram.setRead(True)
     ram.setWrite(True)
 
-# Thumb: ARM's TMode context register selects the instruction set.
+# Thumb: ARM's TMode context register selects the instruction set. As an
+# analyst would before analyzing a Thumb-only image, make it the default.
 from java.math import BigInteger
 TMODE = prog.getProgramContext().getRegister("TMode") if LAYOUT["thumb"] else None
+if TMODE is not None:
+    for blk in mem.getBlocks():
+        if blk.isInitialized():
+            prog.getProgramContext().setValue(TMODE, blk.getStart(), blk.getEnd(), BigInteger.ONE)
 
 # 2. Types and prototypes.
 dtm = prog.getDataTypeManager()
@@ -77,34 +82,100 @@ with open(os.path.join(build_dir, "symbols.txt")) as f:
 if "_reset" not in [s[0] for s in syms]:
     syms.append(("_reset", 0xFFF00100, 0x28, "T"))
 
-for name, addr, size, kind in syms:
-    if name in ("bad_bytes", "split_tail"):
-        continue  # handled by ghidra_setup_edge.py
+def addr_of(name, addr, kind):
     thumb = LAYOUT["thumb"] and bool(addr & 1) and kind in "Tt"
-    a = toAddr("0x%x" % (addr & ~1 if thumb else addr))
+    return toAddr("0x%x" % (addr & ~1 if thumb else addr)), thumb
+
+
+# 3a. Code first (as an analyst marks known entry points), then analysis.
+for name, addr, size, kind in syms:
+    if name in ("bad_bytes", "split_tail") or kind not in "Tt":
+        continue  # bad_bytes / split_tail are handled by ghidra_setup_edge.py
+    a, thumb = addr_of(name, addr, kind)
     if thumb and TMODE is not None:
         prog.getProgramContext().setValue(TMODE, a, a, BigInteger.ONE)
+    DisassembleCommand(a, None, True).applyTo(prog, monitor)
+    if fm.getFunctionAt(a) is None:
+        CreateFunctionCmd(name, a, None, SourceType.USER_DEFINED).applyTo(prog, monitor)
+    if name == "_reset":
+        st.addExternalEntryPoint(a)
+
+# The image was imported without analysis (it would have guessed at the raw
+# bytes); analyze now that the functions are in place.
+analyzeAll(prog)
+
+# PPC64 ELFv2: local calls target "func+8" (after the TOC setup), so analysis
+# creates functions there and splits ours; undo that as an analyst would.
+if prog.getLanguage().getProcessor().toString() == "PowerPC" and prog.getDefaultPointerSize() == 8:
+    from ghidra.program.model.address import AddressSet
+    for name, addr, size, kind in syms:
+        if kind not in "Tt" or name in ("bad_bytes", "split_tail"):
+            continue
+        a = toAddr("0x%x" % addr)
+        inner = fm.getFunctionAt(a.add(8))
+        if inner is not None and inner.getName().startswith("FUN_"):
+            fm.removeFunction(a.add(8))
+            f = fm.getFunctionAt(a)
+            if f is not None:
+                f.setBody(AddressSet(a, a.add(size - 1)))
+        f = fm.getFunctionAt(a)
+        if f is not None and f.isThunk():
+            f.setThunkedFunction(None)
+
+# PPC64 ELFv2 passes stack arguments at SP+96; Ghidra's PPC64 compiler specs
+# model the ELFv1 layout (SP+112). Correct the affected parameters with
+# custom storage, as an analyst would (see README).
+ELFV2_STACK_FIX = prog.getLanguage().getProcessor().toString() == "PowerPC" and prog.getDefaultPointerSize() == 8
+
+
+def fix_elfv2_stack_params(f):
+    from java.util import ArrayList
+    from ghidra.program.model.listing import (Function, ParameterImpl, ReturnParameterImpl,
+                                              VariableStorage)
+    params = list(f.getParameters())
+    if not any(p.getVariableStorage().isStackStorage() for p in params):
+        return
+    jl = ArrayList()
+    for p in params:
+        st_ = p.getVariableStorage()
+        if st_.isStackStorage():
+            st_ = VariableStorage(prog, st_.getStackOffset() - 16, st_.size())
+        jl.add(ParameterImpl(p.getName(), p.getDataType(), st_, prog))
+    r = f.getReturn()
+    f.setCustomVariableStorage(True)
+    f.updateFunction(f.getCallingConventionName(),
+                     ReturnParameterImpl(r.getDataType(), r.getVariableStorage(), prog), jl,
+                     Function.FunctionUpdateType.CUSTOM_STORAGE, True, SourceType.USER_DEFINED)
+
+
+# 3b. Annotations: names, prototypes, typed globals.
+listing = prog.getListing()
+for name, addr, size, kind in syms:
+    if name in ("bad_bytes", "split_tail"):
+        continue
+    a, thumb = addr_of(name, addr, kind)
     if kind in "Tt":
-        DisassembleCommand(a, None, True).applyTo(prog, monitor)
         f = fm.getFunctionAt(a)
         if f is None:
             CreateFunctionCmd(name, a, None, SourceType.USER_DEFINED).applyTo(prog, monitor)
             f = fm.getFunctionAt(a)
-        else:
-            f.setName(name, SourceType.USER_DEFINED)
+        if f is None:
+            print("WARNING: no function at %s for %s" % (a, name))
+            continue
+        f.setName(name, SourceType.USER_DEFINED)
         proto = protos.get(name)
         if proto is not None:
             ok = ApplyFunctionSignatureCmd(a, proto, SourceType.USER_DEFINED).applyTo(prog, monitor)
             if not ok:
                 print("WARNING: could not apply prototype to %s" % name)
-        if name == "_reset":
-            st.addExternalEntryPoint(a)
+            elif ELFV2_STACK_FIX:
+                fix_elfv2_stack_params(f)
     else:
         if name in GLOBAL_TYPES:
             dt = GLOBAL_TYPES[name]()
+            listing.clearCodeUnits(a, a.add(max(dt.getLength(), 1) - 1), False)
             DataUtilities.createData(prog, a, dt, -1, DataUtilities.ClearDataMode.CLEAR_ALL_CONFLICT_DATA)
         # (edge-case globals get their types in ghidra_setup_edge.py)
-        st.createLabel(a, name, SourceType.USER_DEFINED)
+        st.createLabel(a, name, SourceType.USER_DEFINED).setPrimary()
 
-analyzeChanges(prog)
 print("setup done: %d functions" % fm.getFunctionCount())
