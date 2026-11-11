@@ -91,6 +91,8 @@ set_type("g_counterB", IntegerDataType.dataType)
 set_type("g_kw", IntegerDataType.dataType)
 set_type("g_uni", IntegerDataType.dataType)
 set_type("g_dbl", find_type("double"))
+set_type("g_flag_expect", ArrayDataType(find_type("uint32_t"), 3, -1))
+set_type("g_custom_result", ArrayDataType(IntegerDataType.dataType, 4, -1))
 set_type("g_edge_result", ArrayDataType(IntegerDataType.dataType, 10, -1))
 set_type("g_fptab", ArrayDataType(PointerDataType(), 2, -1))
 
@@ -190,15 +192,73 @@ def split_body():
     print("  split_func body: %s" % f.getBody())
 report("non-contiguous function", split_body)
 
-# --- struct return: GCC (PPC SVR4) returns aggregates via a hidden pointer in
-# r3, which Ghidra's PPC model gets wrong for this 8-byte struct; fix the
-# annotation as an analyst would (pointer return + explicit pointer param).
-def struct_return():
-    from ghidra.app.cmd.function import ApplyFunctionSignatureCmd
-    from ghidra.app.util.parser import FunctionSignatureParser
-    sig = FunctionSignatureParser(dtm, None).parse(None, "point * make_point(point * ret, int x, int y)")
-    ApplyFunctionSignatureCmd(A("make_point"), sig, USER).applyTo(prog, monitor)
-report("struct return via hidden pointer", struct_return)
+# --- custom storage: struct / bitfield values in registers and stack slots --
+# The C functions take plain integers; re-type them, keeping the storage
+# Ghidra assigned, as an analyst does with "Use Custom Storage".
+from ghidra.program.model.listing import (Function, ParameterImpl, ReturnParameterImpl,
+                                          VariableStorage)
+
+
+def storage_of(func, idx):
+    return list(func.getParameter(idx).getVariableStorage().getVarnodes())
+
+
+def set_custom(func, params, ret=None):
+    func.setCustomVariableStorage(True)
+    if ret is None:
+        r = func.getReturn()
+        ret = ReturnParameterImpl(r.getDataType(), r.getVariableStorage(), prog)
+    jparams = ArrayList()
+    for p in params:
+        jparams.add(p)
+    func.updateFunction(func.getCallingConventionName(), ret, jparams,
+                        Function.FunctionUpdateType.CUSTOM_STORAGE, True, USER)
+
+
+def ordered(vns):
+    # Ghidra lists compound storage most-significant piece first; for a
+    # struct that is memory order on big-endian, reversed on little-endian.
+    return vns if prog.getLanguage().isBigEndian() else list(reversed(vns))
+
+
+def custom_bitfield_param():
+    f = fm.getFunctionAt(A("take_flags"))
+    st = VariableStorage(prog, storage_of(f, 0))
+    set_custom(f, [ParameterImpl("flags", find_type("flagword"), st, prog)])
+report("custom storage: bitfield struct in a register", custom_bitfield_param)
+
+
+def custom_pair_param():
+    f = fm.getFunctionAt(A("sum_pair"))
+    vns = storage_of(f, 0) + storage_of(f, 1)
+    st = VariableStorage(prog, ordered(vns))
+    set_custom(f, [ParameterImpl("pt", find_type("point"), st, prog)])
+report("custom storage: struct split over two registers", custom_pair_param)
+
+
+def custom_stack_pair():
+    f = fm.getFunctionAt(A("stack_pair"))
+    si, sj = storage_of(f, 8), storage_of(f, 9)
+    if not (len(si) == 1 and len(sj) == 1 and si[0].getAddress().isStackAddress()
+            and sj[0].getAddress().isStackAddress()
+            and sj[0].getOffset() == si[0].getOffset() + 4 and si[0].getSize() == 4):
+        print("EDGE skipped: custom storage: struct in stack slots (i/j not adjacent 4-byte slots)")
+        return
+    params = [ParameterImpl(p.getName(), p.getDataType(), p.getVariableStorage(), prog)
+              for p in list(f.getParameters())[:8]]
+    st = VariableStorage(prog, si[0].getAddress(), 8)
+    params.append(ParameterImpl("ij", find_type("point"), st, prog))
+    set_custom(f, params)
+report("custom storage: struct in stack slots", custom_stack_pair)
+
+
+def custom_return():
+    f = fm.getFunctionAt(A("make_flags"))
+    ret = ReturnParameterImpl(find_type("flagword"), f.getReturn().getVariableStorage(), prog)
+    params = [ParameterImpl(p.getName(), p.getDataType(), p.getVariableStorage(), prog)
+              for p in f.getParameters()]
+    set_custom(f, params, ret)
+report("custom storage: bitfield struct return", custom_return)
 
 # --- rename decompiler locals (committed to the database) ----------------------
 def rename_locals():

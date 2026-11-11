@@ -47,6 +47,15 @@ enum big {
     BIG_ALIAS = 0xF0000000
 };
 
+/* Custom-storage cases: the C code passes plain integers, the Ghidra
+   annotation (ghidra_setup_edge.py) types them as struct/bitfield values
+   held in the same registers / stack slots. */
+struct flagword {
+    uint32_t lo : 3;
+    uint32_t mid : 5;
+    uint32_t hi : 24;
+};
+
 struct thing {
     int field_q;
     int ok;
@@ -62,5 +71,9 @@ int edge_locals(int n);
 int split_func(void);
 int asm_between(void);
 int call_ptr(void **tbl);
+uint32_t take_flags(uint32_t raw);
+int sum_pair(int a, int b);
+int stack_pair(int a, int b, int c, int d, int e, int f, int g, int h, int i, int j);
+uint32_t make_flags(int v);
 void edge_done(void);
 void edge_main(void);

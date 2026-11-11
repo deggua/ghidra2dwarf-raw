@@ -10,7 +10,9 @@ NM := $(CROSS)nm
 OPT ?= -O1
 OUT ?= build
 
-CFLAGS := $(OPT) -g -mcpu=750 -mhard-float -mbig-endian -msdata=none -G0 \
+# -msvr4-struct-return: SVR4/EABI struct returns (r3:r4), as in Ghidra's
+# ppc_32.cspec; powerpc-linux-gnu defaults to the Linux (memory) convention.
+CFLAGS := $(OPT) -g -mcpu=750 -mhard-float -mbig-endian -msdata=none -G0 -msvr4-struct-return \
           -fno-pic -mno-relocatable -ffreestanding -fno-builtin -fno-inline \
           -fno-asynchronous-unwind-tables -fno-stack-protector -Wall -Wextra
 ASFLAGS := -mcpu=750 -Wa,-mregnames -fno-pic

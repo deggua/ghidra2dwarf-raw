@@ -134,8 +134,29 @@ def main():
     check_eq("code * value", "(unsigned long)%s == (unsigned long)&split_func" % pc_var, 1)
     check_finish("finish call_ptr", 16)
 
+    # --- custom storage -------------------------------------------------------------
+    cont_to("take_flags")
+    out = run("ptype flags")
+    check("custom storage: bitfield param type", "lo : 3" in out and "hi : 24" in out, out)
+    for fld, i in (("lo", 0), ("mid", 1), ("hi", 2)):
+        check_eq("custom storage: bitfield %s matches GCC" % fld, "flags.%s == g_flag_expect[%d]" % (fld, i), 1)
+    cont_to("sum_pair")
+    check_eq("custom storage: struct over two registers .x", "pt.x", 12)
+    check_eq("custom storage: struct over two registers .y", "pt.y", 34)
+    if "ij" in func_text("stack_pair").split("{")[0]:
+        cont_to("stack_pair")
+        check_eq("custom storage: struct in stack slots .x", "ij.x", 56)
+        check_eq("custom storage: struct in stack slots .y", "ij.y", 78)
+        check_eq("custom storage: other params intact", "h", 8)
+    else:
+        print("SKIP custom stack struct (arguments not in adjacent 4-byte stack slots)")
+    out = run("ptype make_flags")
+    check("custom storage: struct return type", "flagword" in out, out)
+
     # --- globals at the end ----------------------------------------------------------
     cont_to("edge_done")
+    for i, e in enumerate([0xF, 12034, 56 * 1000 + 78 + 36, 0x432105]):
+        check_eq("g_custom_result[%d]" % i, "g_custom_result[%d]" % i, e)
     for i, e in enumerate([16, 11, 12, 60, 296, 700, 8, 1, 16]):
         check_eq("g_edge_result[%d]" % i, "g_edge_result[%d]" % i, e)
     check_eq("double global", "g_dbl", 6.375)

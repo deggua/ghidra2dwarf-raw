@@ -36,6 +36,8 @@ int g_kw = 77;                                              /* named "switch" */
 int g_uni = 88;                                             /* named with non-ASCII */
 void *g_codeptr = (void *)split_func;                       /* code * */
 void *g_fptab[2] = { 0, (void *)split_func };              /* code * via decompiler */
+uint32_t g_flag_expect[3];                                  /* GCC's own decode of the flag word */
+int g_custom_result[4];
 double g_dbl;
 volatile int g_edge_result[10];
 
@@ -101,6 +103,26 @@ int call_ptr(void **tbl)
     return a + fp();
 }
 
+uint32_t take_flags(uint32_t raw)
+{
+    return (raw >> 3) & 0x1f;
+}
+
+int sum_pair(int a, int b)
+{
+    return a * 1000 + b;
+}
+
+int stack_pair(int a, int b, int c, int d, int e, int f, int g, int h, int i, int j)
+{
+    return a + b + c + d + e + f + g + h + i * 1000 + j;
+}
+
+uint32_t make_flags(int v)
+{
+    return ((uint32_t)v << 8) | 5;
+}
+
 void edge_done(void)
 {
     __asm__ volatile("" ::: "memory");
@@ -122,5 +144,16 @@ void edge_main(void)
     g_edge_result[6] = split_func();
     g_edge_result[7] = asm_between();
     g_edge_result[8] = call_ptr(g_fptab);
+    {
+        union { uint32_t raw; struct flagword f; } u;
+        u.raw = 0x12345678;
+        g_flag_expect[0] = u.f.lo;
+        g_flag_expect[1] = u.f.mid;
+        g_flag_expect[2] = u.f.hi;
+        g_custom_result[0] = take_flags(u.raw);
+    }
+    g_custom_result[1] = sum_pair(12, 34);
+    g_custom_result[2] = stack_pair(1, 2, 3, 4, 5, 6, 7, 8, 56, 78);
+    g_custom_result[3] = make_flags(0x4321);
     edge_done();
 }
