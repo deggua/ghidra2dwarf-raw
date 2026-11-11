@@ -35,7 +35,7 @@ def qemu_command(build, port):
     with open(os.path.join(build, "layout.json")) as f:
         t = TARGETS[json.load(f)["target"]]
     if t["mode"] == "rom":
-        return ["qemu-system-ppc", "-M", "mac99", "-bios", os.path.join(build, "fw.bin"),
+        return ["qemu-system-ppc", "-M", "mac99"] + t["qemu_args"] + ["-bios", os.path.join(build, "fw.bin"),
                 "-display", "none", "-S", "-gdb", "tcp:127.0.0.1:%d" % port,
                 "-monitor", "none", "-serial", "none"]
     return [t["qemu"]] + t["qemu_args"] + ["-g", str(port), os.path.join(build, "fw.elf")]

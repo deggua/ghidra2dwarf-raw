@@ -11,6 +11,12 @@ SECTIONS
     .vectors 0xfff00000 : {
         . = 0x100;
         KEEP(*(.reset))
+        . = 0x700;
+        KEEP(*(.vec.700))
+        . = 0x900;
+        KEEP(*(.vec.900))
+        . = 0xc00;
+        KEEP(*(.vec.c00))
     } > ROM
 
     .text : {

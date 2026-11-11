@@ -76,6 +76,12 @@ class Options(object):
         # emit GCC-style double rows at frameless function entries
         self.split_sections = True
         self.frameless_rows = True
+        # Mark interrupt/exception handler frames as signal frames (CIE
+        # augmentation "S"): GDB then looks up the interrupted frame at its
+        # exact PC (instead of PC-1, which is wrong for an interrupt at a
+        # function's first instruction or a line boundary) but labels the
+        # handler frame "<signal handler called>" in backtraces.
+        self.irq_signal_frame = True
         # ELF header e_flags; -1 = derive from the language / compiler spec
         # (ARM EABI/BE8/float ABI, MIPS ABI+ISA, PPC64 ELFv1/ELFv2).
         self.elf_flags = -1
@@ -505,7 +511,8 @@ class Exporter(object):
                 self.entry_points.append(int(a.getOffset()))
         self.cfi = None
         if self.opts.cfi:
-            self.cfi = CfiGenerator(self.machine, self.dw, self.A, self.entry_points)
+            self.cfi = CfiGenerator(self.machine, self.dw, self.A, self.entry_points,
+                                    irq_signal_frame=self.opts.irq_signal_frame)
         self.c_lines = []
         self.func_ranges = []
         self.elf_symbols = []   # (name, addr, size, type)
@@ -556,6 +563,11 @@ class Exporter(object):
         self.file_no = dw.add_file(os.path.basename(self.c_path))
 
         self.qualified_renames = self._collect_qualified_renames()
+        self.interrupts = self._find_interrupt_handlers()
+        if self.interrupts:
+            fm = self.program.getFunctionManager()
+            self.log("Interrupt/exception handlers: %s" % ", ".join(sorted(
+                str(fm.getFunctionAt(self.space.getAddress(o)).getName()) for o in self.interrupts)))
         self._write_c_preamble()
         self._export_functions()
         self._export_globals()
@@ -611,6 +623,56 @@ class Exporter(object):
             self.c_lines += text.replace("\r\n", "\n").split("\n")
             self.types_header_lines = (first, len(self.c_lines))
             self.c_lines.append("")
+
+    # Instructions returning from an interrupt/exception.
+    _IRQ_RETURN = re.compile(r"^(rfi|rfid|hrfid|rfci|rfmci|rfdi|rfgi|eret|eretaa|eretab|deret|"
+                             r"iret|iretd|iretq)$", re.I)
+
+    def _is_vector_address(self, off):
+        """Classic PowerPC exception vectors (0x200..0x2f00 above 0x0 or
+        0xfff00000)."""
+        if str(self.lang.getProcessor()) != "PowerPC":
+            return False
+        base = off & ~0xFFFF
+        rel = off - base
+        # 0x100 is system reset: no interrupted context to return to
+        return base in (0, 0xFFF00000, 0xFFFFFFFFFFF00000) and 0x200 <= rel < 0x3000 and rel % 0x100 == 0
+
+    def _find_interrupt_handlers(self):
+        """Entry offsets of functions entered by the hardware, which get
+        interrupt-frame CFI:
+          * functions returning with rfi/rfid/rfci/rfmci, eret, iret, ...;
+          * functions tagged INTERRUPT in Ghidra;
+          * external entry points at exception vector addresses;
+          * functions an interrupt stub jumps (not calls) to."""
+        fm = self.program.getFunctionManager()
+        eps = set(self.entry_points)
+        found = set()
+        funcs = [f for f in fm.getFunctions(True) if not f.isExternal() and self.in_space(f.getEntryPoint())]
+        for f in funcs:
+            entry = int(f.getEntryPoint().getOffset())
+            tags = set(str(t.getName()).upper() for t in f.getTags())
+            if "INTERRUPT" in tags or (entry in eps and self._is_vector_address(entry)):
+                found.add(entry)
+                continue
+            for ins in self.listing.getInstructions(f.getBody(), True):
+                if self._IRQ_RETURN.match(str(ins.getMnemonicString())):
+                    found.add(entry)
+                    break
+        work = list(found)
+        while work:
+            f = fm.getFunctionAt(self.space.getAddress(work.pop()))
+            if f is None:
+                continue
+            for ins in self.listing.getInstructions(f.getBody(), True):
+                ft = ins.getFlowType()
+                if ft.isJump() and not ft.isConditional() and not ft.isCall():
+                    for t in ins.getFlows():
+                        g = fm.getFunctionAt(t)
+                        if g is not None and int(t.getOffset()) not in found:
+                            found.add(int(t.getOffset()))
+                            work.append(int(t.getOffset()))
+        return found
 
     def _collect_qualified_renames(self):
         """[(qualified name, exported name)] for namespaced symbols whose
@@ -754,7 +816,7 @@ class Exporter(object):
             self.log("WARNING: flow analysis failed for %s: %s" % (name, e))
             flow = None
         if self.cfi is not None and flow is not None:
-            self.cfi.add_function(flow, ranges)
+            self.cfi.add_function(flow, ranges, interrupt=entry in self.interrupts)
         if self._is_thumb(func.getEntryPoint()):
             # ARM ELF: Thumb function symbols have bit 0 set, and mapping
             # symbols ($t/$a) tell GDB the instruction set of each region.

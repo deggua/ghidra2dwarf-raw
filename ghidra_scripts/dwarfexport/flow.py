@@ -53,6 +53,18 @@ _LINK_REGISTERS = {
 }
 
 
+# Registers holding an interrupted context's PC, per Ghidra processor, with
+# the CFI return-address column used for them. GDB maps none of these DWARF
+# numbers to a register (DWARF can't name them for GDB); a CIE's return
+# address column needn't be a register GDB knows, and the rule for it is
+# always "saved at a stack slot".
+_IRQ_RETURN_REGS = {
+    "PowerPC": [("SRR0", 100 + 26), ("CSRR0", 100 + 58), ("MCSRR0", 100 + 570)],
+    "MIPS": [("EPC", 80), ("ErrorEPC", 81)],
+    "AARCH64": [("elr_el1", 33), ("elr_el2", 34), ("elr_el3", 35)],
+}
+
+
 def _pc_column(lang):
     proc = str(lang.getProcessor())
     size = lang.getDefaultSpace().getPointerSize()
@@ -104,6 +116,12 @@ class MachineInfo(object):
         # Every register with a DWARF number.
         self.big_endian = bool(self.lang.isBigEndian())
         self.mapped = [(start, size) for start, size, _ in reg_index.entries]
+        # Interrupt return registers: [((off, size), cfi column)].
+        self.irq_ret = []
+        for name, col in _IRQ_RETURN_REGS.get(str(self.lang.getProcessor()), []):
+            reg = self.lang.getRegister(name)
+            if reg is not None:
+                self.irq_ret.append(((int(reg.getAddress().getOffset()), int(reg.getMinimumByteSize())), col))
         self.volatile = [k for k in self.mapped
                          if k != self.sp_key and k not in self.unaffected and k != self.ra_key]
 
@@ -638,7 +656,8 @@ class FunctionFlow(object):
 class CfiGenerator(object):
     """Emits a CIE and per-function FDEs from FunctionFlow states."""
 
-    def __init__(self, machine, dwarf_builder, address_mapper, entry_points=()):
+    def __init__(self, machine, dwarf_builder, address_mapper, entry_points=(), irq_signal_frame=True):
+        self.irq_signal_frame = irq_signal_frame
         self.m = machine
         self.dw = dwarf_builder
         self.A = address_mapper
@@ -664,9 +683,27 @@ class CfiGenerator(object):
                 init.append(C.DW_CFA_undefined)
                 init += uleb(num)
         dwarf_builder.cie = CommonInformation(1, 1, machine.ra_dwarf, bytes(init))
+        self._irq_cies = {}
         self.ok = True
 
-    def _rule(self, flow, st):
+    def _irq_cie(self, col):
+        """CIE for interrupt handlers returning through `col` (e.g. SRR0):
+        a signal frame ("S"), every register preserved, and the return
+        address unknown until the handler stores it."""
+        idx = self._irq_cies.get(col)
+        if idx is None:
+            m = self.m
+            init = bytearray()
+            init.append(C.DW_CFA_def_cfa)
+            init += uleb(m.sp_dwarf) + uleb(m.stackshift)
+            init.append(C.DW_CFA_undefined)
+            init += uleb(col)
+            idx = self.dw.add_cie(CommonInformation(1, 1, col, bytes(init),
+                                                    augmentation="S" if self.irq_signal_frame else ""))
+            self._irq_cies[col] = idx
+        return idx
+
+    def _rule(self, flow, st, irq=None):
         m = self.m
         cfa = None
         sp = flow.reg_value(st, m.sp_key)
@@ -692,6 +729,25 @@ class CfiGenerator(object):
             if v is not None and v[0] == INIT and v[1] not in slots:
                 slots[v[1]] = (o, size)
         saved = {}
+        if irq is not None:
+            # Interrupt handler: the interrupted code expects *every*
+            # register back, and its PC is in the interrupt return register
+            # until the handler stores it.
+            ret_key, col = irq
+            slot = slots.get(ret_key)
+            if slot is not None and slot[1] == ret_key[1]:
+                saved[col] = slot[0] - m.stackshift
+            for k in m.mapped:
+                num = m.dwarf_of(k)
+                if num is None or k == m.sp_key:
+                    continue
+                # Use the slot whenever there is one: calls made by the
+                # handler clobber volatile registers, and a caller-frame
+                # lookup happens inside the call instruction.
+                slot = slots.get(k)
+                if slot is not None and slot[1] == k[1]:
+                    saved[num] = slot[0] - m.stackshift
+            return cfa[0], cfa[1], saved
         for k in self._tracked_regs():
             num = m.dwarf_of(k)
             if num is None or k == m.sp_key:
@@ -722,7 +778,7 @@ class CfiGenerator(object):
         return self._tracked
 
     @staticmethod
-    def _encode(prev, cur):
+    def _encode(prev, cur, undefined_cols=()):
         ops = bytearray()
         if prev is None or (prev[0], prev[1]) != (cur[0], cur[1]):
             if cur[1] >= 0:
@@ -742,15 +798,27 @@ class CfiGenerator(object):
                 ops += uleb(reg) + sleb(off)
         for reg in sorted(prev_saved):
             if reg not in cur[2]:
-                ops.append(C.DW_CFA_same_value)
+                ops.append(C.DW_CFA_undefined if reg in undefined_cols else C.DW_CFA_same_value)
                 ops += uleb(reg)
         return bytes(ops)
 
-    def add_function(self, flow, ranges):
+    def _irq_return_reg(self, flow):
+        """The interrupt return register this handler saves (else the first
+        one the processor has)."""
+        for key, col in self.m.irq_ret:
+            for st in flow.state_in.values():
+                if any(v == (INIT, key) for _, v in st.mem.values()):
+                    return key, col
+        return self.m.irq_ret[0] if self.m.irq_ret else None
+
+    def add_function(self, flow, ranges, interrupt=False):
         if not self.ok:
             return
         m = self.m
-        outermost = int(flow.func.getEntryPoint().getOffset()) in self.entry_points
+        irq = self._irq_return_reg(flow) if interrupt else None
+        cie = self._irq_cie(irq[1]) if irq is not None else 0
+        undefined_cols = (irq[1],) if irq is not None else ()
+        outermost = irq is None and int(flow.func.getEntryPoint().getOffset()) in self.entry_points
         for lo, hi in ranges:
             rows = []
             prev = (m.sp_dwarf, m.stackshift, {})
@@ -763,11 +831,11 @@ class CfiGenerator(object):
                 st = flow.state_in.get(off)
                 if st is None:
                     continue
-                rule = self._rule(flow, st)
+                rule = self._rule(flow, st, irq)
                 if rule is None:
                     continue
-                ops = self._encode(prev, rule)
+                ops = self._encode(prev, rule, undefined_cols)
                 if ops:
                     rows.append((self.A(off), ops))
                 prev = rule
-            self.dw.fdes.append(FrameDescription(self.A(lo), self.A(lo) + (hi - lo), rows))
+            self.dw.fdes.append(FrameDescription(self.A(lo), self.A(lo) + (hi - lo), rows, cie))

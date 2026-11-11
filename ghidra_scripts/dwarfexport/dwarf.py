@@ -175,20 +175,26 @@ class LineSequence(object):
 # --------------------------------------------------------------------------
 
 class FrameDescription(object):
-    """An FDE: ``instructions`` is a list of (address, [cfa-op bytes])."""
+    """An FDE: ``instructions`` is a list of (address, [cfa-op bytes]);
+    ``cie`` indexes DwarfBuilder.cies."""
 
-    def __init__(self, start, end, instructions):
+    def __init__(self, start, end, instructions, cie=0):
         self.start = start
         self.end = end
         self.instructions = instructions
+        self.cie = cie
 
 
 class CommonInformation(object):
-    def __init__(self, code_align, data_align, ra_reg, initial_instructions):
+    """A CIE. augmentation "S" marks signal/interrupt frames: GDB then uses
+    the interrupted frame's exact PC (no "return address - 1")."""
+
+    def __init__(self, code_align, data_align, ra_reg, initial_instructions, augmentation=""):
         self.code_align = code_align
         self.data_align = data_align
         self.ra_reg = ra_reg
         self.initial_instructions = initial_instructions
+        self.augmentation = augmentation
 
 
 # --------------------------------------------------------------------------
@@ -210,8 +216,14 @@ class DwarfBuilder(object):
         self.dirs = []           # include directories (index 1..n)
         self.sequences = []      # [LineSequence]
         self.aranges = []        # [(start, end)]
-        self.cie = None
+        self.cie = None      # the default CIE (index 0 of cies)
+        self.cies = []       # additional CIEs (index 1..)
         self.fdes = []
+
+    def add_cie(self, cie):
+        """Registers an additional CIE; returns its index for FrameDescription."""
+        self.cies.append(cie)
+        return len(self.cies)
 
     # -- primitive packers ---------------------------------------------------
     def u8(self, v):
@@ -468,7 +480,6 @@ class DwarfBuilder(object):
     def _build_frame(self):
         if self.cie is None:
             return None
-        cie = self.cie
         out = bytearray()
 
         def pad_entry(entry):
@@ -478,22 +489,27 @@ class DwarfBuilder(object):
                 entry.append(C.DW_CFA_nop)
             return entry
 
-        body = bytearray()
-        body += self.u32(0xFFFFFFFF)   # CIE_id
-        body.append(4)                 # version (DWARF 4 .debug_frame)
-        body += b"\0"                  # augmentation ""
-        body.append(self.addr_size)    # address_size
-        body.append(0)                 # segment_size
-        body += uleb(cie.code_align)
-        body += sleb(cie.data_align)
-        body += uleb(cie.ra_reg)
-        body += cie.initial_instructions
-        pad_entry(body)
-        out += self.u32(len(body)) + body
-
-        for fde in self.fdes:
+        cie_offsets = []
+        for cie in [self.cie] + self.cies:
+            cie_offsets.append(len(out))
             body = bytearray()
-            body += self.u32(0)        # CIE pointer (offset of the CIE)
+            body += self.u32(0xFFFFFFFF)   # CIE_id
+            body.append(4)                 # version (DWARF 4 .debug_frame)
+            body += cie.augmentation.encode() + b"\0"
+            body.append(self.addr_size)    # address_size
+            body.append(0)                 # segment_size
+            body += uleb(cie.code_align)
+            body += sleb(cie.data_align)
+            body += uleb(cie.ra_reg)
+            body += cie.initial_instructions
+            pad_entry(body)
+            out += self.u32(len(body)) + body
+
+        all_cies = [self.cie] + self.cies
+        for fde in self.fdes:
+            cie = all_cies[fde.cie]
+            body = bytearray()
+            body += self.u32(cie_offsets[fde.cie])   # CIE pointer
             body += self.uaddr(fde.start)
             body += self.uaddr(fde.end - fde.start)
             loc = fde.start

@@ -55,7 +55,13 @@ def job(target, opt, sanitized, work, verbose):
     r = subprocess.run(["llvm-dwarfdump", "--verify", elf], capture_output=True, text=True)
     if "No errors." not in r.stdout:
         fail("llvm-dwarfdump --verify:\n" + r.stdout[-2000:])
-    for label, checks in (("main", "gdb_checks.py"), ("edge", "gdb_edge_checks.py")):
+    import json
+    with open(os.path.join(build, "layout.json")) as f:
+        has_irq = json.load(f).get("irq")
+    suites = [("main", "gdb_checks.py"), ("edge", "gdb_edge_checks.py")]
+    if has_irq:
+        suites.append(("irq", "gdb_irq_checks.py"))
+    for label, checks in suites:
         ok, lines, out = run_gdb_test.run(build, elf, csrc, os.path.join(HERE, checks), sanitized)
         summary = [l for l in lines if l.startswith("SUMMARY")]
         report["counts"][label] = summary[0][len("SUMMARY "):] if summary else "no summary"
@@ -112,9 +118,10 @@ def main():
     for name in sorted(results):
         rep = results[name]
         all_ok &= rep["ok"]
-        print("  %-28s %-4s main: %-22s edge: %s" % (name, "ok" if rep["ok"] else "FAIL",
-                                                     rep["counts"].get("main", "-"),
-                                                     rep["counts"].get("edge", "-")))
+        print("  %-28s %-4s main: %-22s edge: %-22s%s" % (
+            name, "ok" if rep["ok"] else "FAIL", rep["counts"].get("main", "-"),
+            rep["counts"].get("edge", "-"),
+            (" irq: " + rep["counts"]["irq"]) if "irq" in rep["counts"] else ""))
     print("ALL TESTS PASSED" if all_ok else "SOME TESTS FAILED")
     return 0 if all_ok else 1
 

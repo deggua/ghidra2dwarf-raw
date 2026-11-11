@@ -32,8 +32,10 @@ def export(build, work, opts=()):
            "-loader", "BinaryLoader", "-loader-baseAddr", "0x%x" % layout["base"], "-noanalysis",
            "-processor", layout["lang"], "-cspec", layout["cspec"],
            "-postScript", os.path.join(HERE, "ghidra_setup.py"), build,
-           os.path.join(fw, "fw.h"), os.path.join(fw, "edge.h"),
-           "-postScript", os.path.join(HERE, "ghidra_setup_edge.py"), build,
+           os.path.join(fw, "fw.h"), os.path.join(fw, "edge.h")] + \
+          ([os.path.join(fw, "irq.h")] if layout.get("irq") else []) + \
+          ["-postScript", os.path.join(HERE, "ghidra_setup_edge.py"), build] + \
+          (["-postScript", os.path.join(HERE, "ghidra_setup_irq.py"), build] if layout.get("irq") else []) + [
            "-postScript", os.path.join(REPO, "ghidra_scripts", "ExportDwarfELF.py"),
            os.path.join(work, "out")] + list(opts)
     log_path = os.path.join(work, "ghidra.log")
@@ -44,7 +46,8 @@ def export(build, work, opts=()):
         text = f.read()
     errors = re.findall(r"^(?:ERROR .*|Traceback.*)$", text, re.M)
     notes = [l for l in text.splitlines()
-             if l.startswith(("ghidra2dwarf-raw: ", "WARNING", "EDGE FAILED", "EDGE skipped"))]
+             if l.startswith(("ghidra2dwarf-raw: ", "WARNING", "EDGE FAILED", "EDGE skipped",
+                              "Interrupt/exception handlers", "IRQ setup"))]
     ok = r.returncode == 0 and not errors and os.path.exists(os.path.join(work, "out", "fw.bin.elf"))
     return ok, notes, text
 

@@ -34,14 +34,17 @@ def build(name, opt, out):
     os.makedirs(out, exist_ok=True)
     cc = t["cross"] + "gcc"
     tool = lambda n: t["cross"] + n  # noqa: E731
-    cflags = ["-" + opt] + COMMON_CFLAGS + t["cflags"]
+    cflags = ["-" + opt] + COMMON_CFLAGS + t["cflags"] + (["-DHAVE_IRQ"] if t["irq"] else [])
     isa_dir = os.path.join(FW, t["isa"])
     objs = []
-    for src, flags in ((os.path.join(isa_dir, "crt0.S"), t["asflags"]),
-                       (os.path.join(isa_dir, "edge_asm.S"), t["asflags"]),
-                       (os.path.join(FW, "main.c"), cflags),
-                       (os.path.join(FW, "edge.c"), cflags)):
-        obj = os.path.join(out, os.path.basename(src).rsplit(".", 1)[0] + ".o")
+    srcs = [(os.path.join(isa_dir, "crt0.S"), t["asflags"]),
+            (os.path.join(isa_dir, "edge_asm.S"), t["asflags"]),
+            (os.path.join(FW, "main.c"), cflags),
+            (os.path.join(FW, "edge.c"), cflags)]
+    if t["irq"]:
+        srcs += [(os.path.join(isa_dir, "irq.S"), t["asflags"]), (os.path.join(FW, "irq.c"), cflags)]
+    for src, flags in srcs:
+        obj = os.path.join(out, os.path.basename(src) + ".o")
         sh([cc] + flags + ["-g", "-c", src, "-o", obj])
         objs.append(obj)
 
@@ -74,7 +77,7 @@ def build(name, opt, out):
     else:
         ram = [[syms["__bss_start"], max(syms["__bss_end"] - syms["__bss_start"], 8)]]
     layout = {"target": name, "base": t["base"], "ram": ram, "thumb": t["thumb"],
-              "lang": t["lang"], "cspec": t["cspec"]}
+              "lang": t["lang"], "cspec": t["cspec"], "irq": t["irq"]}
     with open(os.path.join(out, "layout.json"), "w") as f:
         json.dump(layout, f, indent=1)
     return out

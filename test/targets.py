@@ -29,16 +29,18 @@ def _t(**kw):
     kw.setdefault("mode", "user")
     kw.setdefault("thumb", False)
     kw.setdefault("qemu_args", [])
+    kw.setdefault("irq", False)
     return kw
 
 
 TARGETS = {
     # --- PowerPC ---------------------------------------------------------------
-    "ppc32": _t(cross="powerpc-linux-gnu-", isa="ppc32", mode="rom", base=0xFFF00000,
-                cflags=["-mcpu=750", "-mhard-float", "-msdata=none", "-G0", "-msvr4-struct-return",
+    # MPC8245-class: PowerPC 603e core, boot ROM with exception vectors
+    "ppc32": _t(cross="powerpc-linux-gnu-", isa="ppc32", mode="rom", base=0xFFF00000, irq=True,
+                cflags=["-mcpu=603e", "-mhard-float", "-msdata=none", "-G0", "-msvr4-struct-return",
                         "-mno-relocatable"],
-                asflags=["-mcpu=750", "-Wa,-mregnames"],
-                lang="PowerPC:BE:32:default"),
+                asflags=["-mcpu=603e", "-Wa,-mregnames"],
+                lang="PowerPC:BE:32:default", qemu_args=["-cpu", "603e"]),
     "ppc64be": _t(cross="powerpc64-linux-gnu-", isa="ppc64", base=BASE64,
                   cflags=["-mabi=elfv2", "-mcmodel=medium"], asflags=["-mabi=elfv2"],
                   lang="PowerPC:BE:64:A2ALT", qemu="qemu-ppc64"),

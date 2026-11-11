@@ -6,6 +6,9 @@
  */
 #include "fw.h"
 #include "edge.h"
+#ifdef HAVE_IRQ
+#include "irq.h"
+#endif
 
 volatile uint32_t g_tick;
 int g_counter = 5;
@@ -157,6 +160,9 @@ void _cstart(void)
         *dst++ = *src++;
     for (dst = __bss_start; dst < __bss_end; dst++)
         *dst = 0;
+#ifdef HAVE_IRQ
+    irq_test();
+#endif
     edge_main();
     fw_main();
 }
