@@ -341,6 +341,31 @@ class FunctionFlow(object):
         saved = {k: v for k, v in a.saved.items() if b.saved.get(k) == v}
         return State(regs, mem, saved)
 
+    def stabilize(self, old, new, join_off):
+        """Keep a join's state monotone (concrete -> own phi -> unknown,
+        dropped slots stay dropped) so the fixpoint iteration terminates:
+        otherwise phis of nested loop heads can chase each other forever."""
+        for k, ov in old.regs.items():
+            nv = new.regs[k] if k in new.regs else self.default(k)
+            if ov is None:
+                new.regs[k] = None
+            elif ov == (PHI, join_off, k) and nv is not None:
+                new.regs[k] = ov
+        for o in list(new.mem):
+            if o not in old.mem:
+                del new.mem[o]
+            else:
+                osz, ov = old.mem[o]
+                nsz, nv = new.mem[o]
+                if osz != nsz or ov is None:
+                    new.mem[o] = (nsz, None) if osz == nsz else None
+                    if new.mem[o] is None:
+                        del new.mem[o]
+                elif ov == (PHI, join_off, ("m", o)) and nv is not None:
+                    new.mem[o] = (nsz, ov)
+        new.saved = dict((k, v) for k, v in new.saved.items() if old.saved.get(k) == v)
+        return new
+
     # -- driver ---------------------------------------------------------------
     def _run(self):
         func = self.func
@@ -400,6 +425,8 @@ class FunctionFlow(object):
                 if k == entry_off:
                     new = self.merge(init, new, k)
                 old = self.state_in.get(k)
+                if old is not None and len(preds[k]) > 1:
+                    new = self.stabilize(old, new, k)
                 if old is None or new != old:
                     self.state_in[k] = new
                     if k not in queued:
