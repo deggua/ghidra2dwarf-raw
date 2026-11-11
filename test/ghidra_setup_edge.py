@@ -323,4 +323,11 @@ def rename_locals():
     ifc.dispose()
 report("local names with '?'", rename_locals)
 
+# --- memory map without the X flag (hand-made by the analyst) ---------------------
+if _LAYOUT.get("noexec_blocks"):
+    def noexec():
+        for b in prog.getMemory().getBlocks():
+            b.setExecute(False)
+    report("memory blocks without the X flag", noexec)
+
 print("edge setup done")

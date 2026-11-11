@@ -32,7 +32,7 @@ def export(build, work, opts=()):
            "-loader", "BinaryLoader", "-loader-baseAddr", "0x%x" % layout["base"], "-noanalysis",
            "-processor", layout["lang"], "-cspec", layout["cspec"],
            "-postScript", os.path.join(HERE, "ghidra_setup.py"), build,
-           os.path.join(fw, "fw.h"), os.path.join(fw, "edge.h")] + \
+           os.path.join(fw, "fw.h"), os.path.join(fw, "edge.h"), os.path.join(fw, "shapes.h")] + \
           ([os.path.join(fw, "irq.h")] if layout.get("irq") else []) + \
           ["-postScript", os.path.join(HERE, "ghidra_setup_edge.py"), build] + \
           (["-postScript", os.path.join(HERE, "ghidra_setup_irq.py"), build] if layout.get("irq") else []) + [

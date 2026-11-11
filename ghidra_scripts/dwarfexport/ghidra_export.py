@@ -350,8 +350,36 @@ class TypeBuilder(object):
         }[kind]
         die = self.cu.child(tag)
         self.cache[key] = die
+        if not hasattr(self, "_dts"):
+            self._dts = {}
+        self._dts[key] = dt
         self.pending.append((kind, die, dt))
         return die
+
+    def add_tag_typedefs(self):
+        """The pseudo-C (like Ghidra) uses struct/union/enum names without
+        the tag keyword ("msg local_18;"); C's tag namespace would make GDB
+        reject "p sizeof(msg)". Add "typedef struct msg msg;" for each tag
+        name no typedef already has."""
+        def name_of(dt):
+            n = str(dt.getName())
+            return self.type_name_filter(n) if self.type_name_filter is not None else n
+        taken = set(name_of(dt) for (kind, _, _), (die, dt) in self._entries() if kind in
+                    ("typedef", "blob", "rawptr", "base"))
+        for (kind, _, _), (die, dt) in self._entries():
+            if kind not in ("struct", "union", "enum"):
+                continue
+            n = name_of(dt)
+            if n in taken:
+                continue
+            taken.add(n)
+            td = self.cu.child(C.DW_TAG_typedef)
+            self.dw.name(td, n, raw=True)
+            td.add(C.DW_AT_type, C.DW_FORM_ref4, die)
+
+    def _entries(self):
+        dts = getattr(self, "_dts", {})
+        return [(key, (die, dts[key])) for key, die in self.cache.items() if key in dts]
 
     def code_pointer(self, depth):
         """Pointer^depth to Ghidra's "code" (function of unknown type)."""
@@ -603,6 +631,7 @@ class Exporter(object):
         if self.opts.all_types:
             self._export_all_types()
         self.types.flush()
+        self.types.add_tag_typedefs()
 
         ranges = sorted(self.func_ranges)
         cu.add(C.DW_AT_ranges, C.DW_FORM_sec_offset, dw.add_ranges(ranges))
@@ -695,7 +724,10 @@ class Exporter(object):
                 continue
             for ins in self.listing.getInstructions(f.getBody(), True):
                 ft = ins.getFlowType()
-                if ft.isJump() and not ft.isConditional() and not ft.isCall():
+                # "b handler": after analysis Ghidra often types it as a
+                # CALL_TERMINATOR (tail call) rather than a jump
+                if not ft.isConditional() and (ft.isJump() and not ft.isCall()
+                                               or ft.isCall() and ft.isTerminal()):
                     for t in ins.getFlows():
                         g = fm.getFunctionAt(t)
                         if g is not None and int(t.getOffset()) not in found:
@@ -791,7 +823,10 @@ class Exporter(object):
         for r in func.getBody().getAddressRanges():
             if not self.in_space(r.getMinAddress()):
                 continue
-            ranges.append((int(r.getMinAddress().getOffset()), int(r.getMaxAddress().getOffset()) + 1))
+            # (a function ending at the very top of the address space ends one
+            # byte early: the exclusive end 2**32 doesn't fit a DWARF address)
+            ranges.append((int(r.getMinAddress().getOffset()),
+                           min(int(r.getMaxAddress().getOffset()) + 1, (1 << (8 * self.addr_size)) - 1)))
         ranges.sort()
         # The range holding the entry point goes first: GDB uses the start of
         # the first DW_AT_ranges entry as a non-contiguous function's entry.
@@ -839,8 +874,18 @@ class Exporter(object):
             self.func_ranges.append((self.A(lo), self.A(lo) + (hi - lo)))
 
         size = ranges[0][1] - entry
+        extra = {}
+        if hf is not None:
+            # switch jump tables the decompiler recovered: edges the raw
+            # computed jump doesn't show
+            try:
+                for jt in hf.getJumpTables():
+                    sw = int(jt.getSwitchAddress().getOffset())
+                    extra[sw] = [int(c.getOffset()) for c in jt.getCases()]
+            except Exception:  # noqa: BLE001
+                pass
         try:
-            flow = FunctionFlow(self.machine, func)
+            flow = FunctionFlow(self.machine, func, extra)
         except Exception as e:
             self.log("WARNING: flow analysis failed for %s: %s" % (name, e))
             flow = None
@@ -869,6 +914,23 @@ class Exporter(object):
             sig_line = base + 1
             self.types.ref(die, func.getReturnType())
             addr_lines = {}
+        elif self._thunk_target(func) is not None:
+            # The decompiler shows the thunked function's body for a thunk:
+            # write a forwarding call instead, and only the thunk's parameters.
+            target = self._thunk_target(func)
+            tname = self.nm(_qualified(target)) if target is not None else "?"
+            args = ", ".join(self.nm(str(p.getName())) for p in func.getParameters())
+            ret = func.getReturnType()
+            void = ret is None or isinstance(ret, VoidDataType) or ret.getLength() <= 0
+            self.c_lines += [str(func.getSignature().getPrototypeString()), "{",
+                             "  %s%s(%s);   /* thunk */" % ("" if void else "return ", tname, args), "}"]
+            sig_line = base + 1
+            addr_lines = {}
+            for ins in self.listing.getInstructions(func.getBody(), True):
+                addr_lines[int(ins.getAddress().getOffset())] = base + 3
+            proto = hf.getFunctionPrototype()
+            self.types.ref(die, proto.getReturnType() if proto is not None else ret)
+            self._export_variables(die, func, hf, ranges, flow, params_only=True)
         else:
             self._code_decls = self._find_code_decls(markup)
             lines = DecompilerUtils.toLines(markup)
@@ -945,7 +1007,43 @@ class Exporter(object):
             self.dw.add_sequence(out_rows, self.A(lo) + (hi - lo))
 
     # -- variables -------------------------------------------------------------
-    def _export_variables(self, func_die, func, hf, ranges, flow):
+    def _thunk_target(self, func):
+        """The function a thunk forwards to: Ghidra's thunks, plus functions
+        that only jump to another function (Ghidra doesn't flag PPC64 ones:
+        ELFv1 "b f", ELFv2 TOC setup + "b f+8" to the local entry)."""
+        if func.isThunk():
+            return func.getThunkedFunction(True)
+        insns = []
+        for ins in self.listing.getInstructions(func.getBody(), True):
+            insns.append(ins)
+            if len(insns) > 3:
+                return None
+        if not insns:
+            return None
+        last = insns[-1]
+        ft = last.getFlowType()
+        if ft.isConditional() or not (ft.isJump() or (ft.isCall() and ft.isTerminal())):
+            return None
+        flows = [t for t in last.getFlows() if t is not None]
+        if len(flows) != 1:
+            return None
+        fm = self.program.getFunctionManager()
+        target = fm.getFunctionAt(flows[0])
+        ppc64 = str(self.lang.getProcessor()) == "PowerPC" and self.addr_size == 8
+        if target is None and ppc64:
+            target = fm.getFunctionContaining(flows[0])
+            if target is not None and int(flows[0].getOffset()) - int(target.getEntryPoint().getOffset()) \
+                    != self._ppc64_local_entry(target):
+                target = None
+        if target is None or target == func:
+            return None
+        # anything before the jump may only set up the TOC (r2)
+        for ins in insns[:-1]:
+            if not ppc64 or str(ins.getRegister(0) or "") != "r2":
+                return None
+        return target
+
+    def _export_variables(self, func_die, func, hf, ranges, flow, params_only=False):
         lsm = hf.getLocalSymbolMap()
         params = []
         for i in range(lsm.getNumParams()):
@@ -963,6 +1061,8 @@ class Exporter(object):
         ctx = _FunctionContext(self, func, hf, ranges, flow)
         for sym in params:
             self._export_variable(func_die, sym, ctx, True)
+        if params_only:
+            return
         for sym in others:
             self._export_variable(func_die, sym, ctx, sym.isParameter())
 
@@ -1216,6 +1316,7 @@ class Exporter(object):
         return merged
 
     MAX_SECTION_RUNS = 20000
+    SECTION_BUDGET = 60000
 
     def _split_runs(self, lo, hi, code):
         """Partition [lo, hi) into [(start, end, is_code)] runs."""
@@ -1234,8 +1335,15 @@ class Exporter(object):
             i += 1
         if pos < hi:
             runs.append((pos, hi, False))
-        if len(runs) > self.MAX_SECTION_RUNS or not runs:
+        # Stay well below ELF's section index limit (elf.MAX_SECTIONS) over
+        # all blocks: past the budget a block becomes one code section.
+        used = getattr(self, "_runs_used", 0)
+        if len(runs) > min(self.MAX_SECTION_RUNS, self.SECTION_BUDGET - used) or not runs:
+            if runs:
+                self.log("WARNING: too many code/data runs in block at 0x%x; exporting it as one "
+                         "code section" % lo)
             return [(lo, hi, True)]
+        self._runs_used = used + len(runs)
         return runs
 
     def _read_bytes(self, lo, hi):
@@ -1276,8 +1384,11 @@ class Exporter(object):
                       for f in self.program.getFunctionManager().getFunctions(True)
                       if not f.isExternal() and self.in_space(f.getEntryPoint()))
         fmt = ">Q" if self.big_endian else "<Q"
+        code_ranges = self._code_ranges()
         code_blocks = [(int(b.getStart().getOffset()), int(b.getEnd().getOffset()) + 1)
-                       for b in self.memory.getBlocks() if b.isExecute() and self.in_space(b.getStart())]
+                       for b in self.memory.getBlocks() if self.in_space(b.getStart()) and (
+                           b.isExecute() or any(clo <= int(b.getEnd().getOffset()) and int(b.getStart().getOffset()) < chi
+                                                for clo, chi in code_ranges))]
         cands = []
         weak = []   # [code pointer, TOC?, 0] where the pointer isn't a function entry
         for block in self.memory.getBlocks():
@@ -1346,13 +1457,21 @@ class Exporter(object):
             lo = int(start.getOffset())
             hi = lo + int(block.getSize())
             name = str(block.getName())
-            if block.isExecute() and self.opts.split_sections:
+            # Treat a block holding functions as code even if the analyst's
+            # memory map lacks the X flag: GDB only gives source-level
+            # debugging to functions in an executable section.
+            has_code = any(clo < hi and lo < chi for clo, chi in code)
+            if has_code and not block.isExecute():
+                self.log("WARNING: memory block %s holds functions but is not executable; "
+                         "exporting its code as executable" % name)
+            exec_like = bool(block.isExecute()) or has_code
+            if exec_like and self.opts.split_sections:
                 # GDB classifies symbols (function vs data) by the flags of
                 # their section, and raw dumps are often one RWX block: emit
                 # code and data runs as separate sections.
                 runs = self._split_runs(lo, hi, code)
             else:
-                runs = [(lo, hi, bool(block.isExecute()))]
+                runs = [(lo, hi, exec_like)]
             runs = self._carve_opd(runs, opd)
             data = None
             if self.opts.embed_bytes and block.isInitialized():
@@ -1366,7 +1485,7 @@ class Exporter(object):
                     elf.add_section(Section(".opd", C.SHT_PROGBITS, C.SHF_ALLOC | C.SHF_WRITE,
                                             self.A(rlo), self._read_bytes(rlo, rhi), align=8))
                     continue
-                if not is_code and block.isExecute() and str(self.lang.getProcessor()) == "ARM":
+                if not is_code and exec_like and str(self.lang.getProcessor()) == "ARM":
                     elf.add_symbol("$d", self.A(rlo), 0, C.STT_NOTYPE, C.STB_LOCAL, C.SHN_ABS)
                 sflags = base_flags | (C.SHF_EXECINSTR if is_code else 0)
                 if is_code and text_lo is not None and rlo <= text_lo < rhi and not text_done:
@@ -1378,7 +1497,7 @@ class Exporter(object):
                     text_done = True
                 elif is_code:
                     sname = "%s.text" % name
-                elif block.isExecute():
+                elif exec_like:
                     sname = "%s.data" % name
                 else:
                     sname = name
@@ -1594,8 +1713,12 @@ class _FunctionContext(object):
     # -- physical location of values ------------------------------------------
     def _unique_home(self, vn):
         """Register a temporary (unique-space, HASH storage) decompiler
-        instance was physically written to: the register of the same size
-        that its defining instruction writes (same opcode preferred)."""
+        instance was physically written to: the register its defining
+        machine p-code op writes, if that op matches the decompiler's (same
+        opcode, same register/constant inputs). Decompiler-synthesized ops
+        (COPYs at call sites, PTRADDs, ...) have no such register: better
+        no location than a coincidental one (a call's return address
+        write)."""
         d = vn.getDef()
         if d is None or self.flow is None or d.getOpcode() == PcodeOp.MULTIEQUAL:
             return None
@@ -1603,19 +1726,62 @@ class _FunctionContext(object):
         dec = self.flow.decoded.get(off)
         if dec is None:
             return None
+        m = self.exp.machine
+        is_call = dec[0]
         size = int(vn.getSize())
-        cands = [(opc, (out[1], out[2])) for opc, out, _, _, _ in dec[5]
-                 if out is not None and out[0] == "r" and out[2] == size]
-        same = [k for opc, k in cands if opc == d.getOpcode()]
-        keys = same or [k for _, k in cands]
+        dop = d.getOpcode()
+
+        def inputs_match(op):
+            for i in range(min(int(d.getNumInputs()), 3)):
+                if i == 0 and dop in (PcodeOp.LOAD, PcodeOp.STORE):
+                    continue    # address space id: encoded differently
+                dv, mv = d.getInput(i), op[2 + i]
+                if dv is None or mv is None:
+                    continue
+                # (a machine temporary matches anything: the instruction may
+                # compute an operand the decompiler sees as a register)
+                if dv.isRegister():
+                    if mv[0] == "c" or (mv[0] == "r" and
+                                        (mv[1], mv[2]) != (int(dv.getOffset()), int(dv.getSize()))):
+                        return False
+                elif dv.isConstant():
+                    if mv[0] == "r" or (mv[0] == "c" and mv[1] != int(dv.getOffset())):
+                        return False
+            return True
+
+        def usable(k):
+            return not (is_call and k == m.ra_key)
+
+        # the matching op's output register -- directly, or through a COPY of
+        # its temporary result (x86 "mov rbp,[rdi+8]": U = LOAD ..; RBP = COPY U)
+        copies = {}
+        for opc, out, i0, _, _ in dec[5]:
+            if opc == PcodeOp.COPY and out is not None and out[0] == "r" and i0 is not None and i0[0] == "u":
+                copies.setdefault(i0, (out[1], out[2]))
+        keys = []
+        for op in dec[5]:
+            opc, out = op[0], op[1]
+            if opc != dop or out is None or out[2] != size or not inputs_match(op):
+                continue
+            k = (out[1], out[2]) if out[0] == "r" else copies.get(out) if out[0] == "u" else None
+            if k is not None and k[1] == size and usable(k):
+                keys.append(k)
         keys = list(dict.fromkeys(keys))
+        if len(keys) == 1:
+            return keys[0]
         if keys:
-            return keys[-1] if len(keys) == 1 or same else None
+            return None
         # A 32-bit result written to a 64-bit register (AArch64 "add w0,.."
-        # is X0 = zext(..), MIPS64/PPC64 sign-extend): the low part.
+        # is X0 = zext(..), MIPS64/PPC64 sign-extend): the low part -- if the
+        # machine op computing it matches.
+        if not any(opc == dop and out is not None and out[0] == "u" and out[2] == size
+                   and inputs_match(op) for op in dec[5] for opc, out in [op[:2]]):
+            return None
         wide = list(dict.fromkeys((out[1], out[2]) for opc, out, _, _, _ in dec[5]
                                   if out is not None and out[0] == "r" and out[2] > size
-                                  and self.exp.machine.dwarf_of((out[1], out[2])) is not None))
+                                  and opc in (PcodeOp.INT_ZEXT, PcodeOp.INT_SEXT, PcodeOp.COPY)
+                                  and usable((out[1], out[2]))
+                                  and m.dwarf_of((out[1], out[2])) is not None))
         if len(wide) != 1:
             return None
         off_, sz = wide[0]
@@ -1627,6 +1793,11 @@ class _FunctionContext(object):
         if flow is None:
             return None
         if vn.isUnique():
+            d = vn.getDef()
+            if (d is not None and d.getOpcode() == PcodeOp.COPY and d.getInput(0) is not None
+                    and d.getInput(0).isRegister()):
+                # a copy of a register (e.g. at a call site): the same value
+                return self.instance_value(d.getInput(0))
             home = self._unique_home(vn)
             if home is None:
                 return None

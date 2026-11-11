@@ -102,6 +102,9 @@ sc_vector:
 /* ---- handlers outside the vector area ------------------------------- */
 
     .text
+    /* No rfi of its own: leaves through the shared irq_exit, so it is only
+       recognized as a handler because the (INTERRUPT-tagged) vector stub
+       branches to it. */
     .globl prog_entry
     .type prog_entry, @function
 prog_entry:
@@ -111,8 +114,14 @@ prog_entry:
     lwz     r3, 12(r1)          /* skip the trap instruction */
     addi    r3, r3, 4           /* (not r0: "addi rD,r0,x" means rD = x) */
     stw     r3, 12(r1)
-    RESTORE_FRAME_RFI
+    b       irq_exit
     .size prog_entry, . - prog_entry
+
+    .globl irq_exit
+    .type irq_exit, @function
+irq_exit:
+    RESTORE_FRAME_RFI
+    .size irq_exit, . - irq_exit
 
     .globl dec_entry
     .type dec_entry, @function
@@ -159,3 +168,65 @@ irq_disable:
     mtmsr   r4
     blr
     .size irq_disable, . - irq_disable
+
+/* ---- shapes from the adversarial review ------------------------------ */
+
+/* Out-of-line register save/restore helpers as GCC -Os -mno-multiple (and
+   other compilers) use them: r11 points at the top of the frame. */
+    .globl _savegpr_29
+    .type _savegpr_29, @function
+_savegpr_29:
+    stw     r29, -12(r11)
+    stw     r30, -8(r11)
+    stw     r31, -4(r11)
+    blr
+    .size _savegpr_29, . - _savegpr_29
+
+    .globl _restgpr_29_x
+    .type _restgpr_29_x, @function
+_restgpr_29_x:
+    lwz     r0, 4(r11)
+    lwz     r29, -12(r11)
+    lwz     r30, -8(r11)
+    lwz     r31, -4(r11)
+    mtlr    r0
+    mr      r1, r11
+    blr
+    .size _restgpr_29_x, . - _restgpr_29_x
+
+    /* int shape_os(int a, int b, int c): saves r29-r31 through the helper,
+       keeps its arguments there across a call */
+    .globl shape_os
+    .type shape_os, @function
+shape_os:
+    stwu    r1, -32(r1)
+    mflr    r0
+    addi    r11, r1, 32
+    bl      _savegpr_29
+    stw     r0, 36(r1)
+    mr      r31, r3
+    mr      r30, r4
+    mr      r29, r5
+    bl      shape_probe
+    add     r3, r31, r30
+    add     r3, r3, r29
+    addi    r11, r1, 32
+    b       _restgpr_29_x
+    .size shape_os, . - shape_os
+
+    /* int early_init(int v): boot-code style, no stack frame: the return
+       address is parked in r30 (whose own value goes to a global) */
+    .globl early_init
+    .type early_init, @function
+early_init:
+    lis     r9, g_saved_r30@ha
+    stw     r30, g_saved_r30@l(r9)
+    mflr    r30
+    bl      shape_probe
+    addi    r3, r3, 1
+    bl      shape_probe
+    mtlr    r30
+    lis     r9, g_saved_r30@ha
+    lwz     r30, g_saved_r30@l(r9)
+    blr
+    .size early_init, . - early_init

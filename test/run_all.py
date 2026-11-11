@@ -26,6 +26,7 @@ sys.path.insert(0, HERE)
 from targets import TARGETS  # noqa: E402
 import build_fw  # noqa: E402
 import export_fw  # noqa: E402
+import difftrace  # noqa: E402
 import roundtrip  # noqa: E402
 import run_gdb_test  # noqa: E402
 
@@ -79,6 +80,16 @@ def job(target, opt, sanitized, work, verbose):
             report["ok"] = False
             if not summary:
                 report["lines"].append("[%s] %s" % (label, out[-2000:]))
+    if not sanitized:
+        # unwinding at every instruction vs GCC's own CFI
+        msgs = []
+        for start, steps in (("shapes_main", 5000), ("edge_main", 3000)):
+            ok, lines = difftrace.difftrace(build, elf, steps, start,
+                                            work=os.path.join(out_dir, "out"))
+            msgs.append(lines[0])
+            if not ok:
+                fail("unwinding differs from GCC's CFI (from %s):\n    %s" % (start, "\n    ".join(lines)))
+        report["counts"]["diff"] = "ok" if report["ok"] else "; ".join(msgs)
     report["time"] = time.time() - t0
     return report
 
@@ -130,6 +141,7 @@ def main():
             name, "ok" if rep["ok"] else "FAIL", rep["counts"].get("main", "-"),
             rep["counts"].get("edge", "-"),
             " feat: " + rep["counts"].get("feat", "-") + " rt: " + rep["counts"].get("rt", "-")
+            + " diff: " + ("ok" if rep["counts"].get("diff") == "ok" else rep["counts"].get("diff", "-"))
             + ((" irq: " + rep["counts"]["irq"]) if "irq" in rep["counts"] else "")))
     print("ALL TESTS PASSED" if all_ok else "SOME TESTS FAILED")
     return 0 if all_ok else 1

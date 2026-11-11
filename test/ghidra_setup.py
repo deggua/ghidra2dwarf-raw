@@ -71,6 +71,10 @@ GLOBAL_TYPES = {
     "g_stats": lambda: find_type("stats"),
     "g_result": lambda: ArrayDataType(find_type("int"), 8, -1),
     "g_banner": lambda: ArrayDataType(find_type("char"), 8, -1),
+    "g_poke": lambda: find_type("int"),
+    "g_shape_sink": lambda: find_type("int"),
+    "g_shape_arr": lambda: ArrayDataType(find_type("int"), 10, -1),
+    "g_shape_result": lambda: ArrayDataType(find_type("int"), 8, -1),
 }
 
 # 3. Symbols (name addr size type) from the reference build.

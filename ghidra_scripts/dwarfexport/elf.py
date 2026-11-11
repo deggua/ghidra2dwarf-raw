@@ -113,8 +113,14 @@ class ElfWriter(object):
         with open(path, "wb") as f:
             f.write(self.to_bytes())
 
+    # Section indexes from SHN_LORESERVE (0xff00) on are reserved (SHN_ABS,
+    # SHN_COMMON, ...); more sections would need SHN_XINDEX/SHT_SYMTAB_SHNDX.
+    MAX_SECTIONS = 0xff00 - 4
+
     def to_bytes(self):
         word = 8 if self.is64 else 4
+        if len(self.sections) + 3 > self.MAX_SECTIONS:
+            raise ValueError("too many ELF sections (%d)" % len(self.sections))
 
         if self.symbols:
             symtab, strtab, first_global, entsize = self._build_symtab()

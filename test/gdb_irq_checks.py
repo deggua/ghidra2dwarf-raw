@@ -118,12 +118,36 @@ def main():
         here = func_at(gdb.selected_frame().pc())
         check("stepi over rfi returns to the interrupted function", here in ("busy_work", "irq_test"), here)
 
+    # --- out-of-line register save helper (_savegpr_29) -------------------------
+    cont_to("shape_probe", "v == 111")
+    names = frame_names()
+    check("savegpr: backtrace", names[:4] == ["shape_probe", "shape_os", "shape_os_caller", "irq_test"]
+          and names[-1] == "_reset", names)
+    select_frame("shape_os_caller")
+    v = val("q")
+    if v.is_optimized_out:
+        print("SKIP savegpr caller q (<optimized out>)")
+    else:
+        check_eq("savegpr: caller's q restored from the helper's save slot", "q", 222)
+
+    # --- return address parked in r30 (no stack frame) ---------------------------
+    cont_to("shape_probe", "v == 5")
+    names = frame_names()
+    check("RA in register: backtrace", names[:3] == ["shape_probe", "early_init", "irq_test"]
+          and names[-1] == "_reset", names)
+    cont_to("shape_probe", "v == 11")
+    names = frame_names()
+    check("RA in register (2nd call): backtrace", names[:3] == ["shape_probe", "early_init", "irq_test"]
+          and names[-1] == "_reset", names)
+
     # --- end state ----------------------------------------------------------------
     cont_to("edge_main")
     check_eq("syscall result", "g_irq_result[0]", 42)
     check_eq("traps", "g_irq_result[1]", 1)
     check_eq("trap pc", "g_trap_pc == (unsigned long)&trap_now", 1)
     check_eq("irq_test finished", "g_irq_result[3]", 0x1234)
+    check_eq("shape_os_caller result", "g_irq_result[4]", 558)
+    check_eq("early_init result", "g_irq_result[5]", 22)
     check("ticks", int(val("g_ticks")) >= 3, str(val("g_ticks")))
 
 

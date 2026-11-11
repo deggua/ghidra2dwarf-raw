@@ -193,6 +193,14 @@ Things to check in your Ghidra project, all found while testing:
     spec has no callee-pops convention.
   * `char` signedness follows the compiler spec, which for most processors is
     signed (GCC uses unsigned on ARM, AArch64 and PowerPC).
+* **Unrecovered switch tables.** If neither Ghidra nor its decompiler
+  recovers a jump table ("Could not recover jumptable" in the decompiled
+  code), the case code is not part of the function: it has no line info,
+  CFI or variables, so stepping and backtraces there (and through calls made
+  from there) go wrong. Recover the table (e.g. the `SwitchOverride.java`
+  script with the case addresses), then re-export. Case code that is in the
+  function body but only reachable through an unresolved computed jump is
+  analyzed with the state at the jump.
 * **Language variant.** Pick one that decodes all your instructions; e.g. POWER8+
   code needs `PowerPC:*:64:A2ALT`, since the `default` PPC64 languages lack VSX
   (`mtfprd`).
@@ -243,9 +251,12 @@ code.
 
 * **Memory map**: allocated sections for the loaded memory blocks in the
   default address space (overlays and other spaces are skipped), with the
-  blocks' R/W/X permissions. Executable blocks are split into code runs
-  (function bodies) and data runs, since GDB decides whether a symbol is a
-  function or data from its section, and raw dumps are often one RWX block.
+  blocks' R/W/X permissions. Blocks holding functions are split into code
+  runs (function bodies) and data runs, since GDB decides whether a symbol is
+  a function or data from its section, and raw dumps are often one RWX block.
+  A block that holds functions but lacks the X flag (a hand-made memory map)
+  is still exported as code, with a warning: GDB only gives functions in an
+  executable section source-level debugging.
   The main code run is named `.text`: GDB files DWARF function symbols under
   `.text`, and without it `list func` / `info line func` fail.
 * **Symbols** (`.symtab`): functions (`STT_FUNC`, with size), defined data
@@ -257,7 +268,10 @@ code.
   packed layouts, anonymous members, flexible array members), unions, enums
   (including 8-byte and > `INT_MAX` values), multi-dimensional arrays, and
   function types (including varargs). Every struct/union/enum/typedef is
-  exported, even unused ones. Ghidra-only types are mapped as follows:
+  exported, even unused ones. Struct/union/enum names also get a same-named
+  typedef (unless one exists), since the pseudo-C uses them without the tag
+  keyword: `p sizeof(msg)` works like `p sizeof(struct msg)`. Ghidra-only
+  types are mapped as follows:
 
   | Ghidra | DWARF |
   |--------|-------|
@@ -303,11 +317,20 @@ values, so the exporter combines two analyses:
    interpretation over the raw p-code of every instruction (`flow.py`). It
    tracks the stack pointer as *entry SP + delta*, register entry values,
    per-instruction definitions, phi merges at joins, and stack slots, through
-   copies, spills/reloads, zero/sign extensions and sub-register views, and
-   calls (call-clobbered registers are invalidated). Decompiler temporaries
-   (HASH storage) are followed through the register their defining
-   instruction wrote. A parameter the decompiled code never reads is shown
-   wherever its entry value still exists.
+   copies, spills/reloads, zero/sign extensions and sub-register views,
+   constants built in pieces (`lis`/`ori`), conditionally executed p-code
+   (ARM conditional instructions, x86 `cmov`, conditional returns such as
+   PPC `beqlr`, MIPS branch-likely delay slots), and calls (call-clobbered
+   registers are invalidated). Stack slots whose address escapes (passed to
+   a callee or stored to memory) are forgotten at calls and at stores
+   through pointers, since the callee may change them. Calls to out-of-line
+   register save/restore helpers (`_savegpr_N`, `_restgpr_N_x`, `_savefpr_N`,
+   ... by name, or any function marked *inline* in Ghidra) are interpreted
+   as part of the caller instead of as calls. Decompiler temporaries (HASH
+   storage) are followed through the register their defining machine
+   operation wrote, if that operation matches the decompiler's (otherwise no
+   location rather than a coincidental one). A parameter the decompiled code
+   never reads is shown wherever its entry value still exists.
 
 At each PC the exporter picks the best physical location for the current
 value. Call-preserved registers and stack slots are preferred because they
@@ -315,11 +338,14 @@ stay valid when the frame is a caller frame. If the value no longer exists
 anywhere, the variable shows as `<optimized out>`, as with optimized
 compiler-generated debug info.
 
-The same analysis yields the CFI: the CFA rule (SP + offset, or a frame
-pointer register) and the save slots of the return address and callee-saved
-registers at every instruction, including shrink-wrapped functions (the
-return address saved on only some paths), epilogue restores, and reloads in
-delay slots. The rules are derived from the state at each PC (which register
+The same analysis yields the CFI: the CFA rule (SP + offset, or a
+call-preserved frame pointer register) and the save slots of the return
+address and callee-saved registers at every instruction, including
+shrink-wrapped functions (the return address saved on only some paths),
+epilogue restores, reloads in delay slots, and a return address kept in
+another register (boot code without a stack: `mflr r30`, emitted as
+`DW_CFA_register`). Where the CFA can't be tracked, no FDE covers the code,
+so GDB uses its prologue analyzer there instead of a stale rule. The rules are derived from the state at each PC (which register
 or stack slot still holds each entry value), not from save/restore events. Call-clobbered
 registers are marked `DW_CFA_undefined`, so caller frames show them as not
 saved instead of showing the callee's values. Program entry points get an
@@ -358,9 +384,14 @@ undefined return address, so backtraces end cleanly.
 * Only the default address space. Overlays and bank-switched memory are not
   represented.
 * The CFI analysis understands SP-relative frames and frame pointers copied
-  from SP. Stack realignment (`and sp, -16`) or `alloca`-style dynamic SP
-  changes end CFA tracking for the rest of the function, and GDB falls back to
-  its prologue analyzer there.
+  from SP. After a stack realignment (`and esp, -64`) or an `alloca`-style
+  dynamic SP change the CFA is unknown, so no FDE covers that code and GDB
+  falls back to its prologue analyzer. That works in most places, but on i386
+  -O2 it gets the caller of a realigned frame wrong (GCC describes such
+  frames with a DRAP register and `DW_CFA_def_cfa_expression`, which the
+  exporter doesn't synthesize yet).
+* Thunks (a function that only jumps to another one) are written as a
+  one-line forwarding call in the `.c` file.
 * Values that only exist as an expression of other registers (e.g. `i` when
   only `i+1` is kept) are reported as `<optimized out>`. There's no
   `DW_OP_stack_value` synthesis.
@@ -482,10 +513,26 @@ The edge-case module (`firmware/edge.c`, `edge_asm.S`, `ghidra_setup_edge.py`,
   field by field against GCC's own decode), a struct split over two
   registers or two stack slots, and a struct return type;
 * a non-contiguous function (stepping into its detached tail and backtracing
-  from there), and a function whose decompilation fails or is skipped.
+  from there), and a function whose decompilation fails or is skipped;
+* code shapes found by an adversarial review (`firmware/shapes.c`): a
+  conditional return before the frame setup, conditional moves, a 40 KB
+  frame, arguments copied into a stack object a callee modifies, a store as
+  the first instruction, a realigned stack, a thunk; on ppc32 also
+  out-of-line `_savegpr`/`_restgpr` helpers, a return address parked in r30,
+  and an exception handler that leaves through a shared `rfi` exit;
+* a memory map without the X flag (ppc32-linux).
+
+**Differential unwinding test** (`test/difftrace.py`): the firmware is
+single-stepped twice from the same point (5,000 instructions from
+`shapes_main`, 3,000 from `edge_main`), once with GCC's own debug info and
+once with the export, and the unwound PC and SP of every frame must be
+identical at every instruction (wherever GCC has CFI, i.e. outside
+hand-written assembly).
 
 All of it runs on all 20 targets at three `-O` levels, and with
-`sanitize_names=true`: 80 export-and-debug runs.
+`sanitize_names=true`: 80 export-and-debug runs. (The ppc32 ROM must stay
+under 16 KB: QEMU's mac99 machine overwrites larger `-bios` images from
+0xfff04000 on; the build checks this.)
 
 Where GDB or QEMU gets something wrong even with GCC's own debug info, the
 checks detect it and skip: floating point registers in some GDB+QEMU

@@ -169,6 +169,87 @@ class MachineInfo(object):
             cache[off] = p if 0 < p < 0x10000 else 0
         return cache[off]
 
+    # GCC/compiler register save and restore helpers, called like functions
+    # but part of the caller's prologue/epilogue.
+    _HELPER_RE = __import__("re").compile(
+        r"^_+(save|rest)(gpr|fpr|vr|_?gpr|_?fpr)[01]?_?\d+(_[a-z])?$|^_+(save|rest)_?(gp)?r(eg)?s?_?\d+$")
+
+    def callee_area(self, target):
+        """Bytes above the SP at a call that belong to the callee (the
+        caller keeps no values there): the ABI's reserved words and the
+        callee's stack arguments (which it may modify)."""
+        proc = str(self.lang.getProcessor())
+        if proc == "PowerPC":
+            area = 8 if self.ptr_size == 4 else 32     # back chain + LR save word / ELFv1-v2 header
+        elif proc == "MIPS" and self.regs_size() == 4:
+            area = 16                                  # o32 argument home slots
+        else:
+            area = 0
+        return max(area, self._stack_args_extent(target))
+
+    def _stack_args_extent(self, target):
+        if target is None:
+            return 0
+        off = int(target.getOffset())
+        cache = getattr(self, "_args_extent", None)
+        if cache is None:
+            cache = self._args_extent = {}
+        if off not in cache:
+            ext = 0
+            f = self.program.getFunctionManager().getFunctionAt(target)
+            if f is not None:
+                for p in f.getParameters():
+                    stg = p.getVariableStorage()
+                    if stg.isStackStorage():
+                        # callee offsets are from its entry SP, which is the
+                        # caller's SP at the call plus the pushed return address
+                        ext = max(ext, int(stg.getStackOffset()) + int(stg.size()) - self.stackshift)
+            cache[off] = min(max(ext, 0), 4096)
+        return cache[off]
+
+    def regs_size(self):
+        """Size of a general register (MIPS: 8 for n32 although pointers are 4)."""
+        sp = self.lang.getRegister("sp") or self.lang.getRegister("r1")
+        return int(sp.getMinimumByteSize()) if sp is not None else self.ptr_size
+
+    def inline_body(self, target):
+        """Decoded data p-code of a register save/restore helper called at
+        `target` (by name, or a function Ghidra marks inline), else None."""
+        if target is None:
+            return None
+        off = int(target.getOffset())
+        cache = getattr(self, "_inline", None)
+        if cache is None:
+            cache = self._inline = {}
+        if off in cache:
+            return cache[off]
+        body = None
+        f = self.program.getFunctionManager().getFunctionAt(target)
+        if f is not None and (f.isInline() or self._HELPER_RE.match(str(f.getName()))):
+            ops = []
+            ok = False
+            n = 0
+            for ins in self.listing.getInstructions(f.getBody(), True):
+                n += 1
+                ft = ins.getFlowType()
+                if n > 64 or ft.isCall() or ft.isConditional():
+                    ops = None
+                    break
+                for op in ins.getPcode():
+                    opc = int(op.getOpcode())
+                    if opc in (PcodeOp.RETURN, PcodeOp.BRANCH, PcodeOp.BRANCHIND, PcodeOp.CBRANCH):
+                        continue
+                    k = op.getNumInputs()
+                    ins_ = [FunctionFlow._decode(op.getInput(i)) if i < k else None for i in range(3)]
+                    ops.append((opc, FunctionFlow._decode(op.getOutput()), ins_[0], ins_[1], ins_[2]))
+                if ft.isTerminal():
+                    ok = True
+                    break
+            if ops is not None and ok:
+                body = ops
+        cache[off] = body
+        return body
+
     def is_preserved(self, key):
         """Is the register (or the register containing it) preserved across
         calls, so that CFI can unwind it in caller frames?"""
@@ -182,21 +263,33 @@ class MachineInfo(object):
 # ----------------------------------------------------------------------------
 
 class State(object):
-    __slots__ = ("regs", "mem", "saved")
+    __slots__ = ("regs", "mem", "saved", "esc")
 
-    def __init__(self, regs=None, mem=None, saved=None):
+    def __init__(self, regs=None, mem=None, saved=None, esc=None):
         self.regs = regs if regs is not None else {}     # (off,size) -> value
         self.mem = mem if mem is not None else {}        # sp offset -> (size, value)
         self.saved = saved if saved is not None else {}  # (off,size) -> sp offset
+        # lowest SP offset whose address has escaped (passed to a callee or
+        # stored to memory): stack slots from there up can change behind
+        # our back at calls and stores through pointers
+        self.esc = esc
 
     def copy(self):
-        return State(dict(self.regs), dict(self.mem), dict(self.saved))
+        return State(dict(self.regs), dict(self.mem), dict(self.saved), self.esc)
+
+    def assign(self, other):
+        self.regs, self.mem, self.saved, self.esc = other.regs, other.mem, other.saved, other.esc
 
     def __eq__(self, other):
-        return self.regs == other.regs and self.mem == other.mem and self.saved == other.saved
+        return (self.regs == other.regs and self.mem == other.mem and self.saved == other.saved
+                and self.esc == other.esc)
 
     def __ne__(self, other):
         return not self.__eq__(other)
+
+
+def _min_esc(a, b):
+    return b if a is None else (a if b is None else min(a, b))
 
 
 def _signed(c, size):
@@ -213,12 +306,17 @@ class FunctionFlow(object):
     ``state_out``  {offset: State} after each reachable instruction
     """
 
-    def __init__(self, machine, func):
+    def __init__(self, machine, func, extra_edges=None):
         self.m = machine
         self.func = func
+        # {instruction offset: [target offsets]}: computed jumps the
+        # decompiler resolved (switch jump tables)
+        self.extra_edges = extra_edges or {}
         self.listing = machine.listing
         self.state_in = {}
         self.state_out = {}
+        self.state_taken = {}   # out-state of the taken path where it differs (branch likely)
+        self.taken = None
         self.insn_len = {}
         self.insns = []
         self.converged = True
@@ -298,6 +396,8 @@ class FunctionFlow(object):
             return ("r", int(vn.getOffset()), int(vn.getSize()))
         if vn.isUnique():
             return ("u", int(vn.getOffset()), int(vn.getSize()))
+        if vn.getAddress().isMemoryAddress():
+            return ("a", int(vn.getOffset()), int(vn.getSize()))   # branch targets
         return ("x",)
 
     def _get(self, st, d):
@@ -351,97 +451,236 @@ class FunctionFlow(object):
                 return (SP, a[1] + _signed(b[1], b[2]))
             if b[0] == SP and a[0] == CONST:
                 return (SP, b[1] + _signed(a[1], a[2]))
-            if a[0] == CONST and b[0] == CONST:
-                return (CONST, (a[1] + b[1]) & ((1 << (8 * a[2])) - 1), a[2])
         elif opc == PcodeOp.INT_SUB:
             if a[0] == SP and b[0] == CONST:
                 return (SP, a[1] - _signed(b[1], b[2]))
+        if a[0] == CONST and b[0] == CONST:
+            # constants built in pieces (PPC "lis r0,-1; ori r0,r0,0x63b0"
+            # for a frame over 32 KB, MIPS lui/ori, ...)
+            size = a[2]
+            mask = (1 << (8 * size)) - 1
+            x, y = a[1], b[1]
+            if opc == PcodeOp.INT_ADD:
+                r = x + y
+            elif opc == PcodeOp.INT_SUB:
+                r = x - y
+            elif opc == PcodeOp.INT_OR:
+                r = x | y
+            elif opc == PcodeOp.INT_AND:
+                r = x & y
+            elif opc == PcodeOp.INT_XOR:
+                r = x ^ y
+            elif opc == PcodeOp.INT_LEFT:
+                r = x << y if y < 64 else 0
+            elif opc == PcodeOp.INT_RIGHT:
+                r = x >> y if y < 64 else 0
+            elif opc == PcodeOp.INT_SRIGHT:
+                r = _signed(x, size) >> min(y, 63)
+            elif opc == PcodeOp.INT_MULT:
+                r = x * y          # (ARM vpush: register count * 4)
+            else:
+                return None
+            return (CONST, r & mask, size)
         return None
 
     # -- transfer function ---------------------------------------------------------
     _ARITH = (PcodeOp.INT_ADD, PcodeOp.INT_SUB, PcodeOp.INT_OR, PcodeOp.INT_AND, PcodeOp.INT_XOR,
-              PcodeOp.INT_LEFT, PcodeOp.INT_RIGHT, PcodeOp.INT_SRIGHT)
+              PcodeOp.INT_LEFT, PcodeOp.INT_RIGHT, PcodeOp.INT_SRIGHT, PcodeOp.INT_MULT)
+
+    def _local_target(self, i, i0, nexts, n):
+        """Where a branch op at p-code index i goes inside the instruction:
+        an op index, "next" (fall through: the rest of the p-code is
+        conditional, e.g. ARM conditional execution, x86 CMOVcc), or None
+        (a real branch to another instruction)."""
+        if i0 is None:
+            return None
+        if i0[0] == "c":
+            t = i + _signed(i0[1], i0[2] or 8)   # p-code relative branch
+            return "next" if t >= n else (t if t > i else None)
+        if i0[0] == "a" and i0[1] in nexts:
+            return "next"
+        return None
 
     def step(self, st, off):
         """Applies the instruction at offset ``off`` to ``st`` in place."""
-        is_call, _, _, _, _, ops = self.decoded[off]
+        is_call, _, _, _, _, ops, nexts = self.decoded[off][:7]
         sp_before = self.reg_value(st, self.m.sp_key)
         written = set()
-        for opc, out, i0, i1, i2 in ops:
-            if out is not None and out[0] == "r":
-                written.add((out[1], out[2]))
-            if opc == PcodeOp.STORE:
-                addr = self._get(st, i1)
-                if addr is not None and addr[0] == SP:
-                    soff = addr[1]
-                    size = i2[2] if len(i2) > 2 else 0
-                    for o in [o for o, (sz, _) in st.mem.items() if o < soff + size and soff < o + sz]:
-                        del st.mem[o]
-                    val = self._get(st, i2)
-                    st.mem[soff] = (size, val)
-                    if (val is not None and val[0] == INIT and val[1] not in st.saved
-                            and self.m.dwarf_of(val[1]) is not None):
-                        st.saved[val[1]] = soff
+        self.side_effect = False   # memory access other than the own stack frame
+        pend = {}        # p-code index / "next" -> state reaching it by a local branch
+        alive = True     # is the current straight-line path executing?
+        left = False     # has the current path left the instruction (return, jump)?
+        n = len(ops)
+        for idx, op in enumerate(ops):
+            opc, out, i0 = op[0], op[1], op[2]
+            if idx in pend:
+                other = pend.pop(idx)
+                if alive:
+                    st.assign(self.merge(st, other, ("pcode", off, idx)))
+                else:
+                    st.assign(other)
+                    alive, left = True, False
+            if not alive:
                 continue
-            if out is None:
+            if opc in (PcodeOp.CBRANCH, PcodeOp.BRANCH):
+                tgt = self._local_target(idx, i0, nexts, n)
+                if tgt is not None:
+                    snap = st.copy()
+                    if tgt in pend:
+                        snap = self.merge(pend[tgt], snap, ("pcode", off, tgt))
+                    pend[tgt] = snap
+                    if opc == PcodeOp.BRANCH:
+                        alive = False
+                    continue
+                if opc == PcodeOp.BRANCH:
+                    left = True
                 continue
-            if opc == PcodeOp.COPY:
-                val = self._get(st, i0)
-            elif opc in self._ARITH:
-                val = self._arith(opc, self._get(st, i0), self._get(st, i1))
-            elif opc == PcodeOp.LOAD:
-                val = None
-                addr = self._get(st, i1)
-                if addr is not None and addr[0] == SP:
-                    slot = st.mem.get(addr[1])
-                    if slot is not None and len(out) > 2 and slot[0] == out[2]:
-                        val = slot[1]
-            elif opc == PcodeOp.SUBPIECE and i1 is not None and i1[0] == "c" and i1[1] == 0:
-                # Low-order bytes of a value (e.g. MIPS64 "sw a0,.." stores
-                # the 32-bit low part of the 64-bit a0): same origin, narrower.
-                val = self._narrow(self._get(st, i0), out[2] if len(out) > 2 else 0)
-            elif opc in (PcodeOp.INT_ZEXT, PcodeOp.INT_SEXT) and out[0] == "r" and i0[0] in "ru":
-                # Widening writes (x86-64 "mov ebx, edi" is RBX = zext(EBX),
-                # MIPS64/PPC64 32-bit ops sign-extend): the wide register gets
-                # a new value, but its low part still holds the narrow one.
-                inner = self._get(st, i0)
-                # an extended stack address is still that address (n32:
-                # "addiu sp,sp,-16" = sext(sp:4 - 16))
-                self._set(st, out, inner if (inner is not None and inner[0] == SP) else None, off)
-                if inner is not None and i0[2] < out[2]:
-                    lo = out[1] if not self.m.big_endian else out[1] + out[2] - i0[2]
-                    st.regs[(lo, i0[2])] = inner
+            if opc in (PcodeOp.RETURN, PcodeOp.BRANCHIND):
+                left = True
                 continue
+            self._apply(st, op, off, written)
+
+        self.taken = None
+        skipped = pend.pop("next", None)
+        if skipped is not None:
+            if not alive or left:
+                # conditional terminator (beqlr, popeq {..,pc}) or branch
+                # likely: only the not-taken path falls through; a jump
+                # target gets the taken path's state
+                if alive:
+                    self.taken = st.copy()
+                st.assign(skipped)
             else:
-                val = None
-            self._set(st, out, val, off)
+                st.assign(self.merge(st, skipped, ("pcode", off, "next")))
 
         for k in [k for k in st.regs if k[0] == "u"]:
             del st.regs[k]
 
         if is_call:
-            # The callee returns with the SP as before the call (plus any
-            # arguments it pops itself: stdcall, -mrtd) and clobbers every
-            # register that is not preserved across calls.
-            if sp_before is not None:
-                if sp_before[0] == SP:
-                    purge = self.m.stack_purge(self.call_targets.get(off))
-                    st.regs[self.m.sp_key] = (SP, sp_before[1] + purge)
-                else:
-                    st.regs[self.m.sp_key] = sp_before
-            for k in self.m.volatile:
-                st.regs[k] = (DEF, off, k)
-            for k in list(st.regs):
-                if k != self.m.sp_key and k not in self.m.unaffected and k not in self.m.volatile:
-                    if k != self.m.ra_key:
-                        st.regs[k] = (DEF, off, k)
-            if self.m.ra_key is not None and self.m.ra_key in written:
-                st.regs[self.m.ra_key] = (DEF, off, self.m.ra_key)
+            target = self.call_targets.get(off)
+            body = self.m.inline_body(target)
+            if body is not None:
+                # register save/restore helper (_savegpr_N, ...): its effect
+                # is part of the caller's prologue/epilogue
+                for op in body:
+                    self._apply(st, op, off, written)
+                for k in [k for k in st.regs if k[0] == "u"]:
+                    del st.regs[k]
+            else:
+                self._call_effects(st, off, target, sp_before, written)
 
         # Registers reloaded with their entry value are "restored".
         for k in list(st.saved):
             if k in written and st.regs.get(k) == (INIT, k):
                 del st.saved[k]
+
+    def _is_save_slot(self, value):
+        """Does a stack slot holding value save a register for the caller
+        (a call-preserved register's or the return address' entry value)?"""
+        if value is None or value[0] != INIT:
+            return False
+        k = value[1]
+        return k == ("ra",) or k == self.m.ra_key or (isinstance(k[0], int) and self.m.is_preserved(k))
+
+    def _clobber_escaped(self, st):
+        """Stack slots whose address escaped may have been changed."""
+        if st.esc is None:
+            return
+        for o in [o for o, (_, v) in st.mem.items() if o >= st.esc and not self._is_save_slot(v)]:
+            del st.mem[o]
+
+    def _call_effects(self, st, off, target, sp_before, written):
+        m = self.m
+        # The callee may use stack addresses it was given (in a register),
+        # and owns the ABI's area just above the SP at the call (PPC LR save
+        # word, MIPS o32 argument home slots, stack arguments).
+        for k, v in st.regs.items():
+            if v is not None and v[0] == SP and k[0] != "u" and k != m.sp_key and not m.is_preserved(k):
+                st.esc = _min_esc(st.esc, v[1])
+        if sp_before is not None and sp_before[0] == SP:
+            lo, hi = sp_before[1], sp_before[1] + m.callee_area(target)
+            for o in [o for o, (_, v) in st.mem.items() if lo <= o < hi and not self._is_save_slot(v)]:
+                del st.mem[o]
+        self._clobber_escaped(st)
+        # The callee returns with the SP as before the call (plus any
+        # arguments it pops itself: stdcall, -mrtd) and clobbers every
+        # register that is not preserved across calls.
+        if sp_before is not None:
+            if sp_before[0] == SP:
+                st.regs[m.sp_key] = (SP, sp_before[1] + m.stack_purge(target))
+            else:
+                st.regs[m.sp_key] = sp_before
+        for k in m.volatile:
+            st.regs[k] = (DEF, off, k)
+        for k in list(st.regs):
+            # (views inside a preserved register survive too: n32's SP low half)
+            if k[0] != "u" and k not in m.volatile and k != m.ra_key and not m.is_preserved(k):
+                st.regs[k] = (DEF, off, k)
+        if m.ra_key is not None and m.ra_key in written:
+            st.regs[m.ra_key] = (DEF, off, m.ra_key)
+
+    def _apply(self, st, op, off, written):
+        """One data p-code op (no control flow)."""
+        opc, out, i0, i1, i2 = op
+        if out is not None and out[0] == "r":
+            written.add((out[1], out[2]))
+        if opc == PcodeOp.STORE:
+            addr = self._get(st, i1)
+            val = self._get(st, i2)
+            if val is not None and val[0] == SP and not (addr is not None and addr[0] == SP):
+                # a stack address stored outside the stack escapes (stored
+                # into the frame -- e.g. the PPC back chain -- it only does if
+                # reloaded and passed on, which the call check catches)
+                st.esc = _min_esc(st.esc, val[1])
+            if addr is not None and addr[0] == SP:
+                soff = addr[1]
+                size = i2[2] if len(i2) > 2 else 0
+                for o in [o for o, (sz, _) in st.mem.items() if o < soff + size and soff < o + sz]:
+                    del st.mem[o]
+                st.mem[soff] = (size, val)
+                if (val is not None and val[0] == INIT and val[1] not in st.saved
+                        and self.m.dwarf_of(val[1]) is not None):
+                    st.saved[val[1]] = soff
+            else:
+                self.side_effect = True
+                self._clobber_escaped(st)     # may write into an escaped object
+            return
+        if out is None:
+            if opc not in (PcodeOp.CALLOTHER, PcodeOp.CALL, PcodeOp.CALLIND):
+                return
+            return
+        if opc == PcodeOp.COPY:
+            val = self._get(st, i0)
+        elif opc in self._ARITH:
+            val = self._arith(opc, self._get(st, i0), self._get(st, i1))
+        elif opc == PcodeOp.LOAD:
+            val = None
+            addr = self._get(st, i1)
+            if addr is not None and addr[0] == SP:
+                slot = st.mem.get(addr[1])
+                if slot is not None and len(out) > 2 and slot[0] == out[2]:
+                    val = slot[1]
+            else:
+                self.side_effect = True    # e.g. a read-to-clear device register
+        elif opc == PcodeOp.SUBPIECE and i1 is not None and i1[0] == "c" and i1[1] == 0:
+            # Low-order bytes of a value (e.g. MIPS64 "sw a0,.." stores
+            # the 32-bit low part of the 64-bit a0): same origin, narrower.
+            val = self._narrow(self._get(st, i0), out[2] if len(out) > 2 else 0)
+        elif opc in (PcodeOp.INT_ZEXT, PcodeOp.INT_SEXT) and out[0] == "r" and i0[0] in "ru":
+            # Widening writes (x86-64 "mov ebx, edi" is RBX = zext(EBX),
+            # MIPS64/PPC64 32-bit ops sign-extend): the wide register gets
+            # a new value, but its low part still holds the narrow one.
+            inner = self._get(st, i0)
+            # an extended stack address is still that address (n32:
+            # "addiu sp,sp,-16" = sext(sp:4 - 16))
+            self._set(st, out, inner if (inner is not None and inner[0] == SP) else None, off)
+            if inner is not None and i0[2] < out[2]:
+                lo = out[1] if not self.m.big_endian else out[1] + out[2] - i0[2]
+                st.regs[(lo, i0[2])] = inner
+            return
+        else:
+            val = None
+        self._set(st, out, val, off)
 
     # -- join ----------------------------------------------------------------
     def merge(self, a, b, join_off):
@@ -466,7 +705,7 @@ class FunctionFlow(object):
             elif va is not None and vb is not None:
                 mem[o] = (sa, (PHI, join_off, ("m", o)))
         saved = {k: v for k, v in a.saved.items() if b.saved.get(k) == v}
-        return State(regs, mem, saved)
+        return State(regs, mem, saved, _min_esc(a.esc, b.esc))
 
     def stabilize(self, old, new, join_off):
         """Keep a join's state monotone (concrete -> own phi -> unknown,
@@ -492,6 +731,7 @@ class FunctionFlow(object):
                 elif ov == (PHI, join_off, ("m", o)) and nv is not None:
                     new.mem[o] = (nsz, ov)
         new.saved = dict((k, v) for k, v in new.saved.items() if old.saved.get(k) == v)
+        new.esc = _min_esc(old.esc, new.esc)
         return new
 
     # -- driver ---------------------------------------------------------------
@@ -518,16 +758,31 @@ class FunctionFlow(object):
                 if len(tg) == 1:
                     self.call_targets[o] = tg[0]
             succs = []
-            if not ft.isTerminal():
-                fall = ins.getFallThrough()
-                if fall is not None and body.contains(fall):
-                    succs.append(int(fall.getOffset()))
-            if ft.isJump():
+            # (not "if not terminal": conditional returns such as PPC beqlr or
+            # ARM bxeq lr / popeq {..,pc} are terminators that fall through)
+            fall = ins.getFallThrough()
+            if fall is not None and body.contains(fall):
+                succs.append(int(fall.getOffset()))
+            is_call = bool(ft.isCall())
+            # A "call" that doesn't return (CALL_TERMINATOR: Ghidra's view of
+            # "b func" as a tail call) into this function's own body is a
+            # jump, e.g. to a detached tail the analyst added to the body.
+            tail_jump = is_call and ft.isTerminal() and any(
+                t is not None and body.contains(t) for t in ins.getFlows())
+            if ft.isJump() or tail_jump:
                 for t in ins.getFlows():
                     if t is not None and body.contains(t):
                         succs.append(int(t.getOffset()))
-            self.decoded[o] = (bool(ft.isCall()), bool(ft.isJump()), bool(ft.isTerminal()),
-                               int(ins.getDelaySlotDepth()), succs, ops)
+            for t in self.extra_edges.get(o, ()):
+                if t not in succs and body.contains(func.getEntryPoint().getNewAddress(t)):
+                    succs.append(t)
+            if tail_jump:
+                is_call = False
+            nxt = o + int(ins.getLength())
+            self.decoded[o] = (is_call, bool(ft.isJump()), bool(ft.isTerminal()),
+                               int(ins.getDelaySlotDepth()), succs, ops,
+                               (nxt, int(fall.getOffset()) if fall is not None else nxt),
+                               bool(ft.isComputed()) and not ft.isConditional())
         self.insns.sort()
 
         init = State()
@@ -539,39 +794,61 @@ class FunctionFlow(object):
         work = [entry_off]
         queued = {entry_off}
         steps = 0
-        while work:
-            aoff = work.pop()
-            queued.discard(aoff)
-            steps += 1
-            if steps > MAX_STEPS:
-                self.converged = False
-                self.m.log("WARNING: flow analysis of %s did not converge" % func.getName())
+        for _round in range(64):
+            while work:
+                aoff = work.pop()
+                queued.discard(aoff)
+                steps += 1
+                if steps > MAX_STEPS:
+                    self.converged = False
+                    self.m.log("WARNING: flow analysis of %s did not converge" % func.getName())
+                    break
+                d = self.decoded.get(aoff)
+                if d is None:
+                    continue
+                st = self.state_in[aoff].copy()
+                self.step(st, aoff)
+                self.state_out[aoff] = st
+                if self.taken is not None:
+                    self.state_taken[aoff] = self.taken
+                else:
+                    self.state_taken.pop(aoff, None)
+                for k in d[4]:
+                    preds.setdefault(k, set()).add(aoff)
+                    # In-state = join of all predecessors' current out-states.
+                    new = None
+                    for p in sorted(preds[k]):
+                        ps = self.state_out.get(p)
+                        if p in self.state_taken and k != self.decoded[p][6][1]:
+                            ps = self.state_taken[p]
+                        if ps is None:
+                            continue
+                        new = ps if new is None else self.merge(new, ps, k)
+                    if k == entry_off:
+                        new = self.merge(init, new, k)
+                    old = self.state_in.get(k)
+                    if old is not None and len(preds[k]) > 1:
+                        new = self.stabilize(old, new, k)
+                    if old is None or new != old:
+                        self.state_in[k] = new
+                        if k not in queued:
+                            queued.add(k)
+                            work.append(k)
+
+            # Code only reachable through a computed jump nobody resolved
+            # (a switch whose jump table neither Ghidra nor the decompiler
+            # recovered): enter each unreached run with the state at the
+            # computed jump, as the hardware does, and continue from there.
+            if not self.converged:
                 break
-            d = self.decoded.get(aoff)
-            if d is None:
-                continue
-            st = self.state_in[aoff].copy()
-            self.step(st, aoff)
-            self.state_out[aoff] = st
-            for k in d[4]:
-                preds.setdefault(k, set()).add(aoff)
-                # In-state = join of all predecessors' current out-states.
-                new = None
-                for p in sorted(preds[k]):
-                    ps = self.state_out.get(p)
-                    if ps is None:
-                        continue
-                    new = ps if new is None else self.merge(new, ps, k)
-                if k == entry_off:
-                    new = self.merge(init, new, k)
-                old = self.state_in.get(k)
-                if old is not None and len(preds[k]) > 1:
-                    new = self.stabilize(old, new, k)
-                if old is None or new != old:
-                    self.state_in[k] = new
-                    if k not in queued:
-                        queued.add(k)
-                        work.append(k)
+            seeds = self._unreached_seeds()
+            if not seeds:
+                break
+            for o, st in seeds:
+                self.state_in[o] = st
+                if o not in queued:
+                    queued.add(o)
+                    work.append(o)
 
         # Delay slots (MIPS, SPARC, ...): Ghidra folds the slot instruction's
         # p-code into the branch, so the slot is never stepped on its own.
@@ -588,6 +865,22 @@ class FunctionFlow(object):
                         self.state_in[ds] = after
                         self.state_out[ds] = after
 
+    def _unreached_seeds(self):
+        computed = [o for o in self.insns if self.decoded[o][7] and o in self.state_in]
+        if not computed:
+            return []
+        seeds = []
+        prev_reached = True
+        for o in self.insns:
+            if o in self.state_in:
+                prev_reached = True
+                continue
+            if prev_reached:
+                src = max([c for c in computed if c < o] or [min(computed)])
+                seeds.append((o, self.state_in[src].copy()))
+            prev_reached = False
+        return seeds
+
     # -- prologue ---------------------------------------------------------------
     def _is_prologue_insn(self, ins, st_in):
         """True if the instruction only sets up the frame: adjusts SP, saves
@@ -595,6 +888,11 @@ class FunctionFlow(object):
         return address register."""
         st = st_in.copy()
         self.step(st, int(ins.getAddress().getOffset()))
+        if self.side_effect:
+            # a store/load through a pointer (e.g. "stw r4,0(r3)" as the
+            # first instruction of a device register accessor) is body code:
+            # "break func" must stop before it
+            return False
         for k in set(st.regs) | set(st_in.regs):
             if k[0] == "u" or self.m.dwarf_of(k) is None and not self.m.containers(k):
                 # scratch / pseudo registers (ARM mult_addr, flags): not
@@ -751,7 +1049,9 @@ class CfiGenerator(object):
             cfa = (m.sp_dwarf, m.stackshift - sp[1])
         else:
             for k, v in sorted((kv for kv in st.regs.items() if kv[0][0] != "u"), key=lambda kv: kv[0]):
-                if v is not None and v[0] == SP:
+                # a frame pointer: only a call-preserved register is still
+                # valid when this frame is a caller frame
+                if v is not None and v[0] == SP and m.is_preserved(k):
                     num = m.dwarf_of(k)
                     if num is not None:
                         cfa = (num, m.stackshift - v[1])
@@ -799,14 +1099,49 @@ class CfiGenerator(object):
             if k == m.ra_key:
                 # Calls clobber the return address register, and GDB looks
                 # up a caller frame's rules inside its call instruction: use
-                # the save slot whenever there is one.
-                if slot is not None:
+                # the save slot whenever there is one -- unless the frame is
+                # already popped and the register restored (ARM "ldr lr,
+                # [sp],#4; bx lr"): memory below SP can be overwritten by an
+                # interrupt.
+                if slot is not None and not (holds_entry and sp is not None and sp[0] == SP
+                                             and slot[0] < sp[1]):
                     saved[num] = slot[0] - m.stackshift
+                    continue
+                # same reasoning for a copy in a call-preserved register
+                other = self._register_holding(flow, st, (INIT, k), preserved_only=True)
+                if other is not None and other != num:
+                    saved[num] = ("reg", other)
+                    continue
             elif not holds_entry and slot is not None:
                 # Callee-saved registers survive calls; only once clobbered
                 # is the slot the place to find them.
                 saved[num] = slot[0] - m.stackshift
+                continue
+            if not holds_entry:
+                # entry value parked in another register (boot code without
+                # a stack: "mflr r30; bl x; mtlr r30; blr")
+                other = self._register_holding(flow, st, (INIT, k))
+                if other is not None:
+                    saved[num] = ("reg", other)
         return cfa[0], cfa[1], saved
+
+    def _register_holding(self, flow, st, value, preserved_only=False):
+        """DWARF number of a register holding value (call-preserved ones
+        first: they stay valid in caller frames)."""
+        m = self.m
+        best = None
+        for k, v in st.regs.items():
+            if v != value or k[0] == "u" or k == m.sp_key or k == value[1]:
+                continue
+            if preserved_only and not m.is_preserved(k):
+                continue
+            num = m.dwarf_of(k)
+            if num is None:
+                continue
+            rank = 0 if m.is_preserved(k) else 1
+            if best is None or (rank, num) < best:
+                best = (rank, num)
+        return best[1] if best is not None else None
 
     def _tracked_regs(self):
         if not hasattr(self, "_tracked"):
@@ -832,10 +1167,14 @@ class CfiGenerator(object):
                 ops.append(0x12)  # DW_CFA_def_cfa_sf (data_align = 1)
                 ops += uleb(cur[0]) + sleb(cur[1])
         prev_saved = prev[2] if prev is not None else {}
-        for reg, off in sorted(cur[2].items()):
+        for reg, off in sorted(cur[2].items(), key=lambda kv: kv[0]):
             if prev_saved.get(reg) != off:
-                ops.append(C.DW_CFA_offset_extended_sf)
-                ops += uleb(reg) + sleb(off)
+                if isinstance(off, tuple):          # ("reg", n): in register n
+                    ops.append(C.DW_CFA_register)
+                    ops += uleb(reg) + uleb(off[1])
+                else:
+                    ops.append(C.DW_CFA_offset_extended_sf)
+                    ops += uleb(reg) + sleb(off)
         for reg in sorted(prev_saved):
             if reg not in cur[2]:
                 ops.append(C.DW_CFA_undefined if reg in undefined_cols else C.DW_CFA_same_value)
@@ -860,22 +1199,32 @@ class CfiGenerator(object):
         undefined_cols = (irq[1],) if irq is not None else ()
         outermost = irq is None and int(flow.func.getEntryPoint().getOffset()) in self.entry_points
         for lo, hi in ranges:
+            # One FDE per run of instructions with a known CFA. Where the CFA
+            # is lost (stack realignment, alloca, unreachable code) no FDE
+            # covers the code, so GDB falls back to its prologue analyzer
+            # instead of using a stale row.
+            start = None
             rows = []
-            prev = (m.sp_dwarf, m.stackshift, {})
-            if outermost:
-                # Program entry point: there is no caller to unwind to.
-                rows.append((self.A(lo), bytes([C.DW_CFA_undefined]) + uleb(m.ra_dwarf)))
+            prev = None
             for off in flow.insns:
                 if off < lo or off >= hi:
                     continue
                 st = flow.state_in.get(off)
-                if st is None:
-                    continue
-                rule = self._rule(flow, st, irq)
+                rule = self._rule(flow, st, irq) if st is not None else None
                 if rule is None:
+                    if start is not None:
+                        self.dw.fdes.append(FrameDescription(self.A(start), self.A(off), rows, cie))
+                        start = None
                     continue
+                if start is None:
+                    start, rows = off, []
+                    prev = (m.sp_dwarf, m.stackshift, {})
+                    if outermost and off == lo:
+                        # Program entry point: there is no caller to unwind to.
+                        rows.append((self.A(off), bytes([C.DW_CFA_undefined]) + uleb(m.ra_dwarf)))
                 ops = self._encode(prev, rule, undefined_cols)
                 if ops:
                     rows.append((self.A(off), ops))
                 prev = rule
-            self.dw.fdes.append(FrameDescription(self.A(lo), self.A(lo) + (hi - lo), rows, cie))
+            if start is not None:
+                self.dw.fdes.append(FrameDescription(self.A(start), self.A(lo) + (hi - lo), rows, cie))

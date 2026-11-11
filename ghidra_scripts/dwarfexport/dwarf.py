@@ -239,6 +239,10 @@ class DwarfBuilder(object):
         return struct.pack(self.end + "Q", v)
 
     def uaddr(self, v):
+        # An exclusive end address at the very top of the address space
+        # (a function ending at 0xffffffff) doesn't fit: end one byte early.
+        if v == 1 << (8 * self.addr_size):
+            v -= 1
         return self.u32(v) if self.addr_size == 4 else self.u64(v)
 
     def expr(self):

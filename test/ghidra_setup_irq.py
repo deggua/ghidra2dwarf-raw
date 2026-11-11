@@ -37,7 +37,7 @@ print("IRQ setup: entry points dec_vector, sc_vector; prog_vector tagged INTERRU
 
 for name, dt in (("g_ticks", IntegerDataType.dataType), ("g_syscalls", IntegerDataType.dataType),
                  ("g_traps", IntegerDataType.dataType), ("g_trap_pc", UnsignedIntegerDataType.dataType),
-                 ("g_irq_result", ArrayDataType(IntegerDataType.dataType, 4, -1))):
+                 ("g_irq_result", ArrayDataType(IntegerDataType.dataType, 8, -1))):
     a = A(name)
     listing.clearCodeUnits(a, a.add(dt.getLength() - 1), False)
     DataUtilities.createData(prog, a, dt, -1, DataUtilities.ClearDataMode.CLEAR_ALL_CONFLICT_DATA)

@@ -10,7 +10,9 @@ volatile int g_ticks;
 volatile int g_syscalls;
 volatile int g_traps;
 volatile uint32_t g_trap_pc;
-volatile int g_irq_result[4];
+volatile int g_irq_result[8];
+volatile uint32_t g_saved_r30;
+volatile int g_probe;
 
 int syscall_handler(int num, int arg)
 {
@@ -42,6 +44,20 @@ int busy_work(int n)
     return acc;
 }
 
+int shape_probe(int v)
+{
+    g_probe += v;
+    return v * 2;
+}
+
+/* q lives in a callee-saved register here; shape_os saves it with
+   _savegpr_29 before reusing the register */
+int shape_os_caller(int p, int q)
+{
+    int r = shape_os(p, q, 3);
+    return r + q;
+}
+
 void irq_test(void)
 {
     g_irq_result[0] = do_syscall(7, 35);
@@ -52,4 +68,6 @@ void irq_test(void)
         g_irq_result[2] = busy_work(100000000);
     irq_disable();
     g_irq_result[3] = 0x1234;
+    g_irq_result[4] = shape_os_caller(111, 222);
+    g_irq_result[5] = early_init(5);
 }

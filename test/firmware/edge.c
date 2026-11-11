@@ -5,6 +5,7 @@
 #include <stdarg.h>
 #include "fw.h"
 #include "edge.h"
+#include "shapes.h"
 
 union value g_union;
 short g_matrix[3][4] = { { 1, 2, 3, 4 }, { 5, 6, 7, 8 }, { 9, 10, 11, -12 } };
@@ -155,5 +156,6 @@ void edge_main(void)
     g_custom_result[1] = sum_pair(12, 34);
     g_custom_result[2] = stack_pair(1, 2, 3, 4, 5, 6, 7, 8, 56, 78);
     g_custom_result[3] = make_flags(0x4321);
+    shapes_main();
     edge_done();
 }

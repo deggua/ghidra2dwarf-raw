@@ -30,6 +30,11 @@ def _no_core():
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
 
+def _isa(build):
+    with open(os.path.join(build, "layout.json")) as f:
+        return TARGETS[json.load(f)["target"]]["isa"]
+
+
 def free_port():
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -126,7 +131,7 @@ def run(build, elf, csrc, checks=None, sanitized=False, timeout=180):
         env = dict(os.environ, ELF=os.path.abspath(elf), CSRC=os.path.abspath(csrc),
                    QEMU_PORT=str(port), SANITIZED="1" if sanitized else "0",
                    FP_ARGS_OK="1" if probe["args"] else "0", FP_RET_OK="1" if probe["ret"] else "0",
-                   BUILD=os.path.abspath(build), PYTHONIOENCODING="utf-8")
+                   BUILD=os.path.abspath(build), TARGET_ARCH=_isa(build), PYTHONIOENCODING="utf-8")
         try:
             r = subprocess.run(["gdb-multiarch", "-q", "-nx", "-batch", "-x", os.path.abspath(checks)],
                                env=env, capture_output=True, text=True, timeout=timeout,

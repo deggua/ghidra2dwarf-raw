@@ -55,6 +55,100 @@ def _unused_vector_regs_misread(var, expected):
         return False
 
 
+def check_correct_or_unavailable(name, expr, expected):
+    """A value may legitimately be <optimized out>, but never wrong."""
+    try:
+        v = val(expr)
+        if v.is_optimized_out:
+            print("SKIP %s (<optimized out>)" % name)
+            return
+        check(name, int(v) == expected, "%s = %s, expected %s" % (expr, v, expected))
+    except gdb.error as e:
+        check(name, False, "%s: %s" % (expr, e))
+
+
+def check_full_backtrace(label, must_contain):
+    names = frame_names()
+    check("%s: backtrace %s" % (label, " <- ".join(must_contain)),
+          all(n in names for n in must_contain) and names[-1] == "_reset", names)
+    out = run("bt")
+    check("%s: backtrace ends cleanly" % label, "Backtrace stopped" not in out, out)
+
+
+def check_shapes():
+    """Code shapes from the adversarial review (firmware/shapes.c)."""
+    # conditional return before the frame setup (PPC blelr, ARM bxls lr)
+    cont_to("shape_swap")
+    check_full_backtrace("qsort", ["shape_swap", "shape_qsort", "shapes_main", "edge_main"])
+    select_frame("shape_qsort")
+    check_correct_or_unavailable("qsort n (caller frame)", "n", 10)
+    check_correct_or_unavailable("qsort a (caller frame)", "a", int(val("&g_shape_arr[0]")))
+    cont_to("shape_qsort", "n > 1 && n < 10")
+    names = frame_names()
+    check("recursive qsort: two qsort frames", names.count("shape_qsort") >= 2, names)
+    check_full_backtrace("recursive qsort", ["shape_qsort", "shapes_main"])
+
+    # conditional epilogue (ARM "pople {..,pc}")
+    cont_to("shape_fib", "n == 1")
+    check_full_backtrace("fib", ["shape_fib", "shapes_main"])
+    check("fib: recursion frames", frame_names().count("shape_fib") >= 3, frame_names())
+
+    # conditional move into a callee-saved register
+    cont_to("shape_leaf", "v == 77")
+    check_full_backtrace("csel", ["shape_leaf", "shape_csel", "shapes_main"])
+    select_frame("shape_csel")
+    check_correct_or_unavailable("csel b (conditionally moved)", "b", 77)
+    check_correct_or_unavailable("csel a", "a", 0)
+
+    # 40 KB frame
+    cont_to("shape_leaf", "v == 5")
+    check_full_backtrace("40 KB frame", ["shape_leaf", "shape_big", "shapes_main"])
+    select_frame("shape_big")
+    check_correct_or_unavailable("big frame n", "n", 5)
+
+    # arguments copied into a stack object that the callee modifies
+    cont_to("shape_leaf", "v == 1035")
+    check_full_backtrace("alias", ["shape_leaf", "shape_alias", "shapes_main"])
+    select_frame("shape_alias")
+    check_correct_or_unavailable("alias id after mutate(&m)", "id", 42)
+    check_correct_or_unavailable("alias val after mutate(&m)", "val", 7)
+    ret_addr = int(gdb.newest_frame().older().pc()) if gdb.newest_frame().older() else None
+    bogus = []
+    b = gdb.selected_frame().block()
+    while b is not None and b.function is None:
+        for sym in b:
+            try:
+                v = sym.value(gdb.selected_frame())
+                if not v.is_optimized_out and v.type.strip_typedefs().code == gdb.TYPE_CODE_INT \
+                        and (int(v) & 0xffffffff) == ((ret_addr or -1) & 0xffffffff):
+                    bogus.append(sym.name)
+            except gdb.error:
+                pass
+        b = b.superblock
+    check("alias: no local shows the return address (decompiler temporaries)", not bogus, bogus)
+
+    # a store as the first instruction
+    cont_to("shape_poke")
+    check_eq("poke: breakpoint before the first store", "g_poke", 0x1111)
+
+    # over-aligned stack
+    cont_to("shape_leaf", "v == 9")
+    names = frame_names()
+    ok = "shape_align" in names and "shapes_main" in names
+    if not ok and os.environ.get("TARGET_ARCH", "") == "x86_32":
+        # README limitation: realigned i386 frames are left to GDB's
+        # prologue analyzer, which needs the (call-clobbered) DRAP register
+        print("SKIP aligned stack caller frames on i386 (known limitation): %s" % names)
+    else:
+        check("aligned stack: caller frames", ok, names)
+
+    # thunk (-O1/-O2: "b shape_leaf"): its own one-line body, not the callee's
+    text = func_text("shape_wrap")
+    check("thunk/wrapper body is not the callee's", "g_shape_sink" not in text, text)
+    cont_to("shape_wrap")
+    check_correct_or_unavailable("thunk/wrapper parameter", "v", 20)
+
+
 def main():
     setup_session()
 
@@ -188,12 +282,18 @@ def main():
     out = run("ptype make_flags")
     check("custom storage: struct return type", "flagword" in out, out)
 
+    check_shapes()
+
     # --- globals at the end ----------------------------------------------------------
     cont_to("edge_done")
     for i, e in enumerate([0xF, 12034, 56 * 1000 + 78 + 36, 0x432105]):
         check_eq("g_custom_result[%d]" % i, "g_custom_result[%d]" % i, e)
     for i, e in enumerate([16, 11, 12, 60, 296, 700, 8, 1, 16]):
         check_eq("g_edge_result[%d]" % i, "g_edge_result[%d]" % i, e)
+    for i, e in enumerate([13, 77, 11, 1084, 11, 21]):
+        check_eq("g_shape_result[%d]" % i, "g_shape_result[%d]" % i, e)
+    check_eq("poke result", "g_poke", 0xabcd)
+    check_eq("sorted", "g_shape_arr[0] == 0 && g_shape_arr[5] == 5 && g_shape_arr[9] == 9", 1)
     check_eq("double global", "g_dbl", 6.375)
     check_eq("union float view", "g_union.f", 1.5)
     check_eq("union int view", "g_union.u", 0x3FC00000)
@@ -240,6 +340,10 @@ def main():
     out = run("ptype struct %s" % Q(THING_T))
     check("ptype '?' typedef/struct", FIELD1 in out, out)
     check_eq("quote replaced in name", "it_s", 7)
+    # struct/union/enum names without the tag keyword, as the pseudo-C uses them
+    check_eq("bare struct name", "sizeof(packed_rec)", 7)
+    check_eq("bare struct name (union member)", "sizeof(reg)", 8)
+    check_eq("bare enum name", "(int)(big)0", 0)
     check_eq("namespaced global Foo", Q(FOO_COUNTER), 100)
     check_eq("namespaced global Bar", Q(BAR_COUNTER), 200)
     check_eq("C keyword as name", Q(KW), 77)

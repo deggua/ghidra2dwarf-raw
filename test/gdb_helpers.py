@@ -86,7 +86,11 @@ def frame_names():
     f = gdb.newest_frame()
     while f is not None:
         names.append(f.name())
-        f = f.older()
+        try:
+            f = f.older()
+        except gdb.error as e:
+            names.append("<error: %s>" % e)
+            break
     return names
 
 

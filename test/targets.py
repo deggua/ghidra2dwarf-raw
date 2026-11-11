@@ -34,6 +34,7 @@ def _t(**kw):
     kw.setdefault("sret_memory", False)   # small structs returned via hidden pointer
     kw.setdefault("calling_convention", None)  # applied to every C function by the setup
     kw.setdefault("positional_args", False)    # FP/int args share slots (n32; Ghidra's cspec doesn't)
+    kw.setdefault("noexec_blocks", False)      # analyst's memory map without the X flag
     return kw
 
 
@@ -46,7 +47,9 @@ TARGETS = {
                 asflags=["-mcpu=603e", "-Wa,-mregnames"],
                 lang="PowerPC:BE:32:default", qemu_args=["-cpu", "603e"]),
     # Linux PPC32 ABI variant: structs returned in memory (GCC default)
+    # (also: a hand-made memory map whose blocks lack the X flag)
     "ppc32-linux": _t(cross="powerpc-linux-gnu-", isa="ppc32", mode="rom", base=0xFFF00000, sret_memory=True,
+                      noexec_blocks=True,
                       cflags=["-mcpu=750", "-mhard-float", "-msdata=none", "-G0", "-mno-relocatable"],
                       asflags=["-mcpu=750", "-Wa,-mregnames"],
                       lang="PowerPC:BE:32:default"),

@@ -159,6 +159,53 @@ class WriterTest(unittest.TestCase):
                 self.assertIn("0x0000000000001008      2", r.stdout)
                 self.assertIn("0x000000000000100c    400", r.stdout)
 
+    @unittest.skipUnless(have("llvm-dwarfdump"), "llvm-dwarfdump not installed")
+    def test_top_of_address_space(self):
+        """A function ending at 0xffffffff (code at the top of a 32-bit
+        space, e.g. a reset vector at 0xfffffffc): exclusive end 2**32."""
+        dw = DwarfBuilder(4, True)
+        cu = dw.cu
+        dw.name(cu, "top.c")
+        cu.add(C.DW_AT_low_pc, C.DW_FORM_addr, 0)
+        cu.add(C.DW_AT_ranges, C.DW_FORM_sec_offset, dw.add_ranges([(0xfffffff0, 1 << 32)]))
+        cu.add(C.DW_AT_stmt_list, C.DW_FORM_sec_offset, 0)
+        dw.add_file("top.c")
+        int_t = cu.child(C.DW_TAG_base_type)
+        dw.name(int_t, "int")
+        int_t.add(C.DW_AT_byte_size, C.DW_FORM_udata, 4)
+        int_t.add(C.DW_AT_encoding, C.DW_FORM_data1, C.DW_ATE_signed)
+        fn = cu.child(C.DW_TAG_subprogram)
+        dw.name(fn, "last_fn")
+        fn.add(C.DW_AT_ranges, C.DW_FORM_sec_offset, dw.add_ranges([(0xfffffff0, 1 << 32)]))
+        p = fn.child(C.DW_TAG_formal_parameter)
+        dw.name(p, "v")
+        p.add(C.DW_AT_type, C.DW_FORM_ref4, int_t)
+        p.add(C.DW_AT_location, C.DW_FORM_sec_offset,
+              dw.add_loclist([(0xfffffff0, 1 << 32, dw.expr().reg(3).bytes())]))
+        dw.add_sequence([(0xfffffff0, 1), (0xfffffffc, 2)], 1 << 32)
+        dw.aranges.append((0xfffffff0, 1 << 32))
+        dw.cie = CommonInformation(4, -4, 65, bytes([C.DW_CFA_def_cfa]) + uleb(1) + uleb(0))
+        dw.fdes.append(FrameDescription(0xfffffff0, 1 << 32, []))
+        elf = ElfWriter(False, True, 20, entry=0xfffffffc)
+        elf.add_section(Section(".text", C.SHT_NOBITS, C.SHF_ALLOC | C.SHF_EXECINSTR,
+                                addr=0xffff0000, size=0x10000, align=4))
+        for name, data in dw.build():
+            elf.add_section(Section(name, C.SHT_PROGBITS, data=data))
+        elf.add_symbol("last_fn", 0xfffffff0, 0x10, C.STT_FUNC, shndx=elf.section_index_for(0xfffffff0))
+        path = os.path.join(self.tmp, "top.elf")
+        elf.write(path)
+        r = subprocess.run(["llvm-dwarfdump", "--verify", path], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_section_limit(self):
+        """More sections than ELF section indexes allow: a clear error, not
+        indexes colliding with SHN_ABS/SHN_COMMON."""
+        elf = ElfWriter(False, True, 20, entry=0)
+        for i in range(0xff00):
+            elf.add_section(Section(".s%d" % i, C.SHT_NOBITS, C.SHF_ALLOC, addr=i * 4, size=4))
+        with self.assertRaises(ValueError):
+            elf.to_bytes()
+
     @unittest.skipUnless(have("readelf"), "readelf not installed")
     def test_readelf(self):
         path = os.path.join(self.tmp, "out.elf")

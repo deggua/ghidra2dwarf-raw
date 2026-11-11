@@ -60,7 +60,8 @@ def build(name, opt, out):
     srcs = [(os.path.join(isa_dir, "crt0.S"), t["asflags"]),
             (os.path.join(isa_dir, "edge_asm.S"), t["asflags"]),
             (os.path.join(FW, "main.c"), cflags),
-            (os.path.join(FW, "edge.c"), cflags)]
+            (os.path.join(FW, "edge.c"), cflags),
+            (os.path.join(FW, "shapes.c"), cflags)]
     if t["irq"]:
         srcs += [(os.path.join(isa_dir, "irq.S"), t["asflags"]), (os.path.join(FW, "irq.c"), cflags)]
     for src, flags in srcs:
@@ -79,6 +80,9 @@ def build(name, opt, out):
     elf = os.path.join(out, "fw.elf")
     sh([cc] + cflags + COMMON_LDFLAGS + t["ldflags"] + ["-Wl,-T," + script] + objs + ["-o", elf])
     sh([tool("objcopy"), "-O", "binary", elf, os.path.join(out, "fw.bin")])
+    if t["mode"] == "rom" and os.path.getsize(os.path.join(out, "fw.bin")) > 16384:
+        # qemu-system-ppc -M mac99 overwrites -bios images from 0xfff04000 on
+        raise SystemExit("ROM image over 16 KB: QEMU mac99 would clobber it")
 
     syms = {}
     entries = []
@@ -114,7 +118,7 @@ def build(name, opt, out):
     layout = {"target": name, "base": t["base"], "ram": ram, "thumb": t["thumb"],
               "lang": t["lang"], "cspec": t["cspec"], "irq": t["irq"], "elfv2": t["elfv2"],
               "sret_memory": t["sret_memory"], "calling_convention": t["calling_convention"],
-              "positional_args": t["positional_args"]}
+              "positional_args": t["positional_args"], "noexec_blocks": t["noexec_blocks"]}
     if opd:
         # PPC64 ELFv1: the TOC base an analyst sets r2 to (from a descriptor)
         layout["toc"] = int.from_bytes(opd[1][8:16], "big")
