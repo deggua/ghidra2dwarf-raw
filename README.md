@@ -62,6 +62,8 @@ Options (`key=value` script arguments in headless mode; defaults in
 | `all_types` | `true` | Emit DWARF for every struct/union/enum/typedef, not only the ones in use (so `ptype`/casts work for all of them). |
 | `decompile_timeout` | `60` | Per-function decompiler timeout, in seconds. |
 | `basename` | program name | Output file base name. |
+| `sanitize_names` | `false` | Rewrite every name into a plain C identifier (`Get?Value` → `Get_Value`, `Foo::init` → `Foo__init`, a variable named `switch` → `switch_`), consistently in the DWARF, the ELF symbols and the `.c` file. See [Names](#names). |
+| `skip_decompile` | | Comma-separated function names (or entry addresses) not to decompile, e.g. ones that hang the decompiler. They still get symbols, address ranges, CFI and a one-line prototype. |
 
 Re-export (and `symbol-file` again in GDB) whenever you change annotations.
 Don't edit the `.c` file: the line table points at its exact line numbers.
@@ -93,21 +95,71 @@ GDB finds the `.c` file through the absolute output directory recorded in the
 DWARF (`DW_AT_comp_dir`). If you move the files, use
 `set substitute-path <old dir> <new dir>` or `directory <new dir>`.
 
+## Names
+
+Ghidra allows names that aren't C identifiers (`Get?Value`, `field?1`,
+`Foo::init`, `operator<<`, names with spaces, non-ASCII). By default they are
+exported verbatim, so the DWARF, the `.c` file and the Ghidra database all
+agree. GDB handles them as follows:
+
+* Breakpoint locations need no quoting: `break Get?Value`, `break Foo::init`.
+* In expressions, put the name in single quotes. This works for variables,
+  struct fields, types, casts and `sizeof`:
+
+  ```
+  (gdb) p 'p?arg'
+  (gdb) p 'g?thing'.'field?1'
+  (gdb) p *('Thing?Info' *)0x100094
+  (gdb) ptype struct 'Thing?Info'
+  (gdb) p &'Foo::counter'
+  ```
+* Names that are valid identifiers, or contain only `$` and `<>`, also work
+  unquoted.
+* A name containing `'` can't be quoted at all, so `'` (and control characters)
+  are always replaced with `_` (`it's` → `it_s`).
+* `info address` does not accept quoted names; use `p &'name'` instead.
+
+If you'd rather never quote, export with `sanitize_names=true`.
+
+Namespaced functions and globals are exported with their qualified name
+(`Foo::init`), as the decompiler prints them, so same-named functions in
+different namespaces stay distinct.
+
 ## What is exported
 
 * **Memory map**: one allocated section per loaded memory block in the default
   address space (overlays and other spaces are skipped), with the block's
   R/W/X permissions.
 * **Symbols** (`.symtab`): functions (`STT_FUNC`, with size), defined data
-  (`STT_OBJECT`), and other non-code labels. Code labels inside functions are
+  (`STT_OBJECT`), and other non-code labels. A label on memory with no data
+  type is a symbol only: GDB says it "has unknown type", so cast it
+  (`p *(int *)&'name'`). Code labels inside functions are
   left out so GDB keeps showing `<func+off>`.
-* **Types**: base types, pointers, typedefs, structs (including bitfields),
-  unions, enums, arrays, function types. Every struct/union/enum/typedef is
-  exported, even unused ones.
+* **Types**: base types, pointers, typedefs, structs (including bitfields,
+  packed layouts, anonymous members, flexible array members), unions, enums
+  (including 8-byte and > `INT_MAX` values), multi-dimensional arrays, and
+  function types (including varargs). Every struct/union/enum/typedef is
+  exported, even unused ones. Ghidra-only types are mapped as follows:
+
+  | Ghidra | DWARF |
+  |--------|-------|
+  | `undefined`, `undefined1..8` | unsigned base types with those names |
+  | dynamic-size data (strings, unicode strings) | a byte array of the data's actual length |
+  | fixed-size types with no C equivalent | a typedef with the Ghidra name, to a byte array of the same size |
+  | pointer typedefs with an offset, shift, mask, relative/image-base type, or another address space (e.g. `int *32 __((offset(-0x4)))`) | a typedef with the Ghidra name, to an unsigned integer, so GDB shows the raw value instead of dereferencing the wrong address |
+  | "not yet defined" placeholder structs | a declaration (GDB shows `<incomplete type>`) |
+  | the decompiler's `code *` (function pointer of unknown type) | a pointer to typedef `code` = `void (...)` |
+  | same-named types in different categories | separate types; each variable refers to the right one |
+
+  `char` signedness follows Ghidra's compiler spec (e.g. signed for PowerPC,
+  even though GCC treats it as unsigned there), so values print the way the
+  decompiled code reads them.
 * **Global variables**: every defined data item with a name, with its type.
 * **Functions**: name, address range(s) (non-contiguous bodies use
-  `DW_AT_ranges`), return type, and the decompiler's parameters and locals
-  under the names used in the `.c` file.
+  `DW_AT_ranges`), return type, varargs, and the decompiler's parameters and
+  locals under the names used in the `.c` file. If a function fails to
+  decompile, the `.c` file gets its prototype and the error, and the function
+  still has symbols, ranges, CFI and a line-table entry.
 * **Line table**: each decompiled line is mapped to the instructions behind its
   tokens. The frame setup maps to the signature line, and the first body
   instruction carries `prologue_end`, so `break func` stops before any argument
@@ -154,6 +206,12 @@ undefined return address, so backtraces end cleanly.
   `ppc.dwarf` numbers LR/CTR differently from GCC/GDB. Other architectures
   should work but may need similar register-number fixes (`build_register_map`)
   or a link register entry (`flow._LINK_REGISTERS`).
+* The DWARF reflects the Ghidra annotations, including their mistakes. For
+  example, Ghidra's PowerPC model returns an 8-byte struct in r3:r4 where GCC
+  uses a hidden pointer in r3. Until the prototype is fixed in Ghidra, the
+  decompiled code and the argument values in GDB are both wrong.
+* `ptype struct X` can't find a declaration-only (placeholder) struct by
+  name; it shows as `<incomplete type>` through pointers to it.
 * Only the default address space. Overlays and bank-switched memory are not
   represented.
 * The CFI analysis understands SP-relative frames and frame pointers copied
@@ -190,6 +248,9 @@ test/
     export_fw.sh       headless import + annotate + export
     run_gdb_test.py    boots the firmware in QEMU (mac99) and runs gdb_checks.py
     gdb_checks.py      GDB-Python assertions (backtraces, args, locals, stepping, finish, globals)
+    gdb_edge_checks.py edge cases (see below)
+    gdb_helpers.py     shared GDB-side helpers
+    ghidra_setup_edge.py  Ghidra-only annotations for the edge cases
 ```
 
 ## Tests
@@ -199,7 +260,7 @@ Needs `qemu-system-ppc`, `gdb-multiarch`, `gcc-powerpc-linux-gnu`, `llvm`
 `GHIDRA_INSTALL_DIR`).
 
 ```sh
-test/run_all.sh            # ~25 s
+test/run_all.sh            # ~35 s
 ```
 
 The test firmware is built from C, stripped to a raw binary, and imported into
@@ -212,3 +273,21 @@ inner and outer frames, 64-bit register-pair and stack-passed arguments,
 recursion, indirect calls, stepping, `finish` return values, struct/bitfield/enum
 printing, and final global state. The checks adapt to code shapes that differ
 legitimately between `-O` levels (tail calls, recursion turned into a loop).
+
+The edge-case module (`firmware/edge.c`, `edge_asm.S`, `ghidra_setup_edge.py`,
+`gdb_edge_checks.py`) covers:
+* names with `?`, `'`, `::`, a C keyword and non-ASCII characters (functions,
+  parameters, locals, globals, struct tags, fields), in both naming modes;
+* namespaced duplicate functions and globals;
+* unions, anonymous unions, packed structs, flexible array members, 2-D
+  arrays, bitfields crossing bytes and signed bitfields, `> INT_MAX` and
+  8-byte enums, bool, int64, function-pointer arrays;
+* string and unicode data, `undefined4`, labels with no data, placeholder
+  structs, shifted pointer typedefs, duplicate type names, the decompiler's
+  `code *`;
+* varargs, float/double arguments and returns, struct return via a hidden
+  pointer, stack-array locals, renamed locals;
+* a non-contiguous function (stepping into its detached tail and backtracing
+  from there), and a function whose decompilation fails or is skipped.
+
+All of it runs at three `-O` levels, and with `sanitize_names=true`.
