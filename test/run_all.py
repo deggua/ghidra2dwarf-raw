@@ -59,6 +59,13 @@ def job(target, opt, sanitized, work, verbose):
     r = subprocess.run(["llvm-dwarfdump", "--verify", elf], capture_output=True, text=True)
     if "No errors." not in r.stdout:
         fail("llvm-dwarfdump --verify:\n" + r.stdout[-2000:])
+    if opt == "O1" and not sanitized:
+        # parallel decompilation must not change anything: export serially
+        # and compare
+        same, why = serial_matches(build, out_dir, opts)
+        report["counts"]["serial"] = "ok" if same else "differs"
+        if not same:
+            fail("serial export (decompile_threads=1) differs: " + why)
     rt_ok, rt_diffs = roundtrip.roundtrip(out_dir, sanitized)
     report["counts"]["rt"] = "ok" if rt_ok else "%d diffs" % len(rt_diffs)
     if not rt_ok:
@@ -92,6 +99,26 @@ def job(target, opt, sanitized, work, verbose):
         report["counts"]["diff"] = "ok" if report["ok"] else "; ".join(msgs)
     report["time"] = time.time() - t0
     return report
+
+
+def serial_matches(build, out_dir, opts):
+    sdir = out_dir + "-serial"
+    ok, _, _ = export_fw.export(build, sdir, list(opts) + ["decompile_threads=1"])
+    if not ok:
+        return False, "serial export failed (see %s/ghidra.log)" % sdir
+    a, b = os.path.join(out_dir, "out"), os.path.join(sdir, "out")
+    with open(os.path.join(a, "fw.bin.c"), "rb") as f1, open(os.path.join(b, "fw.bin.c"), "rb") as f2:
+        if f1.read() != f2.read():
+            return False, "fw.bin.c"
+    for sec in ("--debug-info", "--debug-loc", "--debug-frame", "--debug-line", "--symbols"):
+        outs = []
+        for d in (a, b):
+            r = subprocess.run(["llvm-dwarfdump" if sec != "--symbols" else "llvm-nm", sec if sec != "--symbols"
+                                else "-n", os.path.join(d, "fw.bin.elf")], capture_output=True, text=True)
+            outs.append(r.stdout.replace(os.path.dirname(d), "<dir>").split("\n", 1)[-1])
+        if outs[0] != outs[1]:
+            return False, sec
+    return True, ""
 
 
 def main():

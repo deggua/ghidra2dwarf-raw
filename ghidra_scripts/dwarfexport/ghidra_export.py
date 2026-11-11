@@ -828,28 +828,46 @@ class Exporter(object):
         import threading
         n = int(self.opts.decompile_threads)
         if n < 0:
-            n = max(1, min(8, (os.cpu_count() or 2) - 1))
+            try:
+                cpus = len(os.sched_getaffinity(0))      # (affinity/cgroup aware)
+            except (AttributeError, OSError):
+                cpus = os.cpu_count() or 2
+            n = max(1, min(8, cpus - 1))
         timeout = self.opts.decompile_timeout
+        serial = []
+
+        def serial_ifc():
+            if not serial:
+                serial.append(self._decompiler())
+            return serial[0]
+
         if n <= 1:
-            ifc = self._decompiler()
             try:
                 for func in funcs:
                     yield func, (None if self._skipped(func) else
-                                 ifc.decompileFunction(func, timeout, self.monitor))
+                                 serial_ifc().decompileFunction(func, timeout, self.monitor))
             finally:
-                ifc.dispose()
+                for ifc in serial:
+                    ifc.dispose()
             return
         local = threading.local()
         ifcs = []
         lock = threading.Lock()
 
         def work(func):
-            ifc = getattr(local, "ifc", None)
-            if ifc is None:
-                ifc = local.ifc = self._decompiler()
-                with lock:
-                    ifcs.append(ifc)
-            return None if self._skipped(func) else ifc.decompileFunction(func, timeout, self.monitor)
+            try:
+                ifc = getattr(local, "ifc", None)
+                if ifc is None:
+                    ifc = local.ifc = self._decompiler()
+                    with lock:
+                        ifcs.append(ifc)
+                return None if self._skipped(func) else ifc.decompileFunction(func, timeout, self.monitor)
+            finally:
+                # JPype attached this pool thread to the JVM; detach it, or
+                # every export leaks Java threads (GUI sessions)
+                import java.lang
+                if java.lang.Thread.isAttached():
+                    java.lang.Thread.detach()
 
         ex = concurrent.futures.ThreadPoolExecutor(n)
         try:
@@ -857,18 +875,31 @@ class Exporter(object):
             it = iter(funcs)
             for func in it:
                 window.append((func, ex.submit(work, func)))
-                if len(window) >= 4 * n:
+                if len(window) >= 2 * n:
                     break
             while window:
                 func, fut = window.popleft()
                 nxt = next(it, None)
                 if nxt is not None:
                     window.append((nxt, ex.submit(work, nxt)))
-                yield func, fut.result()
+                res = fut.result()
+                if res is not None and res.isTimedOut() and not self.monitor.isCancelled():
+                    # decompiles are slower under the pool's load: give a
+                    # function that timed out there one serial attempt, so
+                    # the result doesn't depend on machine load
+                    res = serial_ifc().decompileFunction(func, timeout, self.monitor)
+                yield func, res
         finally:
-            ex.shutdown(wait=True, cancel_futures=True)
-            for ifc in ifcs:
-                ifc.dispose()
+            for ifc in list(ifcs):
+                try:
+                    ifc.stopProcess()     # don't wait for in-flight decompiles
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                ex.shutdown(wait=True, cancel_futures=True)
+            finally:
+                for ifc in ifcs + serial:
+                    ifc.dispose()
 
     def _function_ranges(self, func):
         entry = int(func.getEntryPoint().getOffset())
@@ -1107,6 +1138,10 @@ class Exporter(object):
             if int(s.getId()) not in param_ids:
                 others.append(s)
 
+        # (the decompiler's symbol order follows its temporary symbol ids,
+        # which depend on what the same DecompInterface decompiled before:
+        # sort, so the output doesn't depend on the decompiler threads)
+        others.sort(key=lambda sym: (str(sym.getName()), str(sym.getStorage())))
         ctx = _FunctionContext(self, func, hf, ranges, flow)
         for sym in params:
             self._export_variable(func_die, sym, ctx, True)

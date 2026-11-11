@@ -735,9 +735,9 @@ class FunctionFlow(object):
         regs = {}
         ar, br = a.regs, b.regs
         rv = self.reg_value
-        # (same key order as before -- reg_value's view lookup depends on
-        # it -- but direct lookups for keys present in both states)
-        for k in set(ar) | set(br):
+        # (deterministic key order -- reg_value's view lookup depends on it;
+        # a set's order would vary with PYTHONHASHSEED via the "u" keys)
+        for k in list(ar) + [k for k in br if k not in ar]:
             if k in ar:
                 va = ar[k]
                 vb = br[k] if k in br else (None if k[0] == "u" else rv(b, k))

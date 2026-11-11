@@ -317,7 +317,8 @@ def rename_locals():
     ifc.openProgram(prog)
     func = fm.getFunctionAt(A("edge_locals"))
     hf = ifc.decompileFunction(func, 60, monitor).getHighFunction()
-    syms = [s for s in hf.getLocalSymbolMap().getSymbols() if not s.isParameter()]
+    syms = sorted((s for s in hf.getLocalSymbolMap().getSymbols() if not s.isParameter()),
+                  key=lambda s: (str(s.getStorage()), str(s.getName())))   # (deterministic names)
     for i, s in enumerate(syms):
         HighFunctionDBUtil.updateDBVariable(s, "loc?%d" % i, None, USER)
     ifc.dispose()
