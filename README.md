@@ -74,6 +74,7 @@ Options (`key=value` script arguments in headless mode; defaults in
 | `sanitize_names` | `false` | Rewrite every name into a plain C identifier (`Get?Value` → `Get_Value`, `Foo::init` → `Foo__init`, a variable named `switch` → `switch_`), consistently in the DWARF, the ELF symbols and the `.c` file. See [Names](#names). |
 | `skip_decompile` | | Comma-separated function names (or entry addresses) not to decompile, e.g. ones that hang the decompiler. They still get symbols, address ranges, CFI and a one-line prototype. |
 | `elf_flags` | `-1` (auto) | ELF header `e_flags`. By default derived from the language and compiler spec (ARM EABI5, BE8 and float ABI; MIPS o32/n32/o64/EABI/n64 and ISA; PPC64 ELFv1/ELFv2). GDB uses it to pick the ABI. |
+| `decompile_threads` | `-1` | Decompiler worker threads; `-1` = min(8, CPUs - 1), `1` = decompile serially. |
 | `irq_signal_frame` | `true` | Mark interrupt/exception handler frames as signal frames, see [Interrupt and exception handlers](#interrupt-and-exception-handlers). |
 
 Re-export (and `symbol-file` again in GDB) whenever you change annotations.
@@ -399,9 +400,13 @@ undefined return address, so backtraces end cleanly.
 ## Performance
 
 Exporting the stripped PPC32 glibc (`libc.so.6`, 2.3 MB, 3,687 functions,
-9,687 globals) took about 4 minutes on a 16-core VM. Roughly 40% is Ghidra's
-decompiler and the rest is the flow/location analysis. The 3.3 MB ELF loads
-in GDB in about 0.1 s and passes `llvm-dwarfdump --verify`.
+9,687 globals) takes about 2 minutes on a 16-core VM (it took 3.4 minutes
+before the decompiler ran in parallel and the flow analysis was tuned). The
+decompiler runs in worker threads ahead of the export (`decompile_threads`,
+default min(8, CPUs - 1)); what remains is mostly the single-threaded flow
+and location analysis in Python. The 4.5 MB ELF loads in GDB in about 0.1 s
+and passes `llvm-dwarfdump --verify`. A small firmware exports in about a
+second.
 
 ## Layout
 

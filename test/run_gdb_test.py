@@ -65,7 +65,22 @@ kill
 """
 
 
+_PROBE_LOCKS = {}
+_PROBE_LOCKS_LOCK = __import__("threading").Lock()
+
+
 def fp_probe(build):
+    """See _fp_probe; one probe per target at a time (run_all.py runs the
+    -O levels of a target in parallel threads, sharing the probe build)."""
+    with open(os.path.join(build, "layout.json")) as f:
+        target = json.load(f)["target"]
+    with _PROBE_LOCKS_LOCK:
+        lock = _PROBE_LOCKS.setdefault(target, __import__("threading").Lock())
+    with lock:
+        return _fp_probe(build)
+
+
+def _fp_probe(build):
     """Do float/double arguments and return values read correctly in this
     GDB + QEMU combination *with GCC's own debug info* (the reference ELF)?
     Some don't (x86-64 user mode misnumbers xmm registers, MIPS o32 doubles

@@ -34,6 +34,10 @@ CONST = "const"
 
 MAX_STEPS = 500000
 
+# address space id -> varnode kind for FunctionFlow._decode (reset per program)
+_SPACE_KIND = {}
+_MISSING = object()
+
 
 # ----------------------------------------------------------------------------
 # Target description
@@ -81,6 +85,7 @@ class MachineInfo(object):
         self.listing = program.getListing()
         self.lang = program.getLanguage()
         self.regs = reg_index
+        _SPACE_KIND.clear()
         self.stackshift = stackshift
         self.log = log
         self.ptr_size = program.getDefaultPointerSize()
@@ -320,6 +325,12 @@ class FunctionFlow(object):
         self.insn_len = {}
         self.insns = []
         self.converged = True
+        # every register key a state may hold (for reg_value's overlap lookup)
+        self._universe = set(machine.mapped)
+        self._universe.add(machine.sp_key)
+        if machine.ra_key is not None:
+            self._universe.add(machine.ra_key)
+        self._ovl = {}
         self._run()
 
     # -- value access ------------------------------------------------------------
@@ -367,10 +378,35 @@ class FunctionFlow(object):
         lo = key[0] + (key[1] - size if self.m.big_endian else 0)
         return self._rekey(value, (lo, size))
 
+    def _overlaps(self, key):
+        """Register keys seen in this function that overlap key."""
+        hit = self._ovl.get(key)
+        if hit is None:
+            hit = self._ovl[key] = [rk for rk in self._universe
+                                    if rk[0] < key[0] + key[1] and key[0] < rk[0] + rk[1]]
+        return hit
+
+    def _note_key(self, k):
+        if k not in self._universe:
+            self._universe.add(k)
+            self._ovl.clear()
+
     def reg_value(self, st, key):
-        if key in st.regs:
-            return st.regs[key]
-        for rk in st.regs:
+        regs = st.regs
+        v = regs.get(key, _MISSING)
+        if v is not _MISSING:
+            return v
+        present = [rk for rk in self._overlaps(key) if rk in regs]
+        if not present:
+            return self.default(key)
+        if len(present) == 1:
+            rk = present[0]
+            v = regs[rk]
+            if (v is not None and rk[0] <= key[0] and key[0] + key[1] <= rk[0] + rk[1]
+                    and self._is_low_part(key, rk)):
+                return self._narrow(v, key[1])
+            return None
+        for rk in st.regs:     # several views: the first in the state's order
             if rk[0] != "u" and rk[0] < key[0] + key[1] and key[0] < rk[0] + rk[1]:
                 # Overwritten through another view. If a containing register
                 # was written, its low part has a value of the same origin
@@ -390,15 +426,24 @@ class FunctionFlow(object):
     def _decode(vn):
         if vn is None:
             return None
-        if vn.isConstant():
-            return ("c", int(vn.getOffset()), int(vn.getSize()))
-        if vn.isRegister():
-            return ("r", int(vn.getOffset()), int(vn.getSize()))
-        if vn.isUnique():
-            return ("u", int(vn.getOffset()), int(vn.getSize()))
-        if vn.getAddress().isMemoryAddress():
-            return ("a", int(vn.getOffset()), int(vn.getSize()))   # branch targets
-        return ("x",)
+        # (each Java call costs: classify the address space once per space id)
+        sid = int(vn.getSpace())
+        kind = _SPACE_KIND.get(sid)
+        if kind is None:
+            if vn.isConstant():
+                kind = "c"
+            elif vn.isRegister():
+                kind = "r"
+            elif vn.isUnique():
+                kind = "u"
+            elif vn.getAddress().isMemoryAddress():
+                kind = "a"      # branch targets
+            else:
+                kind = "x"
+            _SPACE_KIND[sid] = kind
+        if kind == "x":
+            return ("x",)
+        return (kind, int(vn.getOffset()), int(vn.getSize()))
 
     def _get(self, st, d):
         t = d[0]
@@ -414,6 +459,8 @@ class FunctionFlow(object):
         t = d[0]
         if t == "r":
             k = (d[1], d[2])
+            if k not in self._universe:
+                self._note_key(k)
             if value is None:
                 value = (DEF, ins_off, k)
             for other in [o for o in st.regs if o[0] != "u" and o != k
@@ -676,6 +723,7 @@ class FunctionFlow(object):
             self._set(st, out, inner if (inner is not None and inner[0] == SP) else None, off)
             if inner is not None and i0[2] < out[2]:
                 lo = out[1] if not self.m.big_endian else out[1] + out[2] - i0[2]
+                self._note_key((lo, i0[2]))
                 st.regs[(lo, i0[2])] = inner
             return
         else:
@@ -685,9 +733,17 @@ class FunctionFlow(object):
     # -- join ----------------------------------------------------------------
     def merge(self, a, b, join_off):
         regs = {}
-        for k in set(a.regs) | set(b.regs):
-            va = self.reg_value(a, k) if k[0] != "u" else a.regs.get(k)
-            vb = self.reg_value(b, k) if k[0] != "u" else b.regs.get(k)
+        ar, br = a.regs, b.regs
+        rv = self.reg_value
+        # (same key order as before -- reg_value's view lookup depends on
+        # it -- but direct lookups for keys present in both states)
+        for k in set(ar) | set(br):
+            if k in ar:
+                va = ar[k]
+                vb = br[k] if k in br else (None if k[0] == "u" else rv(b, k))
+            else:
+                vb = br[k]
+                va = None if k[0] == "u" else rv(a, k)
             if va == vb:
                 regs[k] = va
             elif va is None or vb is None:
@@ -950,16 +1006,31 @@ class FunctionFlow(object):
         st = self.state_in.get(off)
         return self.reg_value(st, key) if st is not None else None
 
+    def holders(self, st):
+        """Inverted index of a state: ({value: [register keys]},
+        {value: [stack offsets]}), in the state's own order (cached)."""
+        cache = self.__dict__.setdefault("_holders", {})
+        hit = cache.get(id(st))
+        if hit is not None and hit[0] is st:
+            return hit[1], hit[2]
+        regs = {}
+        for k, v in st.regs.items():
+            if k[0] != "u":
+                regs.setdefault(v, []).append(k)
+        mem = {}
+        for o, (_, v) in st.mem.items():
+            mem.setdefault(v, []).append(o)
+        cache[id(st)] = (st, regs, mem)
+        return regs, mem
+
     def locations_of(self, off, value):
         """All (kind, where) holding ``value`` on entry to instruction off:
         ("reg", key) or ("stack", sp_offset)."""
         st = self.state_in.get(off)
         if st is None or value is None:
             return []
-        out = []
-        for k, v in st.regs.items():
-            if v == value and k[0] != "u":
-                out.append(("reg", k))
+        by_val, mem_by_val = self.holders(st)
+        out = [("reg", k) for k in by_val.get(value, ())]
         # A narrow value also lives in the low part of any register holding
         # the wider value of the same origin (MIPS64 "move s0,a0" copies the
         # 64-bit a0 while the variable is its 32-bit low part).
@@ -969,8 +1040,8 @@ class FunctionFlow(object):
                 if not self._is_low_part(vkey, c):
                     continue
                 wide = self._rekey(value, c)
-                for k, v in st.regs.items():
-                    if v == wide and k[0] != "u" and k[1] == c[1]:
+                for k in by_val.get(wide, ()):
+                    if k[1] == c[1]:
                         lo = k[0] + (k[1] - vkey[1] if self.m.big_endian else 0)
                         out.append(("reg", (lo, vkey[1])))
                 if wide == (INIT, c) and c not in st.regs and self.reg_value(st, c) == wide:
@@ -981,9 +1052,7 @@ class FunctionFlow(object):
             # containing/contained register was written)
             if self.reg_value(st, value[1]) == value:
                 out.append(("reg", value[1]))
-        for o, (s, v) in st.mem.items():
-            if v == value:
-                out.append(("stack", o))
+        out += [("stack", o) for o in mem_by_val.get(value, ())]
         return out
 
 
@@ -1131,6 +1200,7 @@ class CfiGenerator(object):
         m = self.m
         best = None
         for k, v in st.regs.items():
+            # (a plain scan: one or two lookups per state don't pay for an index)
             if v != value or k[0] == "u" or k == m.sp_key or k == value[1]:
                 continue
             if preserved_only and not m.is_preserved(k):

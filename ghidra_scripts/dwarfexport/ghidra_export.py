@@ -82,6 +82,8 @@ class Options(object):
         # function's first instruction or a line boundary) but labels the
         # handler frame "<signal handler called>" in backtraces.
         self.irq_signal_frame = True
+        # Decompiler worker threads; -1 = min(8, CPUs - 1). 1 = serial.
+        self.decompile_threads = -1
         # ELF header e_flags; -1 = derive from the language / compiler spec
         # (ARM EABI/BE8/float ABI, MIPS ABI+ISA, PPC64 ELFv1/ELFv2).
         self.elf_flags = -1
@@ -806,16 +808,67 @@ class Exporter(object):
             self.log("Skipping %d external/non-default-space functions" % skipped)
         self.monitor.initialize(len(funcs))
         self.monitor.setMessage("Decompiling functions")
-        ifc = self._decompiler()
+        for i, (func, res) in enumerate(self._decompiled(funcs)):
+            self.monitor.checkCancelled()
+            self.monitor.setProgress(i)
+            if i % 200 == 0:
+                self.log("[%d/%d] %s" % (i, len(funcs), func.getName()))
+            self._export_function(res, func)
+
+    def _skipped(self, func):
+        return (_qualified(func) in self.skip or str(func.getName()) in self.skip
+                or str(func.getEntryPoint()) in self.skip)
+
+    def _decompiled(self, funcs):
+        """Yields (function, DecompileResults or None) in order. Worker
+        threads (one DecompInterface each; JPype releases the GIL during the
+        Java calls) decompile ahead of the export, within a bounded window."""
+        import collections
+        import concurrent.futures
+        import threading
+        n = int(self.opts.decompile_threads)
+        if n < 0:
+            n = max(1, min(8, (os.cpu_count() or 2) - 1))
+        timeout = self.opts.decompile_timeout
+        if n <= 1:
+            ifc = self._decompiler()
+            try:
+                for func in funcs:
+                    yield func, (None if self._skipped(func) else
+                                 ifc.decompileFunction(func, timeout, self.monitor))
+            finally:
+                ifc.dispose()
+            return
+        local = threading.local()
+        ifcs = []
+        lock = threading.Lock()
+
+        def work(func):
+            ifc = getattr(local, "ifc", None)
+            if ifc is None:
+                ifc = local.ifc = self._decompiler()
+                with lock:
+                    ifcs.append(ifc)
+            return None if self._skipped(func) else ifc.decompileFunction(func, timeout, self.monitor)
+
+        ex = concurrent.futures.ThreadPoolExecutor(n)
         try:
-            for i, func in enumerate(funcs):
-                self.monitor.checkCancelled()
-                self.monitor.setProgress(i)
-                if i % 200 == 0:
-                    self.log("[%d/%d] %s" % (i, len(funcs), func.getName()))
-                self._export_function(ifc, func)
+            window = collections.deque()
+            it = iter(funcs)
+            for func in it:
+                window.append((func, ex.submit(work, func)))
+                if len(window) >= 4 * n:
+                    break
+            while window:
+                func, fut = window.popleft()
+                nxt = next(it, None)
+                if nxt is not None:
+                    window.append((nxt, ex.submit(work, nxt)))
+                yield func, fut.result()
         finally:
-            ifc.dispose()
+            ex.shutdown(wait=True, cancel_futures=True)
+            for ifc in ifcs:
+                ifc.dispose()
 
     def _function_ranges(self, func):
         entry = int(func.getEntryPoint().getOffset())
@@ -842,19 +895,14 @@ class Exporter(object):
             ranges = [(entry, entry + 1)]
         return ranges
 
-    def _export_function(self, ifc, func):
+    def _export_function(self, res, func):
         dw = self.dw
         self.stats["functions"] += 1
         name = _qualified(func)
         entry = int(func.getEntryPoint().getOffset())
         ranges = self._function_ranges(func)
 
-        skipped = (name in self.skip or str(func.getName()) in self.skip
-                   or str(func.getEntryPoint()) in self.skip)
-        if skipped:
-            res = None
-        else:
-            res = ifc.decompileFunction(func, self.opts.decompile_timeout, self.monitor)
+        skipped = self._skipped(func)
         hf = res.getHighFunction() if res is not None else None
         markup = res.getCCodeMarkup() if res is not None else None
 
@@ -937,7 +985,8 @@ class Exporter(object):
             addr_lines = {}
             sig_line = None
             for cl in lines:
-                text = str(cl.getIndentString()) + "".join(self._token_text(t) for t in cl.getAllTokens())
+                toks = cl.getAllTokens().toArray()   # (one Java array: no per-element iterator calls)
+                text = str(cl.getIndentString()) + "".join(self._token_text(t) for t in toks)
                 if self.qualified_renames and "::" in text:
                     # the decompiler emits "Ns::name" as several tokens
                     for q, new in self.qualified_renames:
@@ -945,7 +994,7 @@ class Exporter(object):
                             text = text.replace(q, new)
                 self.c_lines.append(text)
                 gline = base + int(cl.getLineNumber())
-                for tok in cl.getAllTokens():
+                for tok in toks:
                     if sig_line is None and isinstance(tok, ClangFuncNameToken):
                         sig_line = gline
                     if isinstance(tok, ClangCommentToken):
