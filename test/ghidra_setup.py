@@ -158,6 +158,44 @@ def fix_elfv2_stack_params(f):
                      Function.FunctionUpdateType.CUSTOM_STORAGE, True, SourceType.USER_DEFINED)
 
 
+def fix_gcc_regparm(f, nregs=3):
+    """GCC -mregparm=N: integer/pointer args go in EAX, EDX, ECX (an int64
+    in a pair, low word first) until N words are used up; float/double and
+    aggregates always go on the stack. Ghidra's __regparm3 hands registers
+    to floats and never to an int64, so re-assign storage by GCC's rules."""
+    from java.util import ArrayList
+    from ghidra.program.model.data import AbstractFloatDataType, Composite, TypeDef
+    from ghidra.program.model.listing import (Function, ParameterImpl, ReturnParameterImpl,
+                                              VariableStorage)
+    lang = prog.getLanguage()
+    regs = [lang.getRegister(r) for r in ("EAX", "EDX", "ECX")][:nregs]
+    used = 0
+    stack = 4
+    jl = ArrayList()
+    for p in f.getParameters():
+        dt = p.getDataType()
+        while isinstance(dt, TypeDef):
+            dt = dt.getBaseDataType()
+        size = max(1, p.getLength())
+        words = (size + 3) // 4
+        if not isinstance(dt, (AbstractFloatDataType, Composite)) and words <= len(regs) - used:
+            vns = [regs[used + i] for i in range(words)]
+            st_ = (VariableStorage(prog, vns[0].getAddress(), size) if words == 1
+                   else VariableStorage(prog, list(reversed(vns))))
+            used += words
+        else:
+            if not isinstance(dt, (AbstractFloatDataType, Composite)):
+                used = len(regs)     # GCC: no more register args after one spills
+            st_ = VariableStorage(prog, stack, size)
+            stack += words * 4
+        jl.add(ParameterImpl(p.getName(), p.getDataType(), st_, prog))
+    r = f.getReturn()
+    f.setCustomVariableStorage(True)
+    f.updateFunction(f.getCallingConventionName(),
+                     ReturnParameterImpl(r.getDataType(), r.getVariableStorage(), prog), jl,
+                     Function.FunctionUpdateType.CUSTOM_STORAGE, True, SourceType.USER_DEFINED)
+
+
 # 3b. Annotations: names, prototypes, typed globals.
 listing = prog.getListing()
 for name, addr, size, kind in syms:
@@ -180,6 +218,12 @@ for name, addr, size, kind in syms:
                 print("WARNING: could not apply prototype to %s" % name)
             elif ELFV2_STACK_FIX:
                 fix_elfv2_stack_params(f)
+            if LAYOUT.get("calling_convention") and not f.hasVarArgs():
+                # the analyst's program-wide calling convention (soft-float,
+                # regparm, stdcall, ...)
+                f.setCallingConvention(LAYOUT["calling_convention"])
+                if LAYOUT["calling_convention"] == "__regparm3" and f.getParameterCount():
+                    fix_gcc_regparm(f)
     else:
         if name in GLOBAL_TYPES:
             dt = GLOBAL_TYPES[name]()

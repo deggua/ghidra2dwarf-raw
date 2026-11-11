@@ -291,6 +291,26 @@ def custom_return():
     set_custom(f, params, ret)
 report("custom storage: bitfield struct return", custom_return)
 
+# --- positional argument slots (MIPS n32): GCC gives every argument a slot, so
+# mix(float a, double b, int c) passes c in a2, but Ghidra's n32 cspec
+# allocates FP and integer registers independently (c -> a0). Fix the
+# storage as an analyst would.
+if _LAYOUT.get("positional_args"):
+    def positional_mix():
+        f = fm.getFunctionAt(A("mix"))
+        regs = prog.getLanguage()
+        params = []
+        for p, reg in zip(f.getParameters(), ("f12", "f13", "a2")):
+            r = regs.getRegister(reg)
+            size = p.getDataType().getLength()
+            vn_addr = r.getAddress()
+            if size < r.getMinimumByteSize() and prog.getLanguage().isBigEndian():
+                vn_addr = vn_addr.add(r.getMinimumByteSize() - size)
+            st = VariableStorage(prog, vn_addr, size)
+            params.append(ParameterImpl(p.getName(), p.getDataType(), st, prog))
+        set_custom(f, params)
+    report("custom storage: positional n32 argument slots", positional_mix)
+
 # --- rename decompiler locals (committed to the database) ----------------------
 def rename_locals():
     ifc = DecompInterface()

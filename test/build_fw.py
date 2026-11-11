@@ -113,7 +113,8 @@ def build(name, opt, out):
         ram = [[syms["__bss_start"], max(syms["__bss_end"] - syms["__bss_start"], 8)]]
     layout = {"target": name, "base": t["base"], "ram": ram, "thumb": t["thumb"],
               "lang": t["lang"], "cspec": t["cspec"], "irq": t["irq"], "elfv2": t["elfv2"],
-              "sret_memory": t["sret_memory"]}
+              "sret_memory": t["sret_memory"], "calling_convention": t["calling_convention"],
+              "positional_args": t["positional_args"]}
     if opd:
         # PPC64 ELFv1: the TOC base an analyst sets r2 to (from a descriptor)
         layout["toc"] = int.from_bytes(opd[1][8:16], "big")

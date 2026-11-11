@@ -155,6 +155,20 @@ class MachineInfo(object):
         self._containers[key] = out
         return out
 
+    def stack_purge(self, target):
+        """Bytes the callee at `target` pops (beyond the return address)."""
+        if target is None:
+            return 0
+        off = int(target.getOffset())
+        cache = getattr(self, "_purge", None)
+        if cache is None:
+            cache = self._purge = {}
+        if off not in cache:
+            f = self.program.getFunctionManager().getFunctionAt(target)
+            p = int(f.getStackPurgeSize()) if f is not None else 0
+            cache[off] = p if 0 < p < 0x10000 else 0
+        return cache[off]
+
     def is_preserved(self, key):
         """Is the register (or the register containing it) preserved across
         calls, so that CFI can unwind it in caller frames?"""
@@ -212,8 +226,12 @@ class FunctionFlow(object):
 
     # -- value access ------------------------------------------------------------
     def default(self, key):
-        if key == self.m.sp_key:
+        sp = self.m.sp_key
+        if key == sp:
             return (SP, 0)
+        if (isinstance(key[0], int) and sp[0] <= key[0] and key[0] + key[1] <= sp[0] + sp[1]
+                and self._is_low_part(key, sp)):
+            return (SP, 0)   # low half of a 64-bit SP (n32 address arithmetic)
         return (INIT, key)
 
     def _is_low_part(self, k, c):
@@ -237,6 +255,10 @@ class FunctionFlow(object):
         if value is None or size <= 0:
             return None
         t = value[0]
+        if t == SP:
+            # addresses: n32/x32 compute SP-relative addresses in the low
+            # 32 bits of 64-bit registers
+            return value
         key = value[1] if t == INIT else (value[2] if t in (DEF, PHI) else None)
         if t == CONST:
             return (CONST, value[1] & ((1 << (8 * size)) - 1), size)
@@ -296,7 +318,12 @@ class FunctionFlow(object):
                 value = (DEF, ins_off, k)
             for other in [o for o in st.regs if o[0] != "u" and o != k
                           and o[0] < k[0] + k[1] and k[0] < o[0] + o[1]]:
-                st.regs[other] = None
+                if k[0] <= other[0] and other[0] + other[1] <= k[0] + k[1]:
+                    # a view inside the written register: reg_value derives
+                    # it from the new value (n32: SP's low half after "move sp,s8")
+                    del st.regs[other]
+                else:
+                    st.regs[other] = None
             # Registers that contain the written one also change.
             for mk in self.m.containers(k):
                 if mk not in st.regs:
@@ -378,7 +405,9 @@ class FunctionFlow(object):
                 # MIPS64/PPC64 32-bit ops sign-extend): the wide register gets
                 # a new value, but its low part still holds the narrow one.
                 inner = self._get(st, i0)
-                self._set(st, out, None, off)
+                # an extended stack address is still that address (n32:
+                # "addiu sp,sp,-16" = sext(sp:4 - 16))
+                self._set(st, out, inner if (inner is not None and inner[0] == SP) else None, off)
                 if inner is not None and i0[2] < out[2]:
                     lo = out[1] if not self.m.big_endian else out[1] + out[2] - i0[2]
                     st.regs[(lo, i0[2])] = inner
@@ -391,10 +420,15 @@ class FunctionFlow(object):
             del st.regs[k]
 
         if is_call:
-            # The callee returns with the SP as before the call and clobbers
-            # every register that is not preserved across calls.
+            # The callee returns with the SP as before the call (plus any
+            # arguments it pops itself: stdcall, -mrtd) and clobbers every
+            # register that is not preserved across calls.
             if sp_before is not None:
-                st.regs[self.m.sp_key] = sp_before
+                if sp_before[0] == SP:
+                    purge = self.m.stack_purge(self.call_targets.get(off))
+                    st.regs[self.m.sp_key] = (SP, sp_before[1] + purge)
+                else:
+                    st.regs[self.m.sp_key] = sp_before
             for k in self.m.volatile:
                 st.regs[k] = (DEF, off, k)
             for k in list(st.regs):
@@ -413,8 +447,8 @@ class FunctionFlow(object):
     def merge(self, a, b, join_off):
         regs = {}
         for k in set(a.regs) | set(b.regs):
-            va = a.regs[k] if k in a.regs else self.default(k)
-            vb = b.regs[k] if k in b.regs else self.default(k)
+            va = self.reg_value(a, k) if k[0] != "u" else a.regs.get(k)
+            vb = self.reg_value(b, k) if k[0] != "u" else b.regs.get(k)
             if va == vb:
                 regs[k] = va
             elif va is None or vb is None:
@@ -439,7 +473,8 @@ class FunctionFlow(object):
         dropped slots stay dropped) so the fixpoint iteration terminates:
         otherwise phis of nested loop heads can chase each other forever."""
         for k, ov in old.regs.items():
-            nv = new.regs[k] if k in new.regs else self.default(k)
+            nv = new.regs[k] if k in new.regs else (
+                self.reg_value(new, k) if k[0] != "u" else None)
             if ov is None:
                 new.regs[k] = None
             elif ov == (PHI, join_off, k) and nv is not None:
@@ -467,6 +502,7 @@ class FunctionFlow(object):
 
         dec = self._decode
         self.decoded = {}
+        self.call_targets = {}
         for ins in self.listing.getInstructions(body, True):
             o = int(ins.getAddress().getOffset())
             self.insns.append(o)
@@ -477,6 +513,10 @@ class FunctionFlow(object):
                 n = op.getNumInputs()
                 ins_ = [dec(op.getInput(i)) if i < n else None for i in range(3)]
                 ops.append((int(op.getOpcode()), dec(op.getOutput()), ins_[0], ins_[1], ins_[2]))
+            if ft.isCall():
+                tg = [t for t in ins.getFlows() if t is not None]
+                if len(tg) == 1:
+                    self.call_targets[o] = tg[0]
             succs = []
             if not ft.isTerminal():
                 fall = ins.getFallThrough()

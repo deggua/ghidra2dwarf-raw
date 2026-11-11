@@ -61,7 +61,8 @@ def main():
     # --- names in the generated C match the DWARF names ---------------------
     with open(CSRC, encoding="utf-8") as f:
         csrc = f.read()
-    check("C file uses exported function name", "int %s(int %s)" % (GET_VALUE, P_ARG) in csrc)
+    check("C file uses exported function name",
+          re.search(r"int (?:__\w+ )?%s\(int %s\)" % (re.escape(GET_VALUE), re.escape(P_ARG)), csrc) is not None)
     check("C file uses exported namespaced name", "%s(10)" % FOO_INIT in csrc)
     check("C file uses exported type name", "struct %s" % THING_T in csrc)
     check("no unquotable quote left in C names", "it's" not in csrc)
@@ -117,7 +118,7 @@ def main():
         print("SKIP finish double (unreadable in this GDB+QEMU setup even with GCC's DWARF)")
 
     # --- renamed locals, stack array -----------------------------------------
-    start = line_of(r"^int edge_locals\(")
+    start = line_of(r"^int (?:__\w+ )?edge_locals\(")
     body = func_text("edge_locals").split("\n")
     rets = [l for l in body if re.match(r"^\s*return\b", l)]
     ret_text = rets[-1]
@@ -158,7 +159,7 @@ def main():
         print("SKIP code * local (indirect call through a function descriptor)")
         cont_to("call_ptr")
     else:
-        call_line = line_of(r"\(\*pcVar\d+\)\(\);", line_of(r"^int call_ptr\("))
+        call_line = line_of(r"\(\*pcVar\d+\)\(\);", line_of(r"^int (?:__\w+ )?call_ptr\("))
         cont_to("%s:%d" % (os.path.basename(CSRC), call_line))
         pc_var = m.group(1)
         out = run("ptype %s" % pc_var)

@@ -153,7 +153,7 @@ def setup_session():
         raise RuntimeError("GDB is not using the exported ELF:\n" + files)
     if "producer" in run("info source") and "GNU C" in run("info source"):
         raise RuntimeError("GCC debug info leaked into the session")
-    fw_main_line = line_of(r"^void fw_main\(void\)")
+    fw_main_line = line_of(r"^void (?:__\w+ )?fw_main\(void\)")
     try:
         loop_line = line_of(r"WARNING: Do nothing block with infinite loop", fw_main_line) - 1
     except KeyError:

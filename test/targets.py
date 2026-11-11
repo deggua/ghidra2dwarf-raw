@@ -32,6 +32,8 @@ def _t(**kw):
     kw.setdefault("irq", False)
     kw.setdefault("elfv2", False)
     kw.setdefault("sret_memory", False)   # small structs returned via hidden pointer
+    kw.setdefault("calling_convention", None)  # applied to every C function by the setup
+    kw.setdefault("positional_args", False)    # FP/int args share slots (n32; Ghidra's cspec doesn't)
     return kw
 
 
@@ -43,6 +45,11 @@ TARGETS = {
                         "-mno-relocatable"],
                 asflags=["-mcpu=603e", "-Wa,-mregnames"],
                 lang="PowerPC:BE:32:default", qemu_args=["-cpu", "603e"]),
+    # Linux PPC32 ABI variant: structs returned in memory (GCC default)
+    "ppc32-linux": _t(cross="powerpc-linux-gnu-", isa="ppc32", mode="rom", base=0xFFF00000, sret_memory=True,
+                      cflags=["-mcpu=750", "-mhard-float", "-msdata=none", "-G0", "-mno-relocatable"],
+                      asflags=["-mcpu=750", "-Wa,-mregnames"],
+                      lang="PowerPC:BE:32:default"),
     "ppc64be": _t(cross="powerpc64-linux-gnu-", isa="ppc64", base=BASE64, elfv2=True,
                   cflags=["-mabi=elfv2", "-mcmodel=medium"], asflags=["-mabi=elfv2"],
                   lang="PowerPC:BE:64:A2ALT", qemu="qemu-ppc64"),
@@ -65,6 +72,17 @@ TARGETS = {
     "mips64le": _t(cross="mips64el-linux-gnuabi64-", isa="mips", base=BASE64,
                    cflags=["-mno-abicalls", "-G0", "-march=mips64r2"], asflags=["-mno-abicalls", "-fno-pic", "-march=mips64r2"],
                    lang="MIPS:LE:64:default", qemu="qemu-mips64el"),
+    # n32: 64-bit registers, 32-bit pointers
+    "mips64n32be": _t(cross="mips64-linux-gnuabi64-", isa="mips", base=BASE32,
+                      cflags=["-mabi=n32", "-mno-abicalls", "-G0", "-march=mips64r2"],
+                      asflags=["-mabi=n32", "-mno-abicalls", "-fno-pic", "-march=mips64r2"],
+                      ldflags=["-mabi=n32"],
+                      lang="MIPS:BE:64:64-32addr", cspec="n32", positional_args=True, qemu="qemu-mipsn32"),
+    "mips64n32le": _t(cross="mips64el-linux-gnuabi64-", isa="mips", base=BASE32,
+                      cflags=["-mabi=n32", "-mno-abicalls", "-G0", "-march=mips64r2"],
+                      asflags=["-mabi=n32", "-mno-abicalls", "-fno-pic", "-march=mips64r2"],
+                      ldflags=["-mabi=n32"],
+                      lang="MIPS:LE:64:64-32addr", cspec="n32", positional_args=True, qemu="qemu-mipsn32el"),
     # --- ARM (hard-float AAPCS, as ARM.cspec) -------------------------------------
     "armle": _t(cross="arm-linux-gnueabi-", isa="arm", base=BASE32,
                 cflags=["-marm", "-march=armv7-a", "-mfloat-abi=hard", "-mfpu=vfpv3-d16"],
@@ -79,6 +97,12 @@ TARGETS = {
                 asflags=["-marm", "-march=armv7-a", "-mbig-endian", "-mfloat-abi=hard", "-mfpu=vfpv3-d16"],
                 ldflags=["-mbig-endian", "-Wl,--be8"],
                 lang="ARM:LEBE:32:v7LEInstruction", qemu="qemu-armeb", qemu_args=["-cpu", "cortex-a15"]),
+    # softfp AAPCS: VFP code, floats passed in core registers (Ghidra: __stdcall_softfp)
+    "armle-softfp": _t(cross="arm-linux-gnueabi-", isa="arm", base=BASE32,
+                       cflags=["-marm", "-march=armv7-a", "-mfloat-abi=softfp", "-mfpu=vfpv3-d16"],
+                       asflags=["-marm", "-march=armv7-a", "-mfloat-abi=softfp", "-mfpu=vfpv3-d16"],
+                       lang="ARM:LE:32:v7", qemu="qemu-arm", qemu_args=["-cpu", "cortex-a15"],
+                       calling_convention="__stdcall_softfp"),
     # --- AArch64 ---------------------------------------------------------------------
     "aarch64le": _t(cross="aarch64-linux-gnu-", isa="aarch64", base=BASE64,
                     lang="AARCH64:LE:64:v8A", qemu="qemu-aarch64"),
@@ -88,6 +112,10 @@ TARGETS = {
     # --- x86 ---------------------------------------------------------------------------
     "i386": _t(cross="", isa="x86_32", base=BASE32, cflags=["-m32", "-fno-pie"], asflags=["-m32"],
                ldflags=["-m32", "-no-pie"], lang="x86:LE:32:default", cspec="gcc", qemu="qemu-i386"),
+    # register arguments (Linux kernel style): EAX, EDX, ECX
+    "i386-regparm": _t(cross="", isa="x86_32", base=BASE32, cflags=["-m32", "-fno-pie", "-mregparm=3"],
+                       asflags=["-m32"], ldflags=["-m32", "-no-pie"], lang="x86:LE:32:default",
+                       cspec="gcc", qemu="qemu-i386", calling_convention="__regparm3"),
     "x86_64": _t(cross="", isa="x86_64", base=BASE64, cflags=["-m64", "-fno-pie"],
                  asflags=["-m64"], ldflags=["-m64", "-no-pie"],
                  lang="x86:LE:64:default", cspec="gcc", qemu="qemu-x86_64"),

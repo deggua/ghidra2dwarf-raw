@@ -1082,7 +1082,20 @@ class Exporter(object):
         return ()
 
     def _float_regs_for_args(self):
-        cc = self.program.getCompilerSpec().getDefaultCallingConvention()
+        """Does the program's predominant calling convention pass floating
+        point arguments in FP registers (e.g. ARM hard-float vs softfp)?"""
+        from collections import Counter
+        cspec = self.program.getCompilerSpec()
+        used = Counter(str(f.getCallingConventionName())
+                       for f in self.program.getFunctionManager().getFunctions(True)
+                       if not f.isExternal())
+        cc = None
+        for name, _ in used.most_common():
+            cc = cspec.getCallingConvention(name)
+            if cc is not None:
+                break
+        if cc is None:
+            cc = cspec.getDefaultCallingConvention()
         try:
             for st in cc.getPotentialInputRegisterStorage(self.program):
                 for vn in st.getVarnodes():
@@ -1108,6 +1121,14 @@ class Exporter(object):
             if self.addr_size == 8:
                 return 0x80000000                               # EF_MIPS_ARCH_64R2 (n64)
             cspec = str(self.program.getCompilerSpec().getCompilerSpecID())
+            a0 = self.lang.getRegister("a0")
+            if a0 is not None and int(a0.getMinimumByteSize()) == 8:
+                # 64-bit registers, 32-bit addresses
+                if "n32" in cspec:
+                    return 0x80000000 | 0x20                    # ARCH_64R2 | EF_MIPS_ABI2 (n32)
+                if "o32" in cspec:
+                    return 0x80000000 | 0x1000                  # ARCH_64R2 | O32
+                return 0x80000000 | 0x2000                      # ARCH_64R2 | O64
             abi = 0x3000 if "eabi" in cspec else 0x1000         # EABI32 / O32
             return 0x70000000 | abi                             # EF_MIPS_ARCH_32R2
         if proc == "PowerPC" and self.addr_size == 8:
