@@ -22,7 +22,6 @@ from java.io import StringWriter
 from ghidra.app.decompiler import DecompInterface, DecompileOptions, ClangFuncNameToken
 from ghidra.app.decompiler.component import DecompilerUtils
 from ghidra.app.util.bin.format.dwarf import DWARFRegisterMappingsManager
-from ghidra.program.model.address import AddressSpace
 from ghidra.program.model.data import (
     AbstractComplexDataType, AbstractFloatDataType, AbstractIntegerDataType,
     Array, BitFieldDataType, BooleanDataType, CharDataType, DataTypeWriter,

@@ -110,13 +110,31 @@ class MachineInfo(object):
         """DWARF number of the register exactly matching key, else None."""
         if key is None or len(key) != 2 or not isinstance(key[0], int):
             return None
+        try:
+            return self._dwarf_cache[key]
+        except KeyError:
+            pass
+        except AttributeError:
+            self._dwarf_cache = {}
+        num = None
         hit = self.regs.lookup(key[0], key[1])
-        if hit is None:
-            return None
-        num, off, size = hit
-        if off != key[0] or size != key[1]:
-            return None
+        if hit is not None and hit[1] == key[0] and hit[2] == key[1]:
+            num = hit[0]
+        self._dwarf_cache[key] = num
         return num
+
+    def containers(self, key):
+        """Mapped registers strictly containing register bytes ``key``."""
+        try:
+            return self._containers[key]
+        except KeyError:
+            pass
+        except AttributeError:
+            self._containers = {}
+        out = [mk for mk in self.mapped
+               if mk != key and mk[0] <= key[0] and key[0] + key[1] <= mk[0] + mk[1]]
+        self._containers[key] = out
+        return out
 
     def is_preserved(self, key):
         """Is the register preserved across calls (so CFI can unwind it)?"""
@@ -202,8 +220,8 @@ class FunctionFlow(object):
                           and o[0] < k[0] + k[1] and k[0] < o[0] + o[1]]:
                 st.regs[other] = None
             # Registers that contain the written one also change.
-            for mk in self.m.mapped:
-                if mk != k and mk[0] <= k[0] and k[0] + k[1] <= mk[0] + mk[1] and mk not in st.regs:
+            for mk in self.m.containers(k):
+                if mk not in st.regs:
                     st.regs[mk] = None
             st.regs[k] = value
         elif vn.isUnique():
