@@ -37,7 +37,9 @@ def export(build, work, opts=()):
           ["-postScript", os.path.join(HERE, "ghidra_setup_edge.py"), build] + \
           (["-postScript", os.path.join(HERE, "ghidra_setup_irq.py"), build] if layout.get("irq") else []) + [
            "-postScript", os.path.join(REPO, "ghidra_scripts", "ExportDwarfELF.py"),
-           os.path.join(work, "out")] + list(opts)
+           os.path.join(work, "out")] + list(opts) + [
+           # what the DWARF round trip (test/roundtrip.py) compares against
+           "-postScript", os.path.join(HERE, "ghidra_dump.py"), os.path.join(work, "original.json")]
     log_path = os.path.join(work, "ghidra.log")
     with open(log_path, "w") as log:
         # pyghidraRun asks once whether to install PyGhidra into Ghidra's venv.

@@ -3,3 +3,4 @@ __pycache__/
 test/firmware/build*/
 /work/
 core.*
+hs_err_pid*.log

@@ -23,6 +23,13 @@ sys.path.insert(0, HERE)
 from targets import TARGETS  # noqa: E402
 
 
+def _no_core():
+    # GDB occasionally hits internal errors (seen with GCC's own DWARF in the
+    # x86_64 FP probe); don't litter the working directory with core files.
+    import resource
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+
 def free_port():
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -85,7 +92,7 @@ def fp_probe(build):
                             "-ex", "file " + os.path.join(build, "fw.elf"),
                             "-ex", "set tcp auto-retry on", "-ex", "set tcp connect-timeout 20",
                             "-ex", "target remote :%d" % port, "-x", script],
-                           capture_output=True, text=True, timeout=120)
+                           capture_output=True, text=True, timeout=120, preexec_fn=_no_core)
         out = r.stdout + r.stderr
     except subprocess.TimeoutExpired:
         out = ""
@@ -119,10 +126,11 @@ def run(build, elf, csrc, checks=None, sanitized=False, timeout=180):
         env = dict(os.environ, ELF=os.path.abspath(elf), CSRC=os.path.abspath(csrc),
                    QEMU_PORT=str(port), SANITIZED="1" if sanitized else "0",
                    FP_ARGS_OK="1" if probe["args"] else "0", FP_RET_OK="1" if probe["ret"] else "0",
-                   PYTHONIOENCODING="utf-8")
+                   BUILD=os.path.abspath(build), PYTHONIOENCODING="utf-8")
         try:
             r = subprocess.run(["gdb-multiarch", "-q", "-nx", "-batch", "-x", os.path.abspath(checks)],
-                               env=env, capture_output=True, text=True, timeout=timeout)
+                               env=env, capture_output=True, text=True, timeout=timeout,
+                               preexec_fn=_no_core)
             out = r.stdout + r.stderr
         except subprocess.TimeoutExpired as e:
             def _s(x):

@@ -13,11 +13,16 @@ A PyGhidra script exports a Ghidra program as:
 
 Load the ELF into GDB while attached to the real target or an emulator (QEMU),
 and `break`, `list`, `next`, `step`, `finish`, `bt`, `up`, `info locals`,
-`p var`, `p *ptr`, `ptype` all work on the decompiled code.
+`info frame`, `p var`, `p *ptr`, `ptype`, `call func(...)`, `return`,
+`watch`, `advance`, `until` and `jump` all work on the decompiled code.
+Backtraces continue through interrupt and exception handlers into the
+interrupted code.
 
-Supported and tested (see [Tests](#tests)): **PowerPC** (32-bit BE, 64-bit BE
-and LE), **MIPS** (32/64-bit, BE and LE), **ARM** (LE, BE8, Thumb-2),
-**AArch64** (LE and BE), and **x86** (i386, x86-64).
+Supported and tested (see [Tests](#tests)): **PowerPC** (32-bit BE, including
+603e/MPC8xxx exception handlers; 64-bit BE ELFv1 and ELFv2, LE), **MIPS**
+(o32, n32 and n64, BE and LE), **ARM** (LE, BE8, Thumb-2; hard-float and
+softfp), **AArch64** (LE and BE), and **x86** (i386, including `-mregparm`,
+and x86-64).
 
 It combines the ideas of
 [ghidra2dwarf](https://github.com/cesena/ghidra2dwarf) (decompiled source +
@@ -68,7 +73,8 @@ Options (`key=value` script arguments in headless mode; defaults in
 | `basename` | program name | Output file base name. |
 | `sanitize_names` | `false` | Rewrite every name into a plain C identifier (`Get?Value` → `Get_Value`, `Foo::init` → `Foo__init`, a variable named `switch` → `switch_`), consistently in the DWARF, the ELF symbols and the `.c` file. See [Names](#names). |
 | `skip_decompile` | | Comma-separated function names (or entry addresses) not to decompile, e.g. ones that hang the decompiler. They still get symbols, address ranges, CFI and a one-line prototype. |
-| `elf_flags` | `-1` (auto) | ELF header `e_flags`. By default derived from the language and compiler spec (ARM EABI5, BE8 and float ABI; MIPS o32/EABI/n64 and ISA; PPC64 ELFv1/ELFv2). GDB uses it to pick the ABI. |
+| `elf_flags` | `-1` (auto) | ELF header `e_flags`. By default derived from the language and compiler spec (ARM EABI5, BE8 and float ABI; MIPS o32/n32/o64/EABI/n64 and ISA; PPC64 ELFv1/ELFv2). GDB uses it to pick the ABI. |
+| `irq_signal_frame` | `true` | Mark interrupt/exception handler frames as signal frames, see [Interrupt and exception handlers](#interrupt-and-exception-handlers). |
 
 Re-export (and `symbol-file` again in GDB) whenever you change annotations.
 Don't edit the `.c` file: the line table points at its exact line numbers.
@@ -138,10 +144,19 @@ them from the Ghidra language and compiler spec:
 | Architecture | What the exporter adds |
 |--------------|------------------------|
 | PowerPC | GCC/GDB DWARF register numbers (Ghidra's `ppc.dwarf` numbers LR/CTR differently). |
-| PPC64 | `e_flags` ELFv2 when functions start with a TOC setup (`addis r2,r12,..` or `lis r2,..` followed by `addi r2,r2,..`), and local entry points in the symbols' `st_other`. Local calls enter 8 bytes in, so breakpoints go there. |
-| MIPS | `e_flags` ABI (o32/EABI/n64) and ISA. Delay slots: Ghidra folds a slot into its branch's p-code, and a PC inside a slot (a caller frame's return address) gets the state *after* the slot executed. |
+| PPC64 | `e_flags` ELFv2 when functions start with a TOC setup (`addis r2,r12,..` or `lis r2,..` followed by `addi r2,r2,..`), and local entry points in the symbols' `st_other`. Local calls enter 8 bytes in, so breakpoints go there. Otherwise ELFv1: see below. |
+| MIPS | `e_flags` ABI and ISA: o32/EABI from the compiler spec; with 64-bit registers, n64, or n32 (`0x20`) when pointers are 32 bits (`MIPS:*:64:64-32addr` languages). Delay slots: Ghidra folds a slot into its branch's p-code, and a PC inside a slot (a caller frame's return address) gets the state *after* the slot executed. n32 code does its stack-pointer arithmetic in the low 32 bits of the 64-bit `sp`; the CFI analysis follows it. |
 | ARM | `e_flags` (EABI5, BE8 for `ARM:LEBE` languages, float ABI) and a `.ARM.attributes` section (GDB reads the float ABI from `Tag_ABI_VFP_args`). Thumb functions (from Ghidra's `TMode` context) get symbols with bit 0 set and `$t`/`$a`/`$d` mapping symbols. |
 | AArch64, x86 | Nothing special. 32-bit writes to 64-bit registers (AArch64 `w0`/`x0`, x86-64 `eax`/`rax`) are tracked as the low part of the wider register. |
+
+**PPC64 ELFv1 function descriptors.** ELFv1 function pointers point at
+3-doubleword descriptors (entry, TOC, environment) in `.opd`, and GDB resolves
+`call ptr(...)`, `break *ptr` and function-pointer values through the `.opd`
+section. A raw image has no sections, so the exporter finds descriptor arrays:
+aligned doublewords pointing at a function entry, followed by the program's
+common TOC value and 0. They're emitted as an `.opd` section with a symbol per
+descriptor. GDB's inferior calls load r2 from the descriptor; for the code to
+run correctly the TOC (r2) must be set up as on the real target.
 
 Things to check in your Ghidra project, all found while testing:
 
@@ -152,12 +167,30 @@ Things to check in your Ghidra project, all found while testing:
   * PPC32: Ghidra's `ppc_32.cspec` returns structs of 8 bytes or less in r3:r4
     (SVR4/EABI, GCC `-msvr4-struct-return`). Linux GCC
     (`powerpc-linux-gnu`) returns them in memory via a hidden pointer in r3.
+    So does PPC64 ELFv1. Fix: return a pointer and add the pointer as the
+    first parameter.
   * PPC64: both Ghidra PPC64 compiler specs put stack arguments at SP+112
     (ELFv1). ELFv2, which is always the case for little-endian, puts them at
     SP+96.
-  * ARM: `ARM.cspec` passes floating point arguments in VFP registers
-    (hard-float). Soft-float code (`-mfloat-abi=soft/softfp`) passes them in
-    core registers.
+  * ARM: `ARM.cspec`'s default convention passes floating point arguments in
+    VFP registers (hard-float). For softfp code (`-mfloat-abi=softfp`: VFP
+    instructions, but float arguments in core registers) set the functions'
+    calling convention to `__stdcall_softfp`; the exporter then also marks
+    the ELF as soft-float, which GDB uses for `finish` and `call`.
+  * MIPS n32: use a `MIPS:*:64:64-32addr` language with the `n32` compiler
+    spec. That spec allocates FP and integer argument registers
+    independently, but n32 (like n64) gives every argument a slot: in
+    `double f(float a, double b, int c)`, `c` is in `a2`, not `a0`. Fix
+    mixed float/integer prototypes with custom storage.
+  * i386 `-mregparm=3` (Linux kernel style): Ghidra's `__regparm3` gives
+    float/double arguments registers and never passes an `int64` in
+    registers. GCC does the opposite: floats and structs always go on the
+    stack, an `int64` takes a register pair (EAX:EDX) if two are left, and an
+    argument that doesn't fit ends register passing. Use custom storage.
+  * Callee-pops conventions (`stdcall`, `-mrtd`): the CFI analysis takes the
+    popped bytes from the callee's prototype (`extrapop`) and accounts for
+    them after the call. This path is untested, since the GCC x86 compiler
+    spec has no callee-pops convention.
   * `char` signedness follows the compiler spec, which for most processors is
     signed (GCC uses unsigned on ARM, AArch64 and PowerPC).
 * **Language variant.** Pick one that decodes all your instructions; e.g. POWER8+
@@ -169,6 +202,42 @@ Things to check in your Ghidra project, all found while testing:
   points (`func+8`, the target of local calls), splitting each function after
   its 2-instruction TOC setup. Merge them back into one function starting at
   the global entry.
+
+## Interrupt and exception handlers
+
+Handlers entered by the hardware get their own CFI (a separate CIE): the
+return address is the interrupt return register (PPC `SRR0`, `CSRR0` for
+critical and `MCSRR0` for machine-check interrupts, MIPS `EPC`/`ErrorEPC`,
+AArch64 `ELR_ELn`), and every register is recovered from where the handler
+saved it. Unwinding from a C function called by the handler goes through the
+handler into the interrupted function at the interrupted instruction, with
+that function's registers and arguments restored from the exception frame.
+
+A function is treated as a handler when:
+
+* it returns with an interrupt-return instruction (`rfi`, `rfid`, `rfci`,
+  `rfmci`, `eret`, `iret`, ...);
+* it has the Ghidra function tag `INTERRUPT` (for handlers whose return
+  isn't in the function, e.g. ones that branch to a common exit path);
+* it is an entry point (Ghidra *external entry point*) at a classic PowerPC
+  exception vector, 0x200-0x2f00 above 0 or 0xfff00000 (system reset at
+  0x100 has nothing to return to); or
+* one of the above jumps (not calls) to it. This covers vector stubs like
+  `nop; nop; b handler`.
+
+With `irq_signal_frame=true` (default) the handler CIE has augmentation `S`,
+and GDB shows the handler as `<signal handler called>` and looks up the
+interrupted frame's line and CFI at the exact interrupted PC. With `false`,
+GDB treats the handler like a normal caller and uses PC-1 for the interrupted
+frame's line and CFI. That is off by one instruction when the interrupt hit
+the first instruction after a branch or at a function start.
+
+Limitation: the return address is only recoverable once the handler has
+stored `SRR0` (or `EPC`, ...) in memory. GDB can read `$srr0` by name but
+can't map DWARF register numbers to special-purpose registers, so before the
+save (in the vector stub, and the first few instructions of the handler) the
+backtrace ends at the handler instead of continuing into the interrupted
+code.
 
 ## What is exported
 
@@ -193,7 +262,8 @@ Things to check in your Ghidra project, all found while testing:
   | Ghidra | DWARF |
   |--------|-------|
   | `undefined`, `undefined1..8` | unsigned base types with those names |
-  | dynamic-size data (strings, unicode strings) | a byte array of the data's actual length |
+  | strings and unicode strings | an array of `char` / `char16_t` / `char32_t` of the data's actual length, so GDB prints them as strings (`"..."`, `u"..."`, `U"..."`) |
+  | other dynamic-size data | a byte array of the data's actual length |
   | fixed-size types with no C equivalent | a typedef with the Ghidra name, to a byte array of the same size |
   | pointer typedefs with an offset, shift, mask, relative/image-base type, or another address space (e.g. `int *32 __((offset(-0x4)))`) | a typedef with the Ghidra name, to an unsigned integer, so GDB shows the raw value instead of dereferencing the wrong address |
   | "not yet defined" placeholder structs | a declaration (GDB shows `<incomplete type>`) |
@@ -263,9 +333,21 @@ undefined return address, so backtraces end cleanly.
   register entry (`flow._LINK_REGISTERS`).
 * The DWARF reflects the Ghidra annotations, including their mistakes (see
   [Architecture notes](#architecture-notes)).
-* PPC64 ELFv1 (function descriptors) is untested; the test firmware uses
-  ELFv2 for both endiannesses. MIPS16/microMIPS mode switches are not
-  represented in the symbols (Thumb is).
+* MIPS16/microMIPS mode switches are not represented in the symbols (Thumb
+  is).
+* C only. The pseudo-C and DWARF are C (namespaced names are kept as
+  qualified names); C++ (classes with member functions, `this`, references,
+  templates, `DW_TAG_namespace`) is future work.
+* `call func(...)` in GDB marshals arguments by the architecture's standard
+  calling convention. GDB doesn't use the DWARF parameter locations for that,
+  and DWARF can't describe a custom convention, so calling functions that
+  use custom storage or a non-standard convention (i386 regparm, softfp
+  without the soft-float ELF flag) passes the arguments in the wrong places.
+  Breakpoints, argument display, `finish` and backtraces aren't affected.
+* `return` in GDB pops the frame using the CFI and puts the value where the
+  standard convention returns it.
+* Interrupt handlers before the return-address save: see
+  [Interrupt and exception handlers](#interrupt-and-exception-handlers).
 * Some GDB + QEMU combinations can't read floating point / vector registers
   at all, even with GCC's own debug info: x86-64 under QEMU user mode
   (GDB misnumbers the xmm registers), MIPS o32 doubles in FPR pairs, and
@@ -302,7 +384,7 @@ ghidra_scripts/dwarfexport/
     consts.py          DWARF/ELF constants
 test/
     run_all.py         full test suite (parallel; targets x -O levels)
-    targets.py         the 14 targets: toolchain, flags, Ghidra language, QEMU
+    targets.py         the 20 targets: toolchain, flags, Ghidra language, QEMU
     build_fw.py        builds the test firmware for a target
     test_writer.py     unit tests for dwarf.py/elf.py (llvm-dwarfdump, readelf, gdb)
     firmware/          test firmware: portable C + per-ISA crt0.S / edge_asm.S
@@ -311,8 +393,13 @@ test/
     run_gdb_test.py    runs the firmware under QEMU and the GDB check scripts
     gdb_checks.py      GDB-Python assertions (backtraces, args, locals, stepping, finish, globals)
     gdb_edge_checks.py edge cases (see below)
+    gdb_feature_checks.py  call, return, watch (global and scoped local), advance, until, jump, info frame
+    gdb_irq_checks.py  backtraces through PPC exception handlers (ppc32)
     gdb_helpers.py     shared GDB-side helpers
     ghidra_setup_edge.py  Ghidra-only annotations for the edge cases
+    ghidra_setup_irq.py   INTERRUPT tag / entry points for the exception vectors
+    roundtrip.py       re-imports the exported ELF into Ghidra (DWARF only) and diffs it
+    ghidra_dump.py, ghidra_dwarf_only.py  helpers for the round trip
 ```
 
 ## Tests
@@ -326,20 +413,25 @@ cross GCC and QEMU: `qemu-system-ppc` (ppc32), `qemu-user` (the rest),
 and the host GCC (`-m32`/`-m64`).
 
 ```sh
-test/run_all.py                         # 14 targets x -O0/-O1/-O2 + sanitized names; ~10 min
+test/run_all.py                         # 20 targets x -O0/-O1/-O2 + sanitized names
 test/run_all.py -t armle-thumb,mips32be -O O1
 ```
 
 | Target | Ghidra language | Runs under |
 |--------|-----------------|------------|
-| ppc32 | `PowerPC:BE:32:default` | `qemu-system-ppc -M mac99` (boot ROM at 0xfff00000) |
+| ppc32 | `PowerPC:BE:32:default`, 603e, SVR4 struct returns, exception handlers | `qemu-system-ppc -M mac99 -cpu 603e` (boot ROM at 0xfff00000) |
+| ppc32-linux | same, Linux ABI (structs returned in memory) | `qemu-system-ppc -M mac99` |
 | ppc64be / ppc64le | `PowerPC:{BE,LE}:64:A2ALT` (ELFv2) | `qemu-ppc64` / `qemu-ppc64le` |
+| ppc64be-elfv1 | `PowerPC:BE:64:A2ALT` (ELFv1, `.opd` descriptors) | `qemu-ppc64` |
 | mips32be / mips32le | `MIPS:{BE,LE}:32:default` (o32) | `qemu-mips` / `qemu-mipsel` |
 | mips64be / mips64le | `MIPS:{BE,LE}:64:default` (n64) | `qemu-mips64` / `qemu-mips64el` |
+| mips64n32be / mips64n32le | `MIPS:{BE,LE}:64:64-32addr`, `n32` compiler spec | `qemu-mipsn32` / `qemu-mipsn32el` |
 | armle / armbe | `ARM:LE:32:v7` / `ARM:LEBE:32:v7LEInstruction` (BE8), hard-float | `qemu-arm` / `qemu-armeb` |
 | armle-thumb | `ARM:LE:32:v7`, Thumb-2 | `qemu-arm` |
+| armle-softfp | `ARM:LE:32:v7`, `__stdcall_softfp` | `qemu-arm` |
 | aarch64le / aarch64be | `AARCH64:{LE,BE}:64:v8A` | `qemu-aarch64` / `qemu-aarch64_be` |
 | i386 / x86_64 | `x86:LE:{32,64}:default`, `gcc` compiler spec | `qemu-i386` / `qemu-x86_64` |
+| i386-regparm | same, `-mregparm=3` (`__regparm3` + custom storage) | `qemu-i386` |
 
 The test firmware is built from C, converted to a raw binary
 (`objcopy -O binary`), and imported into Ghidra as a raw binary at its link
@@ -354,6 +446,19 @@ the reference binary with GCC's debug info).
 GDB then checks argument and local values in inner and outer frames, 64-bit
 register-pair and stack-passed arguments, recursion, indirect calls, stepping,
 `finish` return values, struct/bitfield/enum printing, and final global state.
+A second session per run exercises GDB features that depend on the debug info:
+inferior calls (register, stack, int64 and function-pointer calls), `return`
+with a forced value (the program then has to carry on with it), `info frame`,
+hardware/software watchpoints on a global and on a stack local (which GDB must
+delete when its frame returns), `advance`, `until`, and `jump`. On ppc32 a
+third session checks backtraces through the exception handlers (system call,
+program check via a tagged stub, decrementer via a vector stub), `finish` out
+of a C handler, and stepping over `rfi`.
+
+Every export is also re-imported into a fresh Ghidra project with only the
+DWARF analyzer and compared with the annotated original: function names,
+prototypes (parameter names and types), globals and their types, and
+struct/union/enum layouts must survive the round trip.
 The checks adapt to code shapes that differ legitimately between targets and
 `-O` levels (tail calls, recursion turned into a loop, arguments passed only in
 registers). Before checking floating point values, the harness probes whether
@@ -379,5 +484,10 @@ The edge-case module (`firmware/edge.c`, `edge_asm.S`, `ghidra_setup_edge.py`,
 * a non-contiguous function (stepping into its detached tail and backtracing
   from there), and a function whose decompilation fails or is skipped.
 
-All of it runs on all 14 targets at three `-O` levels, and with
-`sanitize_names=true`: 56 export-and-debug runs, about 9,000 GDB assertions.
+All of it runs on all 20 targets at three `-O` levels, and with
+`sanitize_names=true`: 80 export-and-debug runs.
+
+Where GDB or QEMU gets something wrong even with GCC's own debug info, the
+checks detect it and skip: floating point registers in some GDB+QEMU
+combinations, `info frame` under `qemu-mipsn32`, and inferior calls with
+stack arguments on big-endian AArch64.

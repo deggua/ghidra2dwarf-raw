@@ -216,6 +216,9 @@ def main():
     check_eq("char value", "(unsigned char)g_neg", 240)
     check_eq("string data size", "sizeof(g_str)", 7)
     check_eq("string data byte", "g_str[5]", ord("?"))
+    check_eq("string data prints as a C string", "g_str", "hello?")
+    out = run("print g_wide")
+    check("unicode string prints as a string", 'u"hi"' in out, out)
     check_eq("unicode string size", "sizeof(g_wide)", 6)
     check_eq("undefined4 global", "g_undef4", 0xCAFEBABE)
     try:

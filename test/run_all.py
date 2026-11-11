@@ -4,8 +4,10 @@
   1. unit tests of the Ghidra-independent DWARF/ELF writer;
   2. for every target x -O level: build the test firmware, import the raw
      image into Ghidra headless, apply the simulated annotations (including
-     the edge cases), export, validate with llvm-dwarfdump --verify, and
-     debug it in QEMU with GDB (main checks + edge-case checks);
+     the edge cases), export, validate with llvm-dwarfdump --verify,
+     re-import the ELF into Ghidra (DWARF analyzer only) and compare with the
+     annotated original, and debug it in QEMU with GDB (main, edge-case,
+     GDB-feature and, where the firmware has them, interrupt checks);
   3. at -O1, the same with sanitize_names=true.
 
     test/run_all.py [-t target,...] [-O O0,O1,O2] [-j jobs] [--work dir] [-v]
@@ -24,6 +26,7 @@ sys.path.insert(0, HERE)
 from targets import TARGETS  # noqa: E402
 import build_fw  # noqa: E402
 import export_fw  # noqa: E402
+import roundtrip  # noqa: E402
 import run_gdb_test  # noqa: E402
 
 
@@ -55,10 +58,15 @@ def job(target, opt, sanitized, work, verbose):
     r = subprocess.run(["llvm-dwarfdump", "--verify", elf], capture_output=True, text=True)
     if "No errors." not in r.stdout:
         fail("llvm-dwarfdump --verify:\n" + r.stdout[-2000:])
+    rt_ok, rt_diffs = roundtrip.roundtrip(out_dir, sanitized)
+    report["counts"]["rt"] = "ok" if rt_ok else "%d diffs" % len(rt_diffs)
+    if not rt_ok:
+        fail("DWARF round trip through Ghidra:\n    " + "\n    ".join(rt_diffs[:30]))
     import json
     with open(os.path.join(build, "layout.json")) as f:
         has_irq = json.load(f).get("irq")
-    suites = [("main", "gdb_checks.py"), ("edge", "gdb_edge_checks.py")]
+    suites = [("main", "gdb_checks.py"), ("edge", "gdb_edge_checks.py"),
+              ("feat", "gdb_feature_checks.py")]
     if has_irq:
         suites.append(("irq", "gdb_irq_checks.py"))
     for label, checks in suites:
@@ -121,7 +129,8 @@ def main():
         print("  %-28s %-4s main: %-22s edge: %-22s%s" % (
             name, "ok" if rep["ok"] else "FAIL", rep["counts"].get("main", "-"),
             rep["counts"].get("edge", "-"),
-            (" irq: " + rep["counts"]["irq"]) if "irq" in rep["counts"] else ""))
+            " feat: " + rep["counts"].get("feat", "-") + " rt: " + rep["counts"].get("rt", "-")
+            + ((" irq: " + rep["counts"]["irq"]) if "irq" in rep["counts"] else "")))
     print("ALL TESTS PASSED" if all_ok else "SOME TESTS FAILED")
     return 0 if all_ok else 1
 

@@ -247,6 +247,29 @@ class RegisterIndex(object):
 # Data types
 # ----------------------------------------------------------------------------
 
+def _string_char_type(data):
+    """Character type of a C-style string data item (None for other data,
+    e.g. Pascal strings with a length prefix)."""
+    from ghidra.program.model.data import StringDataInstance
+    dt = data.getDataType()
+    if dt is None or "Pascal" in dt.getClass().getSimpleName():
+        return None
+    sdi = StringDataInstance.getStringDataInstance(data)
+    if sdi is None or sdi == StringDataInstance.NULL_INSTANCE:
+        return None
+    return {1: CharDataType.dataType, 2: WideChar16DataType.dataType,
+            4: WideChar32DataType.dataType}.get(_charset_unit(str(sdi.getCharsetName())))
+
+
+def _charset_unit(cs):
+    cs = cs.upper()
+    if "32" in cs and ("UTF" in cs or "UCS" in cs):
+        return 4
+    if "16" in cs or cs.startswith("UCS-2"):
+        return 2
+    return 1
+
+
 def classify(dt):
     if dt is None:
         return "void"
@@ -271,7 +294,8 @@ def classify(dt):
     if isinstance(dt, VoidDataType):
         return "void"
     if isinstance(dt, (BooleanDataType, AbstractIntegerDataType, AbstractFloatDataType,
-                       AbstractComplexDataType, Undefined, DefaultDataType)):
+                       AbstractComplexDataType, Undefined, DefaultDataType, CharDataType,
+                       WideCharDataType, WideChar16DataType, WideChar32DataType)):
         return "base" if dt.getLength() > 0 else "void"
     if dt.getLength() > 0:
         return "blob"
@@ -360,7 +384,12 @@ class TypeBuilder(object):
 
     # -- fillers ---------------------------------------------------------------
     def _fill_base(self, die, dt):
-        self.tname(die, dt.getName())
+        if isinstance(dt, WideChar16DataType):
+            self.tname(die, "char16_t")   # GDB's C printer keys UTF-16 strings on
+        elif isinstance(dt, WideChar32DataType):
+            self.tname(die, "char32_t")   # these names (u"..", U"..")
+        else:
+            self.tname(die, dt.getName())
         die.add(C.DW_AT_byte_size, C.DW_FORM_udata, int(dt.getLength()))
         if isinstance(dt, BooleanDataType):
             enc = C.DW_ATE_boolean
@@ -1005,10 +1034,17 @@ class Exporter(object):
             if dt is not None and dt.getLength() > 0:
                 self.types.ref(die, dt)
             elif length > 0:
-                # dynamic-size data (strings, ...): byte array of the real size
+                # dynamic-size data: strings become arrays of their character
+                # type (GDB prints them as strings), anything else a byte array
                 arr = self.dw.cu.child(C.DW_TAG_array_type)
-                arr.add(C.DW_AT_type, C.DW_FORM_ref4, self.types.base_of_size(1, False))
-                arr.child(C.DW_TAG_subrange_type).add(C.DW_AT_count, C.DW_FORM_udata, length)
+                elem = _string_char_type(data)
+                if elem is not None and length % elem.getLength() == 0:
+                    self.types.ref(arr, elem)
+                    count = length // elem.getLength()
+                else:
+                    arr.add(C.DW_AT_type, C.DW_FORM_ref4, self.types.base_of_size(1, False))
+                    count = length
+                arr.child(C.DW_TAG_subrange_type).add(C.DW_AT_count, C.DW_FORM_udata, count)
                 die.add(C.DW_AT_type, C.DW_FORM_ref4, arr)
             die.add(C.DW_AT_location, C.DW_FORM_exprloc,
                     self.dw.expr().addr(self.A(addr.getOffset())).bytes())
