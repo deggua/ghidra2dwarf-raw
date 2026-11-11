@@ -24,11 +24,19 @@ $(OUT):
 $(OUT)/crt0.o: crt0.S | $(OUT)
 	$(CC) $(ASFLAGS) -c $< -o $@
 
-$(OUT)/main.o: main.c fw.h | $(OUT)
+$(OUT)/main.o: main.c fw.h edge.h | $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(OUT)/fw.elf: $(OUT)/crt0.o $(OUT)/main.o link.ld
-	$(CC) $(CFLAGS) $(LDFLAGS) $(OUT)/crt0.o $(OUT)/main.o -o $@ -lgcc
+$(OUT)/edge.o: edge.c fw.h edge.h | $(OUT)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OUT)/edge_asm.o: edge_asm.S | $(OUT)
+	$(CC) $(ASFLAGS) -c $< -o $@
+
+OBJS := $(OUT)/crt0.o $(OUT)/main.o $(OUT)/edge.o $(OUT)/edge_asm.o
+
+$(OUT)/fw.elf: $(OBJS) link.ld
+	$(CC) $(CFLAGS) $(LDFLAGS) $(OBJS) -o $@ -lgcc
 
 $(OUT)/fw.bin: $(OUT)/fw.elf
 	$(OBJCOPY) -O binary $< $@

@@ -2,9 +2,9 @@
 """End-to-end test: boot the raw test firmware in QEMU and debug it with GDB
 using only the exported ELF + C file.
 
-    test/run_gdb_test.py <exported .elf> <exported .c> [firmware .bin]
+    test/run_gdb_test.py [--checks script.py] [--sanitized] <exported .elf> <exported .c> [firmware .bin]
 
-Exit status 0 if every check in gdb_checks.py passes.
+Exit status 0 if every check in the check script (default gdb_checks.py) passes.
 """
 
 import os
@@ -25,10 +25,15 @@ def free_port():
 
 
 def main():
-    elf = os.path.abspath(sys.argv[1])
-    csrc = os.path.abspath(sys.argv[2])
-    fw = os.path.abspath(sys.argv[3] if len(sys.argv) > 3 else
-                         os.path.join(HERE, "firmware", "build", "fw.bin"))
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--checks", default=os.path.join(HERE, "gdb_checks.py"))
+    ap.add_argument("--sanitized", action="store_true")
+    ap.add_argument("elf")
+    ap.add_argument("csrc")
+    ap.add_argument("fw", nargs="?", default=os.path.join(HERE, "firmware", "build", "fw.bin"))
+    a = ap.parse_args()
+    elf, csrc, fw = os.path.abspath(a.elf), os.path.abspath(a.csrc), os.path.abspath(a.fw)
     port = free_port()
     qemu = subprocess.Popen(
         ["qemu-system-ppc", "-M", "mac99", "-bios", fw, "-display", "none",
@@ -41,10 +46,11 @@ def main():
                 break
             except OSError:
                 time.sleep(0.1)
-        env = dict(os.environ, ELF=elf, CSRC=csrc, QEMU_PORT=str(port))
+        env = dict(os.environ, ELF=elf, CSRC=csrc, QEMU_PORT=str(port),
+                   SANITIZED="1" if a.sanitized else "0", PYTHONIOENCODING="utf-8")
         try:
             r = subprocess.run(["gdb-multiarch", "-q", "-nx", "-batch",
-                                "-x", os.path.join(HERE, "gdb_checks.py")],
+                                "-x", os.path.abspath(a.checks)],
                                env=env, capture_output=True, text=True, timeout=300)
             out = r.stdout + r.stderr
         except subprocess.TimeoutExpired as e:

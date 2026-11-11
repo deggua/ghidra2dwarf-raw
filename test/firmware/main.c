@@ -5,6 +5,7 @@
  * constants below. If you change anything here, update test/gdb_test.py.
  */
 #include "fw.h"
+#include "edge.h"
 
 volatile uint32_t g_tick;
 int g_counter = 5;
@@ -156,5 +157,6 @@ void _cstart(void)
         *dst++ = *src++;
     for (dst = __bss_start; dst < __bss_end; dst++)
         *dst = 0;
+    edge_main();
     fw_main();
 }

@@ -16,16 +16,18 @@ the decompiled code.
 
 import bisect
 import os
+import re
 import time
 
 from java.io import StringWriter
 from ghidra.app.decompiler import DecompInterface, DecompileOptions, ClangFuncNameToken
 from ghidra.app.decompiler.component import DecompilerUtils
 from ghidra.app.util.bin.format.dwarf import DWARFRegisterMappingsManager
+from ghidra.program.database.data import PointerTypedefInspector
 from ghidra.program.model.data import (
     AbstractComplexDataType, AbstractFloatDataType, AbstractIntegerDataType,
     Array, BitFieldDataType, BooleanDataType, CharDataType, DataTypeWriter,
-    DefaultDataType, Enum, FunctionDefinition, Pointer, Structure, TypeDef,
+    DefaultDataType, Enum, FunctionDefinition, Pointer, PointerType, Structure, TypeDef,
     Undefined, Union, VoidDataType, WideCharDataType, WideChar16DataType,
     WideChar32DataType,
 )
@@ -62,6 +64,17 @@ class Options(object):
         self.decompile_timeout = 60
         # Output base name (default: program name).
         self.basename = None
+        # Rewrite every exported name (DWARF, ELF symbols and the .c file)
+        # into a plain C identifier ("Foo::init" -> "Foo__init",
+        # "Get?Value" -> "Get_Value"), so GDB never needs quoting. When off,
+        # names are kept verbatim (GDB accepts them in 'single quotes') and
+        # only characters that cannot be quoted at all (' and control
+        # characters) are replaced with '_'.
+        self.sanitize_names = False
+        # Comma-separated function names (or entry addresses) not to
+        # decompile, e.g. functions that hang the decompiler. They still get
+        # symbols, ranges, CFI and a one-line prototype in the .c file.
+        self.skip_decompile = ""
 
     def set(self, key, value):
         if not hasattr(self, key):
@@ -72,6 +85,75 @@ class Options(object):
         elif isinstance(cur, int):
             value = int(str(value), 0)
         setattr(self, key, value)
+
+
+_C_KEYWORDS = frozenset("""auto break case char const continue default do double
+    else enum extern float for goto if inline int long register restrict return
+    short signed sizeof static struct switch typedef union unsigned void volatile
+    while _Bool _Complex _Alignas _Alignof _Atomic _Generic _Noreturn
+    _Static_assert _Thread_local""".split())
+
+
+_C_TYPE_WORDS = frozenset("void char short int long float double signed unsigned _Bool _Complex bool".split())
+
+
+def make_name_filter(sanitize, for_types=False):
+    """Returns f(name) -> exported name (see Options.sanitize_names).
+
+    Type names keep C's multi-word base type spellings ("unsigned int") and
+    the type keywords themselves; anything else that is a C keyword gets a
+    trailing '_' (a variable named "switch" -> "switch_")."""
+    cache = {}
+    bad_any = re.compile(r"[^A-Za-z0-9_]")
+    bad_quoted = re.compile(r"['\x00-\x1f\x7f]")
+
+    def f(name):
+        out = cache.get(name)
+        if out is None:
+            if not sanitize:
+                out = bad_quoted.sub("_", name) or "_"
+            elif for_types and name.split() and all(w in _C_TYPE_WORDS for w in name.split()):
+                out = " ".join(name.split())
+            else:
+                out = bad_any.sub("_", name) or "_"
+                if out[0].isdigit():
+                    out = "_" + out
+                if out in _C_KEYWORDS:
+                    out += "_"
+            cache[name] = out
+        return out
+
+    f.cache = cache
+    return f
+
+
+def _qualified(symbol_or_func):
+    """Name as the decompiler prints it: namespace-qualified unless global."""
+    ns = symbol_or_func.getParentNamespace()
+    if ns is None or ns.isGlobal():
+        return str(symbol_or_func.getName())
+    return str(symbol_or_func.getName(True))
+
+
+def _is_special_pointer_typedef(dt):
+    """Ghidra pointer typedefs with settings DWARF cannot express (component
+    offset, bit shift/mask, relative/image-base pointers, other spaces)."""
+    try:
+        if PointerTypedefInspector.getPointerComponentOffset(dt) != 0:
+            return True
+        if PointerTypedefInspector.hasPointerBitShift(dt) or PointerTypedefInspector.hasPointerBitMask(dt):
+            return True
+        if PointerTypedefInspector.getPointerType(dt) != PointerType.DEFAULT:
+            return True
+        dtm = dt.getDataTypeManager()
+        prog = dtm.getProgram() if hasattr(dtm, "getProgram") else None
+        if prog is not None:
+            space = PointerTypedefInspector.getPointerAddressSpace(dt, prog.getAddressFactory())
+            if space is not None and not space.equals(prog.getAddressFactory().getDefaultAddressSpace()):
+                return True
+    except Exception:
+        return False
+    return False
 
 
 def _sanitize_basename(name):
@@ -159,6 +241,8 @@ def classify(dt):
     if isinstance(dt, Pointer):
         return "ptr"
     if isinstance(dt, TypeDef):
+        if isinstance(dt.getBaseDataType(), Pointer) and _is_special_pointer_typedef(dt):
+            return "rawptr"
         return "typedef"
     if isinstance(dt, Structure):
         return "struct"
@@ -197,6 +281,15 @@ class TypeBuilder(object):
         self.pending = []
         self.by_name = {}
 
+    type_name_filter = None
+
+    def tname(self, die, name):
+        """DW_AT_name for a type (type-name rules, see make_name_filter)."""
+        name = str(name)
+        if self.type_name_filter is not None:
+            name = self.type_name_filter(name)
+        self.dw.name(die, name, raw=True)
+
     def ref(self, die, dt):
         t = self.get(dt)
         if t is not None:
@@ -215,12 +308,29 @@ class TypeBuilder(object):
             "struct": C.DW_TAG_structure_type, "union": C.DW_TAG_union_type,
             "enum": C.DW_TAG_enumeration_type, "array": C.DW_TAG_array_type,
             "func": C.DW_TAG_subroutine_type, "base": C.DW_TAG_base_type,
-            "blob": C.DW_TAG_typedef,
+            "blob": C.DW_TAG_typedef, "rawptr": C.DW_TAG_typedef,
         }[kind]
         die = self.cu.child(tag)
         self.cache[key] = die
         self.pending.append((kind, die, dt))
         return die
+
+    def code_pointer(self, depth):
+        """Pointer^depth to Ghidra's "code" (function of unknown type)."""
+        if not hasattr(self, "_code"):
+            fn = self.cu.child(C.DW_TAG_subroutine_type)
+            fn.child(C.DW_TAG_unspecified_parameters)
+            td = self.cu.child(C.DW_TAG_typedef)
+            self.dw.name(td, "code", raw=True)
+            td.add(C.DW_AT_type, C.DW_FORM_ref4, fn)
+            self._code = {0: td}
+        if depth not in self._code:
+            inner = self.code_pointer(depth - 1)
+            p = self.cu.child(C.DW_TAG_pointer_type)
+            p.add(C.DW_AT_byte_size, C.DW_FORM_udata, self.ptr_size)
+            p.add(C.DW_AT_type, C.DW_FORM_ref4, inner)
+            self._code[depth] = p
+        return self._code[depth]
 
     def base_of_size(self, size, signed):
         if signed:
@@ -236,7 +346,7 @@ class TypeBuilder(object):
 
     # -- fillers ---------------------------------------------------------------
     def _fill_base(self, die, dt):
-        self.dw.name(die, str(dt.getName()))
+        self.tname(die, dt.getName())
         die.add(C.DW_AT_byte_size, C.DW_FORM_udata, int(dt.getLength()))
         if isinstance(dt, BooleanDataType):
             enc = C.DW_ATE_boolean
@@ -257,7 +367,7 @@ class TypeBuilder(object):
     def _fill_blob(self, die, dt):
         # Opaque fixed-size type (strings, unknown builtins): typedef to a
         # byte array so its size and name are preserved.
-        self.dw.name(die, str(dt.getName()))
+        self.tname(die, dt.getName())
         arr = self.cu.child(C.DW_TAG_array_type)
         arr.add(C.DW_AT_type, C.DW_FORM_ref4, self.base_of_size(1, False))
         sub = arr.child(C.DW_TAG_subrange_type)
@@ -269,8 +379,16 @@ class TypeBuilder(object):
         die.add(C.DW_AT_byte_size, C.DW_FORM_udata, int(size if size > 0 else self.ptr_size))
         self.ref(die, dt.getDataType())
 
+    def _fill_rawptr(self, die, dt):
+        # A pointer DWARF can't describe (e.g. "int *32 __((offset(-0x4)))"):
+        # keep the name but make it a plain integer, so GDB shows the raw
+        # value instead of dereferencing the wrong address.
+        self.tname(die, dt.getName())
+        size = int(dt.getLength()) if dt.getLength() > 0 else self.ptr_size
+        die.add(C.DW_AT_type, C.DW_FORM_ref4, self.base_of_size(size, False))
+
     def _fill_typedef(self, die, dt):
-        self.dw.name(die, str(dt.getName()))
+        self.tname(die, dt.getName())
         self.ref(die, dt.getDataType())
 
     def _fill_array(self, die, dt):
@@ -288,7 +406,7 @@ class TypeBuilder(object):
             die.child(C.DW_TAG_unspecified_parameters)
 
     def _fill_enum(self, die, dt):
-        self.dw.name(die, str(dt.getName()))
+        self.tname(die, dt.getName())
         size = int(dt.getLength())
         die.add(C.DW_AT_byte_size, C.DW_FORM_udata, size)
         signed = bool(dt.isSigned())
@@ -301,7 +419,7 @@ class TypeBuilder(object):
             e.add(C.DW_AT_const_value, C.DW_FORM_sdata, int(dt.getValue(name)))
 
     def _fill_composite(self, die, dt, components):
-        self.dw.name(die, str(dt.getName()))
+        self.tname(die, dt.getName())
         if dt.isNotYetDefined():
             die.add(C.DW_AT_declaration, C.DW_FORM_flag_present)
             return
@@ -359,7 +477,12 @@ class Exporter(object):
         self.big_endian = bool(self.lang.isBigEndian())
 
         self.dw = DwarfBuilder(self.addr_size, self.big_endian)
+        self.nm = make_name_filter(self.opts.sanitize_names)
+        self.nm_type = make_name_filter(self.opts.sanitize_names, for_types=True)
+        self.dw.name_filter = self.nm
+        self.skip = set(s.strip() for s in str(self.opts.skip_decompile).split(",") if s.strip())
         self.types = TypeBuilder(self.dw, program)
+        self.types.type_name_filter = self.nm_type
         regmap, self.sp_regno = build_register_map(self.lang)
         self.regs = RegisterIndex(self.lang, regmap)
         cc = program.getCompilerSpec().getDefaultCallingConvention()
@@ -409,13 +532,14 @@ class Exporter(object):
         os.makedirs(self.out_dir, exist_ok=True)
         dw = self.dw
         cu = dw.cu
-        dw.name(cu, os.path.basename(self.c_path))
+        dw.name(cu, os.path.basename(self.c_path), raw=True)
         cu.add(C.DW_AT_producer, C.DW_FORM_strp, PRODUCER)
         cu.add(C.DW_AT_language, C.DW_FORM_data2, C.DW_LANG_C99)
         cu.add(C.DW_AT_comp_dir, C.DW_FORM_strp, self.out_dir)
         cu.add(C.DW_AT_low_pc, C.DW_FORM_addr, 0)
         self.file_no = dw.add_file(os.path.basename(self.c_path))
 
+        self.qualified_renames = self._collect_qualified_renames()
         self._write_c_preamble()
         self._export_functions()
         self._export_globals()
@@ -428,6 +552,7 @@ class Exporter(object):
         cu.add(C.DW_AT_stmt_list, C.DW_FORM_sec_offset, 0)
         dw.aranges.extend(ranges)
 
+        self._rename_in_types_header()
         with open(self.c_path, "w", encoding="utf-8", errors="replace") as f:
             f.write("\n".join(self.c_lines))
             f.write("\n")
@@ -466,8 +591,59 @@ class Exporter(object):
                 DataTypeWriter(p.getDataTypeManager(), sw, False).write(lst, self.monitor)
                 text = str(sw.toString())
             self.c_lines.append("/* ---- Data types ---- */")
+            first = len(self.c_lines)
             self.c_lines += text.replace("\r\n", "\n").split("\n")
+            self.types_header_lines = (first, len(self.c_lines))
             self.c_lines.append("")
+
+    def _collect_qualified_renames(self):
+        """[(qualified name, exported name)] for namespaced symbols whose
+        exported name differs (sanitize_names), longest first."""
+        if not self.opts.sanitize_names:
+            return []
+        out = {}
+        it = self.program.getSymbolTable().getAllSymbols(False)
+        while it.hasNext():
+            sym = it.next()
+            ns = sym.getParentNamespace()
+            if ns is not None and not ns.isGlobal():
+                q = str(sym.getName(True))
+                if self.nm(q) != q:
+                    out[q] = self.nm(q)
+        return sorted(out.items(), key=lambda qn: -len(qn[0]))
+
+    def _rename_in_types_header(self):
+        """Apply the name filter to the DataTypeWriter output too, so the
+        type definitions match the (renamed) DWARF type/field names."""
+        span = getattr(self, "types_header_lines", None)
+        pairs = dict(self.nm.cache)
+        pairs.update(self.nm_type.cache)
+        renames = sorted(((o, n) for o, n in pairs.items() if o != n),
+                         key=lambda on: -len(on[0]))
+        if span is None or not renames:
+            return
+        for i in range(span[0], span[1]):
+            line = self.c_lines[i]
+            for o, n in renames:
+                if o in line:
+                    line = line.replace(o, n)
+            self.c_lines[i] = line
+
+    _NAME_TOKENS = None
+
+    def _token_text(self, tok):
+        """Token text, with identifiers passed through the name filter."""
+        text = str(tok.getText())
+        if Exporter._NAME_TOKENS is None:
+            from ghidra.app.decompiler import (ClangVariableToken, ClangFieldToken,
+                                               ClangTypeToken, ClangLabelToken)
+            Exporter._NAME_TOKENS = (ClangVariableToken, ClangFuncNameToken, ClangFieldToken,
+                                     ClangTypeToken, ClangLabelToken)
+        if (text and text[0] not in "\"'-0123456789" and isinstance(tok, Exporter._NAME_TOKENS)):
+            if isinstance(tok, Exporter._NAME_TOKENS[3]):  # ClangTypeToken
+                return self.nm_type(text)
+            return self.nm(text)
+        return text
 
     # -- functions --------------------------------------------------------------
     def _decompiler(self):
@@ -527,11 +703,16 @@ class Exporter(object):
     def _export_function(self, ifc, func):
         dw = self.dw
         self.stats["functions"] += 1
-        name = str(func.getName())
+        name = _qualified(func)
         entry = int(func.getEntryPoint().getOffset())
         ranges = self._function_ranges(func)
 
-        res = ifc.decompileFunction(func, self.opts.decompile_timeout, self.monitor)
+        skipped = (name in self.skip or str(func.getName()) in self.skip
+                   or str(func.getEntryPoint()) in self.skip)
+        if skipped:
+            res = None
+        else:
+            res = ifc.decompileFunction(func, self.opts.decompile_timeout, self.monitor)
         hf = res.getHighFunction() if res is not None else None
         markup = res.getCCodeMarkup() if res is not None else None
 
@@ -561,23 +742,30 @@ class Exporter(object):
         self.elf_symbols.append((name, self.A(entry), size, C.STT_FUNC))
 
         self.c_lines.append("")
-        self.c_lines.append("/* ---- %s @ %s ---- */" % (name, func.getEntryPoint()))
+        self.c_lines.append("/* ---- %s @ %s ---- */" % (self.nm(name), func.getEntryPoint()))
         base = len(self.c_lines)  # line N of the function text -> base + N
 
         if markup is None or hf is None:
             self.stats["decompile_failed"] += 1
-            msg = res.getErrorMessage() if res is not None else "no result"
+            msg = res.getErrorMessage() if res is not None else (
+                "skipped (skip_decompile)" if skipped else "no result")
             sig = str(func.getSignature().getPrototypeString())
             self.c_lines.append("%s /* decompilation failed: %s */" % (sig, str(msg).strip().replace("*/", "* /")))
             sig_line = base + 1
             self.types.ref(die, func.getReturnType())
             addr_lines = {}
         else:
+            self._code_decls = self._find_code_decls(markup)
             lines = DecompilerUtils.toLines(markup)
             addr_lines = {}
             sig_line = None
             for cl in lines:
-                text = str(cl.getIndentString()) + "".join(str(t.getText()) for t in cl.getAllTokens())
+                text = str(cl.getIndentString()) + "".join(self._token_text(t) for t in cl.getAllTokens())
+                if self.qualified_renames and "::" in text:
+                    # the decompiler emits "Ns::name" as several tokens
+                    for q, new in self.qualified_renames:
+                        if q in text:
+                            text = text.replace(q, new)
                 self.c_lines.append(text)
                 gline = base + int(cl.getLineNumber())
                 for tok in cl.getAllTokens():
@@ -595,6 +783,8 @@ class Exporter(object):
             proto = hf.getFunctionPrototype()
             self.types.ref(die, proto.getReturnType() if proto is not None else func.getReturnType())
             self._export_variables(die, func, hf, ranges, flow)
+        if func.hasVarArgs():
+            die.child(C.DW_TAG_unspecified_parameters)
 
         die.add(C.DW_AT_decl_file, C.DW_FORM_udata, self.file_no)
         die.add(C.DW_AT_decl_line, C.DW_FORM_udata, sig_line)
@@ -649,12 +839,37 @@ class Exporter(object):
         for sym in others:
             self._export_variable(func_die, sym, ctx, sym.isParameter())
 
+    @staticmethod
+    def _find_code_decls(markup):
+        """{variable name: pointer depth} for variables the decompiler
+        declares as "code *" -- its placeholder for function pointers of
+        unknown type, which the Java API reports as plain "undefined *"."""
+        from ghidra.app.decompiler import ClangVariableDecl, ClangTokenGroup
+        out = {}
+        stack = [markup]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, ClangVariableDecl):
+                m = re.match(r"\s*code\s*(\*+)", str(node.toString()))
+                hs = node.getHighSymbol()
+                if m and hs is not None:
+                    out[str(hs.getName())] = len(m.group(1))
+                continue
+            if isinstance(node, ClangTokenGroup):
+                for i in range(node.numChildren()):
+                    stack.append(node.Child(i))
+        return out
+
     def _export_variable(self, func_die, sym, ctx, is_param):
         self.stats["variables"] += 1
         tag = C.DW_TAG_formal_parameter if is_param else C.DW_TAG_variable
         die = func_die.child(tag)
         self.dw.name(die, str(sym.getName()))
-        self.types.ref(die, sym.getDataType())
+        depth = getattr(self, "_code_decls", {}).get(str(sym.getName()))
+        if depth and classify(sym.getDataType()) == "ptr":
+            die.add(C.DW_AT_type, C.DW_FORM_ref4, self.types.code_pointer(depth))
+        else:
+            self.types.ref(die, sym.getDataType())
         try:
             loc = ctx.symbol_location(sym)
         except Exception as e:  # never let one odd variable kill the export
@@ -683,7 +898,7 @@ class Exporter(object):
             sym = data.getPrimarySymbol()
             if sym is None:
                 continue
-            name = str(sym.getName())
+            name = _qualified(sym)
             dt = data.getDataType()
             length = int(data.getLength())
             die = self.dw.cu.child(C.DW_TAG_variable)
@@ -717,7 +932,7 @@ class Exporter(object):
                 continue  # code labels would confuse GDB's <func+off> display
             if s.isDynamic() and self.listing.getDefinedDataContaining(addr) is not None:
                 continue
-            self.elf_symbols.append((str(s.getName()), self.A(addr.getOffset()), 0, C.STT_NOTYPE))
+            self.elf_symbols.append((_qualified(s), self.A(addr.getOffset()), 0, C.STT_NOTYPE))
 
     def _export_all_types(self):
         it = self.program.getDataTypeManager().getAllDataTypes()
@@ -774,7 +989,7 @@ class Exporter(object):
             elf.add_section(Section(name, C.SHT_PROGBITS, data=data))
 
         for name, value, size, stype in self.elf_symbols:
-            elf.add_symbol(name, value, size, stype, C.STB_GLOBAL, elf.section_index_for(value))
+            elf.add_symbol(self.nm(name), value, size, stype, C.STB_GLOBAL, elf.section_index_for(value))
         elf.write(self.elf_path)
 
 
@@ -1158,10 +1373,12 @@ class _FunctionContext(object):
             spans = self.live_intervals(vn)
             if vn.isRegister() or space.equals(self.exp.space):
                 e = self.varnode_expr(vn)
-            elif (storage is not None and storage.isCompoundStorage()
-                  and int(vn.getSize()) == int(storage.size())):
-                # Join-space value split over several registers/stack slots
-                # (e.g. a 64-bit parameter in r3:r4).
+            elif (storage is not None and len(storage.getVarnodes()) > 0
+                  and (storage.isCompoundStorage() or int(vn.getSize()) <= int(storage.size()))):
+                # Join-space value: split over several registers/stack slots
+                # (a 64-bit parameter in r3:r4), or a narrower view of one
+                # register (a float parameter in an 8-byte FPR -- GDB converts
+                # the register format to the declared type itself).
                 if vn.isInput() and pcs is not None:
                     entries.extend(self.compound_input_pcs(storage, pcs))
                     continue

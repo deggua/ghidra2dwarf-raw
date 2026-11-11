@@ -8,8 +8,9 @@
 #
 # GUI: asks for the output directory.
 # Headless (pyghidraRun -H ... -postScript ExportDwarfELF.py <outdir> [key=value ...])
-#   options: address_offset=0x..  embed_bytes=true|false  types_header=true|false  cfi=true|false
-#            all_types=true|false decompile_timeout=60     basename=name
+#   options: address_offset=0x..       embed_bytes=true|false   cfi=true|false
+#            types_header=true|false   all_types=true|false     decompile_timeout=60
+#            sanitize_names=true|false skip_decompile=f1,f2     basename=name
 #
 # @category DWARF
 # @runtime PyGhidra

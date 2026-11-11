@@ -4,7 +4,7 @@
 #   * function names + prototypes (parsed from fw.h with Ghidra's C parser),
 #   * typed, named globals.
 #
-# Usage (headless): -postScript ghidra_setup.py <firmware build dir> <fw.h>
+# Usage (headless): -postScript ghidra_setup.py <firmware build dir> <header.h>...
 # @runtime PyGhidra
 
 import os
@@ -16,7 +16,7 @@ from ghidra.program.model.data import DataUtilities
 from ghidra.program.model.symbol import SourceType
 
 args = [str(a) for a in getScriptArgs()]
-build_dir, header = args[0], args[1]
+build_dir, headers = args[0], args[1:]
 prog = currentProgram
 mem = prog.getMemory()
 st = prog.getSymbolTable()
@@ -31,8 +31,7 @@ ram.setWrite(True)
 # 2. Types and prototypes.
 dtm = prog.getDataTypeManager()
 parser = CParser(dtm, True, None)
-with open(header) as f:
-    parser.parse(f.read())
+parser.parse("\n".join(open(h).read() for h in headers))
 if not parser.didParseSucceed():
     raise RuntimeError("C parse failed: %s" % parser.getParseMessages())
 protos = parser.getFunctions()
@@ -69,6 +68,8 @@ with open(os.path.join(build_dir, "symbols.txt")) as f:
 syms.append(("_reset", 0xFFF00100, 0x28, "T"))
 
 for name, addr, size, kind in syms:
+    if name == "bad_bytes":
+        continue  # handled by ghidra_setup_edge.py
     a = toAddr("0x%x" % addr)
     if kind in "Tt":
         DisassembleCommand(a, None, True).applyTo(prog, monitor)
@@ -89,8 +90,7 @@ for name, addr, size, kind in syms:
         if name in GLOBAL_TYPES:
             dt = GLOBAL_TYPES[name]()
             DataUtilities.createData(prog, a, dt, -1, DataUtilities.ClearDataMode.CLEAR_ALL_CONFLICT_DATA)
-        else:
-            print("WARNING: no declared type for %s" % name)
+        # (edge-case globals get their types in ghidra_setup_edge.py)
         st.createLabel(a, name, SourceType.USER_DEFINED)
 
 analyzeChanges(prog)

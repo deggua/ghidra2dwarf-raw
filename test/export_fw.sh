@@ -23,7 +23,8 @@ echo y | "$GHIDRA_INSTALL_DIR/support/pyghidraRun" -H "$WORK/project" fwtest \
     -import "$FW_BUILD/fw.bin" -overwrite \
     -loader BinaryLoader -loader-baseAddr 0xfff00000 \
     -processor PowerPC:BE:32:default \
-    -postScript "$HERE/ghidra_setup.py" "$FW_BUILD" "$HERE/firmware/fw.h" \
+    -postScript "$HERE/ghidra_setup.py" "$FW_BUILD" "$HERE/firmware/fw.h" "$HERE/firmware/edge.h" \
+    -postScript "$HERE/ghidra_setup_edge.py" "$FW_BUILD" \
     -postScript "$REPO/ghidra_scripts/ExportDwarfELF.py" "$WORK/out" "$@" \
     > "$WORK/ghidra.log" 2>&1 || { tail -50 "$WORK/ghidra.log"; exit 1; }
 
@@ -31,5 +32,5 @@ if grep -qE "ERROR|Traceback" "$WORK/ghidra.log"; then
     grep -B2 -A20 -E "ERROR|Traceback" "$WORK/ghidra.log" | head -80
     exit 1
 fi
-grep -E "^(ghidra2dwarf-raw|WARNING|parsed|setup done)" "$WORK/ghidra.log" || true
+grep -E "^(ghidra2dwarf-raw|WARNING|parsed|setup done|EDGE|  )" "$WORK/ghidra.log" || true
 ls -la "$WORK/out"

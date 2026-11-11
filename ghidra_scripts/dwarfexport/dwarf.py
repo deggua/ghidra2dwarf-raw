@@ -233,7 +233,12 @@ class DwarfBuilder(object):
         return Expr(self.addr_size, self.big_endian)
 
     # -- convenience ---------------------------------------------------------
-    def name(self, die, s):
+    # Optional callable applied to every DW_AT_name (see ghidra_export).
+    name_filter = None
+
+    def name(self, die, s, raw=False):
+        if not raw and self.name_filter is not None:
+            s = self.name_filter(s)
         die.add(C.DW_AT_name, C.DW_FORM_strp, s)
 
     def add_file(self, name, dir_index=0):
