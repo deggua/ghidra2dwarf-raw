@@ -42,14 +42,19 @@ def main():
             except OSError:
                 time.sleep(0.1)
         env = dict(os.environ, ELF=elf, CSRC=csrc, QEMU_PORT=str(port))
-        r = subprocess.run(["gdb-multiarch", "-q", "-nx", "-batch",
-                            "-x", os.path.join(HERE, "gdb_checks.py")],
-                           env=env, capture_output=True, text=True, timeout=300)
+        try:
+            r = subprocess.run(["gdb-multiarch", "-q", "-nx", "-batch",
+                                "-x", os.path.join(HERE, "gdb_checks.py")],
+                               env=env, capture_output=True, text=True, timeout=300)
+            out = r.stdout + r.stderr
+        except subprocess.TimeoutExpired as e:
+            def _s(x):
+                return x.decode() if isinstance(x, bytes) else (x or "")
+            out = _s(e.stdout) + _s(e.stderr) + "\nFAIL gdb timed out"
     finally:
         qemu.kill()
         qemu.wait()
-    out = r.stdout + r.stderr
-    lines = [l for l in out.splitlines() if l.startswith(("PASS", "FAIL", "SUMMARY", "Traceback", "  "))]
+    lines = [l for l in out.splitlines() if l.startswith(("PASS", "FAIL", "SKIP", "SUMMARY", "Traceback", "  "))]
     print("\n".join(lines))
     ok = "SUMMARY" in out and " 0 failed" in out
     if not ok and "SUMMARY" not in out:

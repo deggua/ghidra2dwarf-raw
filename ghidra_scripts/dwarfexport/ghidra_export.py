@@ -992,22 +992,102 @@ class _FunctionContext(object):
                 best = cand
         return best[1] if best is not None else None
 
-    def located_spans(self, vn, value, spans):
+    def located_pcs(self, vn, value, pcs):
         flow = self.flow
         own = (int(vn.getOffset()), int(vn.getSize()))
-        insns = flow.insns
+        out = []
+        for pc in pcs:
+            e = self.best_location(flow.locations_of(pc, value), own)
+            if e is not None:
+                out.append((pc, flow.insn_end(pc), e))
+        return out
+
+    def _pcs_in(self, spans):
+        insns = self.flow.insns
         out = []
         for s, t in spans:
             i = bisect.bisect_left(insns, s)
             while i < len(insns) and insns[i] < t:
-                pc = insns[i]
-                e = self.best_location(flow.locations_of(pc, value), own)
-                if e is not None:
-                    out.append((pc, flow.insn_end(pc), e))
+                out.append(insns[i])
                 i += 1
         return out
 
-    def compound_input_spans(self, storage, spans):
+    def reaching_pcs(self, instances):
+        """{instance index: [pc]} -- the PCs at which each SSA instance is
+        the variable's current value (reaching definition over the
+        decompiler's basic blocks). This shows a variable for as long as it
+        has not been reassigned, not only while the decompiler still needs
+        it; FunctionFlow then decides whether the value still physically
+        exists."""
+        flow = self.flow
+        blocks = list(self.hf.getBasicBlocks())
+        if flow is None or not blocks or self.entry_block is None:
+            return None
+        entry_bi = int(self.entry_block.getIndex())
+        events = dict((int(b.getIndex()), []) for b in blocks)
+        for i, vn in enumerate(instances):
+            d = vn.getDef()
+            if d is None:
+                if vn.isInput():
+                    events[entry_bi].append((self.entry, -1, i))
+                continue
+            bi = int(d.getParent().getIndex())
+            if bi not in events:
+                continue
+            if d.getOpcode() == PcodeOp.MULTIEQUAL:
+                bb = self._block_bounds(d.getParent())
+                if bb is None:
+                    continue
+                events[bi].append((bb[0], -1, i))
+            else:
+                events[bi].append((self.exp.insn_end(d.getSeqnum().getTarget()),
+                                   int(d.getSeqnum().getOrder()), i))
+        for ev in events.values():
+            ev.sort()
+
+        TOP = "top"
+        out_inst = dict((int(b.getIndex()), TOP) for b in blocks)
+        in_inst = {}
+        for _ in range(4 * len(blocks) + 4):
+            changed = False
+            for b in blocks:
+                bi = int(b.getIndex())
+                if bi == entry_bi:
+                    inn = None
+                else:
+                    vals = set()
+                    for k in range(b.getInSize()):
+                        vals.add(out_inst.get(int(b.getIn(k).getIndex()), None))
+                    vals.discard(TOP)
+                    inn = vals.pop() if len(vals) == 1 else (TOP if not vals else None)
+                in_inst[bi] = inn
+                out = events[bi][-1][2] if events[bi] else inn
+                if out != out_inst[bi]:
+                    out_inst[bi] = out
+                    changed = True
+            if not changed:
+                break
+
+        result = {}
+        for b in blocks:
+            bi = int(b.getIndex())
+            bounds = self._block_bounds(b)
+            if bounds is None:
+                continue
+            cur = in_inst.get(bi)
+            if cur == TOP:
+                cur = None
+            ev = events[bi]
+            j = 0
+            for pc in self._pcs_in([bounds]):
+                while j < len(ev) and ev[j][0] <= pc:
+                    cur = ev[j][2]
+                    j += 1
+                if cur is not None:
+                    result.setdefault(cur, []).append(pc)
+        return result
+
+    def compound_input_pcs(self, storage, pcs):
         """Spans where every register piece of an input still holds its
         entry value (a torn 64-bit value is worse than <optimized out>)."""
         flow = self.flow
@@ -1021,14 +1101,10 @@ class _FunctionContext(object):
             elif not p.getAddress().isStackAddress():
                 return []
         out = []
-        for s, t in spans:
-            i = bisect.bisect_left(flow.insns, s)
-            while i < len(flow.insns) and flow.insns[i] < t:
-                pc = flow.insns[i]
-                st = flow.state_in.get(pc)
-                if st is not None and all(flow.reg_value(st, k) == ("init", k) for k in keys):
-                    out.append((pc, flow.insn_end(pc), e))
-                i += 1
+        for pc in pcs:
+            st = flow.state_in.get(pc)
+            if st is not None and all(flow.reg_value(st, k) == ("init", k) for k in keys):
+                out.append((pc, flow.insn_end(pc), e))
         return out
 
     # -- main --------------------------------------------------------------------
@@ -1047,7 +1123,9 @@ class _FunctionContext(object):
             return None
         entries = []
         whole = [(lo, hi) for lo, hi in self.ranges]
-        for vn in hv.getInstances():
+        instances = list(hv.getInstances())
+        reaching = self.reaching_pcs(instances)
+        for idx, vn in enumerate(instances):
             space = vn.getAddress().getAddressSpace()
             if vn.isConstant() or vn.isUnique():
                 continue
@@ -1056,20 +1134,26 @@ class _FunctionContext(object):
                 if e is not None:
                     entries.extend((s, t, e) for s, t in whole)
                 continue
-            spans = self.live_intervals(vn)
-            if vn.isRegister() and self.flow is not None:
+            if reaching is not None:
+                pcs = reaching.get(idx, [])
+            elif self.flow is not None:
+                pcs = self._pcs_in(self.live_intervals(vn))
+            else:
+                pcs = None
+            if vn.isRegister() and pcs is not None:
                 value = self.instance_value(vn)
                 if value is not None:
-                    entries.extend(self.located_spans(vn, value, spans))
+                    entries.extend(self.located_pcs(vn, value, pcs))
                 continue
+            spans = self.live_intervals(vn)
             if vn.isRegister() or space.equals(self.exp.space):
                 e = self.varnode_expr(vn)
             elif (storage is not None and storage.isCompoundStorage()
                   and int(vn.getSize()) == int(storage.size())):
                 # Join-space value split over several registers/stack slots
                 # (e.g. a 64-bit parameter in r3:r4).
-                if vn.isInput() and self.flow is not None:
-                    entries.extend(self.compound_input_spans(storage, spans))
+                if vn.isInput() and pcs is not None:
+                    entries.extend(self.compound_input_pcs(storage, pcs))
                     continue
                 e = self.storage_expr(storage)
             else:
