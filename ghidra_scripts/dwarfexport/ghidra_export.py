@@ -1011,6 +1011,18 @@ class _FunctionContext(object):
                 i += 1
         return out
 
+    def _block_info(self):
+        """{block index: (bounds, [pcs], [pred block indexes])}, cached."""
+        if getattr(self, "_binfo", None) is None:
+            info = {}
+            for b in self.hf.getBasicBlocks():
+                bounds = self._block_bounds(b)
+                pcs = self._pcs_in([bounds]) if bounds is not None else []
+                preds = [int(b.getIn(k).getIndex()) for k in range(b.getInSize())]
+                info[int(b.getIndex())] = (bounds, pcs, preds)
+            self._binfo = info
+        return self._binfo
+
     def reaching_pcs(self, instances):
         """{instance index: [pc]} -- the PCs at which each SSA instance is
         the variable's current value (reaching definition over the
@@ -1019,11 +1031,13 @@ class _FunctionContext(object):
         it; FunctionFlow then decides whether the value still physically
         exists."""
         flow = self.flow
-        blocks = list(self.hf.getBasicBlocks())
-        if flow is None or not blocks or self.entry_block is None:
+        if flow is None or self.entry_block is None:
+            return None
+        binfo = self._block_info()
+        if not binfo:
             return None
         entry_bi = int(self.entry_block.getIndex())
-        events = dict((int(b.getIndex()), []) for b in blocks)
+        events = dict((bi, []) for bi in binfo)
         for i, vn in enumerate(instances):
             d = vn.getDef()
             if d is None:
@@ -1034,7 +1048,7 @@ class _FunctionContext(object):
             if bi not in events:
                 continue
             if d.getOpcode() == PcodeOp.MULTIEQUAL:
-                bb = self._block_bounds(d.getParent())
+                bb = binfo[bi][0]
                 if bb is None:
                     continue
                 events[bi].append((bb[0], -1, i))
@@ -1045,18 +1059,17 @@ class _FunctionContext(object):
             ev.sort()
 
         TOP = "top"
-        out_inst = dict((int(b.getIndex()), TOP) for b in blocks)
+        out_inst = dict((bi, TOP) for bi in binfo)
         in_inst = {}
-        for _ in range(4 * len(blocks) + 4):
+        for _ in range(4 * len(binfo) + 4):
             changed = False
-            for b in blocks:
-                bi = int(b.getIndex())
+            for bi, (_, _, preds) in binfo.items():
                 if bi == entry_bi:
                     inn = None
                 else:
                     vals = set()
-                    for k in range(b.getInSize()):
-                        vals.add(out_inst.get(int(b.getIn(k).getIndex()), None))
+                    for pb in preds:
+                        vals.add(out_inst.get(pb, None))
                     vals.discard(TOP)
                     inn = vals.pop() if len(vals) == 1 else (TOP if not vals else None)
                 in_inst[bi] = inn
@@ -1068,9 +1081,7 @@ class _FunctionContext(object):
                 break
 
         result = {}
-        for b in blocks:
-            bi = int(b.getIndex())
-            bounds = self._block_bounds(b)
+        for bi, (bounds, pcs, _) in binfo.items():
             if bounds is None:
                 continue
             cur = in_inst.get(bi)
@@ -1078,7 +1089,7 @@ class _FunctionContext(object):
                 cur = None
             ev = events[bi]
             j = 0
-            for pc in self._pcs_in([bounds]):
+            for pc in pcs:
                 while j < len(ev) and ev[j][0] <= pc:
                     cur = ev[j][2]
                     j += 1

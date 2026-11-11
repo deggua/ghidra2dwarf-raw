@@ -202,18 +202,34 @@ class FunctionFlow(object):
                 return None  # partially overwritten
         return self.default(key)
 
-    def _get(self, st, vn):
+    # Varnodes are decoded once into tuples: ("c", value, size),
+    # ("r", offset, size), ("u", offset, size) or ("x",) for other spaces.
+    @staticmethod
+    def _decode(vn):
+        if vn is None:
+            return None
         if vn.isConstant():
-            return (CONST, int(vn.getOffset()), int(vn.getSize()))
+            return ("c", int(vn.getOffset()), int(vn.getSize()))
         if vn.isRegister():
-            return self.reg_value(st, (int(vn.getOffset()), int(vn.getSize())))
+            return ("r", int(vn.getOffset()), int(vn.getSize()))
         if vn.isUnique():
-            return st.regs.get(("u", int(vn.getOffset()), int(vn.getSize())))
+            return ("u", int(vn.getOffset()), int(vn.getSize()))
+        return ("x",)
+
+    def _get(self, st, d):
+        t = d[0]
+        if t == "c":
+            return (CONST, d[1], d[2])
+        if t == "r":
+            return self.reg_value(st, (d[1], d[2]))
+        if t == "u":
+            return st.regs.get(d)
         return None
 
-    def _set(self, st, vn, value, ins_off):
-        if vn.isRegister():
-            k = (int(vn.getOffset()), int(vn.getSize()))
+    def _set(self, st, d, value, ins_off):
+        t = d[0]
+        if t == "r":
+            k = (d[1], d[2])
             if value is None:
                 value = (DEF, ins_off, k)
             for other in [o for o in st.regs if o[0] != "u" and o != k
@@ -224,8 +240,8 @@ class FunctionFlow(object):
                 if mk not in st.regs:
                     st.regs[mk] = None
             st.regs[k] = value
-        elif vn.isUnique():
-            st.regs[("u", int(vn.getOffset()), int(vn.getSize()))] = value
+        elif t == "u":
+            st.regs[d] = value
 
     def _arith(self, opc, a, b):
         if a is None or b is None:
@@ -252,25 +268,24 @@ class FunctionFlow(object):
         return None
 
     # -- transfer function ---------------------------------------------------------
-    def step(self, st, ins):
-        off = int(ins.getAddress().getOffset())
-        is_call = ins.getFlowType().isCall()
+    _ARITH = (PcodeOp.INT_ADD, PcodeOp.INT_SUB, PcodeOp.INT_OR, PcodeOp.INT_AND, PcodeOp.INT_XOR)
+
+    def step(self, st, off):
+        """Applies the instruction at offset ``off`` to ``st`` in place."""
+        is_call, _, _, _, _, ops = self.decoded[off]
         sp_before = self.reg_value(st, self.m.sp_key)
         written = set()
-        for op in ins.getPcode():
-            opc = op.getOpcode()
-            out = op.getOutput()
-            if out is not None and out.isRegister():
-                written.add((int(out.getOffset()), int(out.getSize())))
+        for opc, out, i0, i1, i2 in ops:
+            if out is not None and out[0] == "r":
+                written.add((out[1], out[2]))
             if opc == PcodeOp.STORE:
-                addr = self._get(st, op.getInput(1))
-                val_vn = op.getInput(2)
+                addr = self._get(st, i1)
                 if addr is not None and addr[0] == SP:
                     soff = addr[1]
-                    size = int(val_vn.getSize())
-                    for o in [o for o, (s, _) in st.mem.items() if o < soff + size and soff < o + s]:
+                    size = i2[2] if len(i2) > 2 else 0
+                    for o in [o for o, (sz, _) in st.mem.items() if o < soff + size and soff < o + sz]:
                         del st.mem[o]
-                    val = self._get(st, val_vn)
+                    val = self._get(st, i2)
                     st.mem[soff] = (size, val)
                     if (val is not None and val[0] == INIT and val[1] not in st.saved
                             and self.m.dwarf_of(val[1]) is not None):
@@ -279,16 +294,15 @@ class FunctionFlow(object):
             if out is None:
                 continue
             if opc == PcodeOp.COPY:
-                val = self._get(st, op.getInput(0))
-            elif opc in (PcodeOp.INT_ADD, PcodeOp.INT_SUB, PcodeOp.INT_OR,
-                         PcodeOp.INT_AND, PcodeOp.INT_XOR):
-                val = self._arith(opc, self._get(st, op.getInput(0)), self._get(st, op.getInput(1)))
+                val = self._get(st, i0)
+            elif opc in self._ARITH:
+                val = self._arith(opc, self._get(st, i0), self._get(st, i1))
             elif opc == PcodeOp.LOAD:
                 val = None
-                addr = self._get(st, op.getInput(1))
+                addr = self._get(st, i1)
                 if addr is not None and addr[0] == SP:
                     slot = st.mem.get(addr[1])
-                    if slot is not None and slot[0] == int(out.getSize()):
+                    if slot is not None and len(out) > 2 and slot[0] == out[2]:
                         val = slot[1]
             else:
                 val = None
@@ -372,10 +386,29 @@ class FunctionFlow(object):
         body = func.getBody()
         entry = func.getEntryPoint()
 
+        dec = self._decode
+        self.decoded = {}
         for ins in self.listing.getInstructions(body, True):
             o = int(ins.getAddress().getOffset())
             self.insns.append(o)
             self.insn_len[o] = int(ins.getLength())
+            ft = ins.getFlowType()
+            ops = []
+            for op in ins.getPcode():
+                n = op.getNumInputs()
+                ins_ = [dec(op.getInput(i)) if i < n else None for i in range(3)]
+                ops.append((int(op.getOpcode()), dec(op.getOutput()), ins_[0], ins_[1], ins_[2]))
+            succs = []
+            if not ft.isTerminal():
+                fall = ins.getFallThrough()
+                if fall is not None and body.contains(fall):
+                    succs.append(int(fall.getOffset()))
+            if ft.isJump():
+                for t in ins.getFlows():
+                    if t is not None and body.contains(t):
+                        succs.append(int(t.getOffset()))
+            self.decoded[o] = (bool(ft.isCall()), bool(ft.isJump()), bool(ft.isTerminal()),
+                               None, succs, ops)
         self.insns.sort()
 
         init = State()
@@ -384,36 +417,24 @@ class FunctionFlow(object):
         entry_off = int(entry.getOffset())
         self.state_in[entry_off] = init
         preds = {}
-        work = [entry]
+        work = [entry_off]
         queued = {entry_off}
         steps = 0
         while work:
-            addr = work.pop()
-            aoff = int(addr.getOffset())
+            aoff = work.pop()
             queued.discard(aoff)
             steps += 1
             if steps > MAX_STEPS:
                 self.converged = False
                 self.m.log("WARNING: flow analysis of %s did not converge" % func.getName())
                 break
-            ins = self.listing.getInstructionAt(addr)
-            if ins is None:
+            d = self.decoded.get(aoff)
+            if d is None:
                 continue
             st = self.state_in[aoff].copy()
-            self.step(st, ins)
+            self.step(st, aoff)
             self.state_out[aoff] = st
-            flow = ins.getFlowType()
-            succs = []
-            if not flow.isTerminal():
-                ft = ins.getFallThrough()
-                if ft is not None:
-                    succs.append(ft)
-            if flow.isJump():
-                succs.extend(ins.getFlows())
-            for s in succs:
-                if s is None or not body.contains(s):
-                    continue
-                k = int(s.getOffset())
+            for k in d[4]:
                 preds.setdefault(k, set()).add(aoff)
                 # In-state = join of all predecessors' current out-states.
                 new = None
@@ -431,7 +452,7 @@ class FunctionFlow(object):
                     self.state_in[k] = new
                     if k not in queued:
                         queued.add(k)
-                        work.append(s)
+                        work.append(k)
 
     # -- prologue ---------------------------------------------------------------
     def _is_prologue_insn(self, ins, st_in):
@@ -439,7 +460,7 @@ class FunctionFlow(object):
         entry register values / the back chain to the stack, or copies the
         return address register."""
         st = st_in.copy()
-        self.step(st, ins)
+        self.step(st, int(ins.getAddress().getOffset()))
         for k in set(st.regs) | set(st_in.regs):
             if k[0] == "u":
                 continue

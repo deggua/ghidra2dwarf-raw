@@ -165,6 +165,13 @@ undefined return address, so backtraces end cleanly.
   `DW_OP_stack_value` synthesis.
 * Delay-slot architectures (MIPS, SPARC) have not been tested.
 
+## Performance
+
+Exporting the stripped PPC32 glibc (`libc.so.6`, 2.3 MB, 3,687 functions,
+9,687 globals) took about 4 minutes on a 16-core VM. Roughly 40% is Ghidra's
+decompiler and the rest is the flow/location analysis. The 3.3 MB ELF loads
+in GDB in about 0.1 s and passes `llvm-dwarfdump --verify`.
+
 ## Layout
 
 ```
