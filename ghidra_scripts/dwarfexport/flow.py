@@ -102,6 +102,7 @@ class MachineInfo(object):
         self.ra_dwarf = self.dwarf_of(self.ra_key) if self.ra_key is not None else _pc_column(self.lang)
 
         # Every register with a DWARF number.
+        self.big_endian = bool(self.lang.isBigEndian())
         self.mapped = [(start, size) for start, size, _ in reg_index.entries]
         self.volatile = [k for k in self.mapped
                          if k != self.sp_key and k not in self.unaffected and k != self.ra_key]
@@ -137,8 +138,11 @@ class MachineInfo(object):
         return out
 
     def is_preserved(self, key):
-        """Is the register preserved across calls (so CFI can unwind it)?"""
-        return key == self.sp_key or key in self.unaffected
+        """Is the register (or the register containing it) preserved across
+        calls, so that CFI can unwind it in caller frames?"""
+        if key == self.sp_key or key in self.unaffected:
+            return True
+        return any(c in self.unaffected for c in self.containers(key))
 
 
 # ----------------------------------------------------------------------------
@@ -304,6 +308,16 @@ class FunctionFlow(object):
                     slot = st.mem.get(addr[1])
                     if slot is not None and len(out) > 2 and slot[0] == out[2]:
                         val = slot[1]
+            elif opc in (PcodeOp.INT_ZEXT, PcodeOp.INT_SEXT) and out[0] == "r" and i0[0] in "ru":
+                # Widening writes (x86-64 "mov ebx, edi" is RBX = zext(EBX),
+                # MIPS64/PPC64 32-bit ops sign-extend): the wide register gets
+                # a new value, but its low part still holds the narrow one.
+                inner = self._get(st, i0)
+                self._set(st, out, None, off)
+                if inner is not None and i0[2] < out[2]:
+                    lo = out[1] if not self.m.big_endian else out[1] + out[2] - i0[2]
+                    st.regs[(lo, i0[2])] = inner
+                continue
             else:
                 val = None
             self._set(st, out, val, off)

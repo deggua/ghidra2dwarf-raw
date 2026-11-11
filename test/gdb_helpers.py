@@ -134,8 +134,20 @@ def setup_session():
     run("set pagination off")
     run("set confirm off")
     run("set charset UTF-8")
-    run("symbol-file " + ELF)
+    # Load the exported ELF as both the executable and the symbol file: with
+    # QEMU user mode GDB would otherwise fetch the running (reference) ELF from
+    # the stub and use its real debug info instead of ours.
+    run("set exec-file-mismatch off")
+    run("set sysroot /nonexistent")
+    run("file " + ELF)
+    run("set tcp auto-retry on")
+    run("set tcp connect-timeout 20")
     run("target remote :%d" % PORT)
+    files = run("info files")
+    if os.path.basename(ELF) not in files or "fw.elf" in files.replace(os.path.basename(ELF), ""):
+        raise RuntimeError("GDB is not using the exported ELF:\n" + files)
+    if "producer" in run("info source") and "GNU C" in run("info source"):
+        raise RuntimeError("GCC debug info leaked into the session")
     fw_main_line = line_of(r"^void fw_main\(void\)")
     loop_line = line_of(r"WARNING: Do nothing block with infinite loop", fw_main_line) - 1
     BACKSTOP.append("%s:%d" % (os.path.basename(CSRC), loop_line))

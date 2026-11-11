@@ -26,7 +26,7 @@ def main():
           and "struct sensor *next;" in out and "filter_fn filter;" in out, out)
     out = run("ptype enum mode")
     check("ptype enum", "MODE_FAULT" in out and "MODE_CALIBRATE" in out, out)
-    out = run("info line *0xfff00350")
+    out = run("info line sensor_update")
     check("info line maps into C file", os.path.basename(CSRC) in out, out)
     check("reset frame has a symbol", gdb.selected_frame().name() == "_reset", gdb.selected_frame().name())
 

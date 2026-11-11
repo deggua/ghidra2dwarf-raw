@@ -8,8 +8,8 @@
 
 union value g_union;
 short g_matrix[3][4] = { { 1, 2, 3, 4 }, { 5, 6, 7, 8 }, { 9, 10, 11, -12 } };
-uint16_t g_msgbuf[4] = { 3, 0x6162, 0x6300, 0 };          /* struct msg: len=3, "abc" */
-struct msg *g_msg = (struct msg *)g_msgbuf;
+struct { uint16_t len; uint8_t data[6]; } g_msgbuf = { 3, "abc" };  /* struct msg */
+struct msg *g_msg = (struct msg *)&g_msgbuf;
 struct packed_rec g_packed = { 0x11, 0x22334455, 0x6677 };
 struct reg g_reg = { { 0x12345678 }, 9 };
 enum big g_big = BIG_HIGH;

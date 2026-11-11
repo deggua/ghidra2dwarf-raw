@@ -7,6 +7,7 @@
 # Usage (headless): -postScript ghidra_setup.py <firmware build dir> <header.h>...
 # @runtime PyGhidra
 
+import json
 import os
 
 from ghidra.app.cmd.disassemble import DisassembleCommand
@@ -22,11 +23,19 @@ mem = prog.getMemory()
 st = prog.getSymbolTable()
 fm = prog.getFunctionManager()
 
-# 1. RAM block (the raw ROM image doesn't contain .data/.bss at their runtime
-#    addresses).
-ram = mem.createUninitializedBlock("RAM", toAddr(0x00100000), 0x10000, False)
-ram.setRead(True)
-ram.setWrite(True)
+with open(os.path.join(build_dir, "layout.json")) as f:
+    LAYOUT = json.load(f)
+
+# 1. RAM blocks for memory the raw image doesn't contain (.data/.bss at their
+#    runtime addresses on the ROM target, .bss on the others).
+for i, (start, size) in enumerate(LAYOUT["ram"]):
+    ram = mem.createUninitializedBlock("RAM%d" % i if i else "RAM", toAddr("0x%x" % start), size, False)
+    ram.setRead(True)
+    ram.setWrite(True)
+
+# Thumb: ARM's TMode context register selects the instruction set.
+from java.math import BigInteger
+TMODE = prog.getProgramContext().getRegister("TMode") if LAYOUT["thumb"] else None
 
 # 2. Types and prototypes.
 dtm = prog.getDataTypeManager()
@@ -65,12 +74,16 @@ with open(os.path.join(build_dir, "symbols.txt")) as f:
     for line in f:
         name, addr, size, kind = line.split()
         syms.append((name, int(addr, 16), int(size, 16), kind))
-syms.append(("_reset", 0xFFF00100, 0x28, "T"))
+if "_reset" not in [s[0] for s in syms]:
+    syms.append(("_reset", 0xFFF00100, 0x28, "T"))
 
 for name, addr, size, kind in syms:
-    if name == "bad_bytes":
+    if name in ("bad_bytes", "split_tail"):
         continue  # handled by ghidra_setup_edge.py
-    a = toAddr("0x%x" % addr)
+    thumb = LAYOUT["thumb"] and bool(addr & 1) and kind in "Tt"
+    a = toAddr("0x%x" % (addr & ~1 if thumb else addr))
+    if thumb and TMODE is not None:
+        prog.getProgramContext().setValue(TMODE, a, a, BigInteger.ONE)
     if kind in "Tt":
         DisassembleCommand(a, None, True).applyTo(prog, monitor)
         f = fm.getFunctionAt(a)

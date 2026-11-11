@@ -953,6 +953,47 @@ class Exporter(object):
         flags = 0x05000000 if proc == "ARM" else 0  # EABI v5
         return machine, flags
 
+    def _code_ranges(self):
+        """Sorted, merged [(lo, hi)] Ghidra offsets covered by function bodies."""
+        rs = []
+        for f in self.program.getFunctionManager().getFunctions(True):
+            if f.isExternal():
+                continue
+            for r in f.getBody().getAddressRanges():
+                if self.in_space(r.getMinAddress()):
+                    rs.append((int(r.getMinAddress().getOffset()), int(r.getMaxAddress().getOffset()) + 1))
+        rs.sort()
+        merged = []
+        for lo, hi in rs:
+            if merged and lo <= merged[-1][1] + 16:  # alignment padding between functions
+                merged[-1] = (merged[-1][0], max(hi, merged[-1][1]))
+            else:
+                merged.append((lo, hi))
+        return merged
+
+    MAX_SECTION_RUNS = 20000
+
+    def _split_runs(self, lo, hi, code):
+        """Partition [lo, hi) into [(start, end, is_code)] runs."""
+        runs = []
+        pos = lo
+        i = bisect.bisect_left(code, (lo, lo))
+        if i > 0 and code[i - 1][1] > lo:
+            i -= 1
+        while i < len(code) and code[i][0] < hi:
+            clo, chi = max(code[i][0], lo), min(code[i][1], hi)
+            if clo > pos:
+                runs.append((pos, clo, False))
+            if chi > clo:
+                runs.append((max(clo, pos), chi, True))
+                pos = chi
+            i += 1
+        if pos < hi:
+            runs.append((pos, hi, False))
+        if len(runs) > self.MAX_SECTION_RUNS or not runs:
+            return [(lo, hi, True)]
+        return runs
+
     def _write_elf(self):
         machine, flags = self._elf_machine()
         entry = 0
@@ -964,26 +1005,36 @@ class Exporter(object):
                 break
         elf = ElfWriter(self.addr_size == 8, self.big_endian, machine, flags, entry)
 
+        code = self._code_ranges()
         for block in self.memory.getBlocks():
             start = block.getStart()
             if not block.isLoaded() or block.isOverlay() or not self.in_space(start):
                 continue
-            sflags = C.SHF_ALLOC
-            if block.isExecute():
-                sflags |= C.SHF_EXECINSTR
-            if block.isWrite():
-                sflags |= C.SHF_WRITE
-            size = int(block.getSize())
+            base_flags = C.SHF_ALLOC | (C.SHF_WRITE if block.isWrite() else 0)
+            lo = int(start.getOffset())
+            hi = lo + int(block.getSize())
             name = str(block.getName())
+            if block.isExecute():
+                # GDB classifies symbols (function vs data) by the flags of
+                # their section, and raw dumps are often one RWX block: emit
+                # code and data runs as separate sections.
+                runs = self._split_runs(lo, hi, code)
+            else:
+                runs = [(lo, hi, False)]
+            data = None
             if self.opts.embed_bytes and block.isInitialized():
                 import jpype
-                buf = jpype.JArray(jpype.JByte)(size)
+                buf = jpype.JArray(jpype.JByte)(hi - lo)
                 block.getBytes(start, buf)
                 data = memoryview(buf).cast("B").tobytes()
-                sec = Section(name, C.SHT_PROGBITS, sflags, self.A(start.getOffset()), data)
-            else:
-                sec = Section(name, C.SHT_NOBITS, sflags, self.A(start.getOffset()), size=size)
-            elf.add_section(sec)
+            for rlo, rhi, is_code in runs:
+                sflags = base_flags | (C.SHF_EXECINSTR if is_code else 0)
+                sname = name if is_code or not block.isExecute() else name + ".data"
+                if data is not None:
+                    sec = Section(sname, C.SHT_PROGBITS, sflags, self.A(rlo), data[rlo - lo:rhi - lo])
+                else:
+                    sec = Section(sname, C.SHT_NOBITS, sflags, self.A(rlo), size=rhi - rlo)
+                elf.add_section(sec)
 
         for name, data in self.dw.build():
             elf.add_section(Section(name, C.SHT_PROGBITS, data=data))
@@ -1175,10 +1226,36 @@ class _FunctionContext(object):
         return out
 
     # -- physical location of values ------------------------------------------
+    def _unique_home(self, vn):
+        """Register a temporary (unique-space, HASH storage) decompiler
+        instance was physically written to: the register of the same size
+        that its defining instruction writes (same opcode preferred)."""
+        d = vn.getDef()
+        if d is None or self.flow is None or d.getOpcode() == PcodeOp.MULTIEQUAL:
+            return None
+        off = int(d.getSeqnum().getTarget().getOffset())
+        dec = self.flow.decoded.get(off)
+        if dec is None:
+            return None
+        size = int(vn.getSize())
+        cands = [(opc, (out[1], out[2])) for opc, out, _, _, _ in dec[5]
+                 if out is not None and out[0] == "r" and out[2] == size]
+        same = [k for opc, k in cands if opc == d.getOpcode()]
+        keys = same or [k for _, k in cands]
+        keys = list(dict.fromkeys(keys))
+        return keys[-1] if len(keys) == 1 or same else None
+
     def instance_value(self, vn):
         """FunctionFlow value id of a register varnode instance, or None."""
         flow = self.flow
-        if flow is None or not vn.isRegister():
+        if flow is None:
+            return None
+        if vn.isUnique():
+            home = self._unique_home(vn)
+            if home is None:
+                return None
+            return flow.value_after(int(vn.getDef().getSeqnum().getTarget().getOffset()), home)
+        if not vn.isRegister():
             return None
         key = (int(vn.getOffset()), int(vn.getSize()))
         d = vn.getDef()
@@ -1208,7 +1285,7 @@ class _FunctionContext(object):
 
     def located_pcs(self, vn, value, pcs):
         flow = self.flow
-        own = (int(vn.getOffset()), int(vn.getSize()))
+        own = (int(vn.getOffset()), int(vn.getSize())) if vn.isRegister() else None
         out = []
         for pc in pcs:
             e = self.best_location(flow.locations_of(pc, value), own)
@@ -1352,7 +1429,14 @@ class _FunctionContext(object):
         reaching = self.reaching_pcs(instances)
         for idx, vn in enumerate(instances):
             space = vn.getAddress().getAddressSpace()
-            if vn.isConstant() or vn.isUnique():
+            if vn.isConstant():
+                continue
+            if vn.isUnique():
+                # temporaries (HASH storage): follow the value from the
+                # register their defining instruction wrote
+                value = self.instance_value(vn)
+                if value is not None and reaching is not None:
+                    entries.extend(self.located_pcs(vn, value, reaching.get(idx, [])))
                 continue
             if space.isStackSpace():
                 e = self.varnode_expr(vn)

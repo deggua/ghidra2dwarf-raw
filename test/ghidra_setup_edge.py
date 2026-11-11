@@ -27,14 +27,22 @@ fm = prog.getFunctionManager()
 listing = prog.getListing()
 
 SYMS = {}
+FUNC_SYMS = set()
 with open(os.path.join(build_dir, "symbols.txt")) as f:
     for line in f:
         name, addr, size, kind = line.split()
         SYMS[name] = (int(addr, 16), int(size, 16))
+        if kind in "Tt":
+            FUNC_SYMS.add(name)
+
+
+import json
+with open(os.path.join(build_dir, "layout.json")) as _f:
+    THUMB = json.load(_f)["thumb"]
 
 
 def A(name):
-    return toAddr("0x%x" % SYMS[name][0])
+    return toAddr("0x%x" % (SYMS[name][0] & ~1 if THUMB and name in FUNC_SYMS else SYMS[name][0]))
 
 
 def find_type(name):
@@ -182,12 +190,14 @@ report("undecompilable function", bad_func)
 # a tail call, so add the tail to the body by hand as an analyst would.
 def split_body():
     f = fm.getFunctionAt(A("split_func"))
-    tail = A("asm_between").add(8)
+    tail = A("split_tail")
     other = fm.getFunctionAt(tail)
     if other is not None:
         fm.removeFunction(tail)
+    from ghidra.app.cmd.disassemble import DisassembleCommand
+    DisassembleCommand(tail, None, True).applyTo(prog, monitor)
     body = AddressSet(f.getBody())
-    body.add(tail, tail.add(7))
+    body.add(tail, tail.add(SYMS["split_tail"][1] - 1))
     f.setBody(body)
     print("  split_func body: %s" % f.getBody())
 report("non-contiguous function", split_body)

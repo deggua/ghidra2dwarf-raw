@@ -1,0 +1,27 @@
+/* User-mode test layout: text, rodata and data contiguous from BASE (so
+   objcopy -O binary gives one image), bss after it. */
+ENTRY(_reset)
+SECTIONS
+{
+    . = @BASE@;
+    .text : { *(.text .text.*) }
+    .rodata : { *(.rodata .rodata.* .srodata .srodata.*) }
+    . = ALIGN(0x10000);
+    .data : {
+        __data_start = .;
+        *(.data .data.* .sdata .sdata.* .got .got.* .toc .toc.*)
+        . = ALIGN(8);
+        __data_end = .;
+    }
+    __data_load = __data_start;
+    .bss (NOLOAD) : {
+        . = ALIGN(8);
+        __bss_start = .;
+        *(.bss .bss.* .sbss .sbss.* COMMON)
+        . = ALIGN(8);
+        __bss_end = .;
+    }
+    /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) *(.gnu.attributes) *(.MIPS.abiflags)
+                  *(.reginfo) *(.ARM.exidx*) *(.ARM.extab*) *(.interp) *(.dynamic) *(.dynsym)
+                  *(.dynstr) *(.hash) *(.gnu.hash) *(.rela.*) *(.rel.*) }
+}

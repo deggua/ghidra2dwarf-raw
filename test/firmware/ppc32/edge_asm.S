@@ -20,9 +20,12 @@ asm_between:
     blr
     .size asm_between, . - asm_between
 
+    .globl split_tail
+    .type split_tail, @function
 split_tail:
     addi    r3, r3, 1
     blr
+    .size split_tail, . - split_tail
 
     .globl bad_bytes
     .type bad_bytes, @object

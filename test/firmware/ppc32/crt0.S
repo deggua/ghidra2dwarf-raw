@@ -5,6 +5,7 @@
  */
     .section .reset, "ax"
     .globl _reset
+    .type _reset, @function
 _reset:
     /* Enable the FPU (MSR[FP] = 0x2000) */
     mfmsr   r3
@@ -20,3 +21,4 @@ _reset:
 
     bl      _cstart
 1:  b       1b
+    .size _reset, . - _reset

@@ -61,9 +61,16 @@ class ElfWriter(object):
 
     def section_index_for(self, addr):
         """Index of the allocated section containing addr, else SHN_ABS."""
-        for i, s in enumerate(self.sections):
-            if s.flags & C.SHF_ALLOC and s.addr <= addr < s.addr + max(s.size, 1):
-                return i
+        import bisect
+        n = len(self.sections)
+        if getattr(self, "_index_n", None) != n:
+            self._index = sorted((s.addr, s.addr + max(s.size, 1), i)
+                                 for i, s in enumerate(self.sections) if s.flags & C.SHF_ALLOC)
+            self._index_starts = [e[0] for e in self._index]
+            self._index_n = n
+        j = bisect.bisect_right(self._index_starts, addr) - 1
+        if j >= 0 and self._index[j][0] <= addr < self._index[j][1]:
+            return self._index[j][2]
         return C.SHN_ABS
 
     # ------------------------------------------------------------------
