@@ -121,6 +121,11 @@ def func_text(name):
     return m.group(1) if m else ""
 
 
+def _lines():
+    with open(CSRC) as f:
+        return f.read().split("\n")
+
+
 def line_of(pattern, after=None):
     """First line number in the C file matching regex (after a line no)."""
     with open(CSRC) as f:
@@ -149,7 +154,12 @@ def setup_session():
     if "producer" in run("info source") and "GNU C" in run("info source"):
         raise RuntimeError("GCC debug info leaked into the session")
     fw_main_line = line_of(r"^void fw_main\(void\)")
-    loop_line = line_of(r"WARNING: Do nothing block with infinite loop", fw_main_line) - 1
+    try:
+        loop_line = line_of(r"WARNING: Do nothing block with infinite loop", fw_main_line) - 1
+    except KeyError:
+        # the idle loop's stores are visible: "do { ... } while( true );"
+        end = line_of(r"^\s*\} while\( true \);", fw_main_line)
+        loop_line = max(i for i in range(fw_main_line, end) if re.match(r"^\s*do \{", _lines()[i - 1]))
     BACKSTOP.append("%s:%d" % (os.path.basename(CSRC), loop_line))
     BACKSTOP_LINE.append(loop_line)
 

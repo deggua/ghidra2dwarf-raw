@@ -87,6 +87,16 @@ def addr_of(name, addr, kind):
     return toAddr("0x%x" % (addr & ~1 if thumb else addr)), thumb
 
 
+# PPC64 ELFv1: r2 holds the TOC base everywhere; Ghidra's ELF loader sets
+# it for ELF files, for a raw image the analyst sets it before analysis.
+if LAYOUT.get("toc"):
+    r2 = prog.getProgramContext().getRegister("r2")
+    for blk in mem.getBlocks():
+        if blk.isExecute() and blk.isInitialized():
+            prog.getProgramContext().setValue(r2, blk.getStart(), blk.getEnd(),
+                                              BigInteger.valueOf(LAYOUT["toc"]))
+    print("set r2 = 0x%x (TOC)" % LAYOUT["toc"])
+
 # 3a. Code first (as an analyst marks known entry points), then analysis.
 for name, addr, size, kind in syms:
     if name in ("bad_bytes", "split_tail") or kind not in "Tt":
@@ -125,7 +135,7 @@ if prog.getLanguage().getProcessor().toString() == "PowerPC" and prog.getDefault
 # PPC64 ELFv2 passes stack arguments at SP+96; Ghidra's PPC64 compiler specs
 # model the ELFv1 layout (SP+112). Correct the affected parameters with
 # custom storage, as an analyst would (see README).
-ELFV2_STACK_FIX = prog.getLanguage().getProcessor().toString() == "PowerPC" and prog.getDefaultPointerSize() == 8
+ELFV2_STACK_FIX = bool(LAYOUT.get("elfv2"))
 
 
 def fix_elfv2_stack_params(f):

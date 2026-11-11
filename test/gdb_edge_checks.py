@@ -152,13 +152,20 @@ def main():
     check_finish("finish split_func", 8)
 
     # --- Ghidra 'code *' local --------------------------------------------------------
-    call_line = line_of(r"\(\*pcVar\d+\)\(\);", line_of(r"^int call_ptr\("))
-    cont_to("%s:%d" % (os.path.basename(CSRC), call_line))
-    pc_var = re.search(r"(pcVar\d+)", func_text("call_ptr")).group(1)
-    out = run("ptype %s" % pc_var)
-    check("code * is a function pointer", "(" in out and "*" in out, out)
-    # (| 1: Thumb code pointers carry the Thumb bit, GDB's &func does not)
-    check_eq("code * value", "((unsigned long)%s | 1) == ((unsigned long)&split_func | 1)" % pc_var, 1)
+    m = re.search(r"(pcVar\d+)", func_text("call_ptr"))
+    if m is None:
+        # PPC64 ELFv1 calls through the descriptor: (*(code *)*puVar3)()
+        print("SKIP code * local (indirect call through a function descriptor)")
+        cont_to("call_ptr")
+    else:
+        call_line = line_of(r"\(\*pcVar\d+\)\(\);", line_of(r"^int call_ptr\("))
+        cont_to("%s:%d" % (os.path.basename(CSRC), call_line))
+        pc_var = m.group(1)
+        out = run("ptype %s" % pc_var)
+        check("code * is a function pointer", "(" in out and "*" in out, out)
+        # GDB prints a code pointer with its function (handles Thumb bits)
+        out = run("p %s" % pc_var)
+        check("code * value", "<split_func>" in out or "<split_func+1>" in out, out)
     check_finish("finish call_ptr", 16)
 
     # --- custom storage -------------------------------------------------------------
@@ -217,8 +224,8 @@ def main():
         check("label without type is untyped", "unknown type" in str(e), str(e))
     check_eq("label without type, cast", "*(int *)&%s" % Q(UNTYPED), 0x1234)
     check_eq("int64", "g_i64", -5)
-    check_eq("function pointer array",
-             "((unsigned long)g_filters[1] | 1) == ((unsigned long)&filter_offset | 1)", 1)
+    out = run("p g_filters[1]")
+    check("function pointer array", re.search(r"<filter_offset(\+1)?>", out) is not None, out)
     check_eq("bitfield a", "g_bits.a", 21)
     check_eq("bitfield b (crosses byte)", "g_bits.b", 99)
     check_eq("bitfield c", "g_bits.c", 9)

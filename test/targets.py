@@ -30,6 +30,8 @@ def _t(**kw):
     kw.setdefault("thumb", False)
     kw.setdefault("qemu_args", [])
     kw.setdefault("irq", False)
+    kw.setdefault("elfv2", False)
+    kw.setdefault("sret_memory", False)   # small structs returned via hidden pointer
     return kw
 
 
@@ -41,10 +43,14 @@ TARGETS = {
                         "-mno-relocatable"],
                 asflags=["-mcpu=603e", "-Wa,-mregnames"],
                 lang="PowerPC:BE:32:default", qemu_args=["-cpu", "603e"]),
-    "ppc64be": _t(cross="powerpc64-linux-gnu-", isa="ppc64", base=BASE64,
+    "ppc64be": _t(cross="powerpc64-linux-gnu-", isa="ppc64", base=BASE64, elfv2=True,
                   cflags=["-mabi=elfv2", "-mcmodel=medium"], asflags=["-mabi=elfv2"],
                   lang="PowerPC:BE:64:A2ALT", qemu="qemu-ppc64"),
-    "ppc64le": _t(cross="powerpc64le-linux-gnu-", isa="ppc64", base=BASE64,
+    # ELFv1: function descriptors in .opd (traditional big-endian PPC64)
+    "ppc64be-elfv1": _t(cross="powerpc64-linux-gnu-", isa="ppc64v1", base=BASE64, sret_memory=True,
+                        cflags=["-mabi=elfv1", "-mcmodel=medium"], asflags=["-mabi=elfv1"],
+                        lang="PowerPC:BE:64:A2ALT", qemu="qemu-ppc64"),
+    "ppc64le": _t(cross="powerpc64le-linux-gnu-", isa="ppc64", base=BASE64, elfv2=True,
                   cflags=["-mcmodel=medium"], lang="PowerPC:LE:64:A2ALT", qemu="qemu-ppc64le"),
     # --- MIPS ----------------------------------------------------------------------
     "mips32be": _t(cross="mips-linux-gnu-", isa="mips", base=BASE32,

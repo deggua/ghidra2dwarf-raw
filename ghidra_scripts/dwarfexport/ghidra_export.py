@@ -1181,6 +1181,90 @@ class Exporter(object):
             return [(lo, hi, True)]
         return runs
 
+    def _read_bytes(self, lo, hi):
+        import jpype
+        buf = jpype.JArray(jpype.JByte)(hi - lo)
+        self.memory.getBytes(self.space.getAddress(lo), buf)
+        return memoryview(buf).cast("B").tobytes()
+
+    @staticmethod
+    def _carve_opd(runs, opd):
+        """Split [(lo, hi, is_code)] runs around .opd regions (is_code "opd")."""
+        if not opd:
+            return runs
+        out = []
+        for lo, hi, kind in runs:
+            pos = lo
+            for olo, ohi in opd:
+                if ohi <= pos or olo >= hi:
+                    continue
+                if olo > pos:
+                    out.append((pos, olo, kind))
+                out.append((max(olo, pos), min(ohi, hi), "opd"))
+                pos = min(ohi, hi)
+            if pos < hi:
+                out.append((pos, hi, kind))
+        return out
+
+    def _find_opd(self, flags):
+        """PPC64 ELFv1: function pointers are addresses of function
+        descriptors (code address, TOC base, environment) in .opd. A raw
+        image has no section table, so find descriptor arrays: aligned
+        doublewords pointing at function entries, followed by the program's
+        (common) TOC value and 0. Returns [(lo, hi)] Ghidra offsets."""
+        if not (str(self.lang.getProcessor()) == "PowerPC" and self.addr_size == 8 and flags == 1):
+            return []
+        import struct
+        entries = set(int(f.getEntryPoint().getOffset())
+                      for f in self.program.getFunctionManager().getFunctions(True)
+                      if not f.isExternal() and self.in_space(f.getEntryPoint()))
+        fmt = ">Q" if self.big_endian else "<Q"
+        code_blocks = [(int(b.getStart().getOffset()), int(b.getEnd().getOffset()) + 1)
+                       for b in self.memory.getBlocks() if b.isExecute() and self.in_space(b.getStart())]
+        cands = []
+        weak = []   # [code pointer, TOC?, 0] where the pointer isn't a function entry
+        for block in self.memory.getBlocks():
+            if not block.isInitialized() or not self.in_space(block.getStart()) or block.isOverlay():
+                continue
+            lo = int(block.getStart().getOffset())
+            hi = lo + int(block.getSize())
+            first = (lo + 7) & ~7
+            data = self._read_bytes(first, hi)
+            n = (len(data) // 8) * 8
+            words = [w[0] for w in struct.iter_unpack(fmt, data[:n])]
+            for i, w in enumerate(words[:-2]):
+                if w in entries:
+                    cands.append((first + 8 * i, words[i + 1], words[i + 2]))
+                elif words[i + 2] == 0 and w & 3 == 0 and any(a <= w < b for a, b in code_blocks):
+                    weak.append((first + 8 * i, words[i + 1], 0))
+        if not cands:
+            return []
+        from collections import Counter
+        toc, _ = Counter(c[1] for c in cands if c[1]).most_common(1)[0] if any(c[1] for c in cands) else (None, 0)
+        descs = sorted(a for a, t, env in cands if t == toc and env == 0)
+        # descriptors of code Ghidra doesn't treat as a function entry, if
+        # they sit between real ones (same TOC, inside a descriptor array)
+        strong = set(descs)
+        for a, t, _ in weak:
+            if t == toc and ((a - 24) in strong or (a + 24) in strong):
+                descs.append(a)
+        descs = sorted(set(descs))
+        regions = []
+        for a in descs:
+            if regions and a == regions[-1][1]:
+                regions[-1][1] = a + 24
+            elif regions and a < regions[-1][1]:
+                continue
+            else:
+                regions.append([a, a + 24])
+        self.opd_descriptors = [(a, self._word(a)) for a in descs]
+        self.log("PPC64 ELFv1: %d function descriptors in %d .opd region(s)" % (len(descs), len(regions)))
+        return [tuple(r) for r in regions]
+
+    def _word(self, off):
+        import struct
+        return struct.unpack(">Q" if self.big_endian else "<Q", self._read_bytes(off, off + 8))[0]
+
     def _write_elf(self):
         machine, flags = self._elf_machine()
         entry = 0
@@ -1193,6 +1277,7 @@ class Exporter(object):
         elf = ElfWriter(self.addr_size == 8, self.big_endian, machine, flags, entry)
 
         code = self._code_ranges()
+        opd = self._find_opd(flags)
         # the code run holding the most function bytes becomes ".text"
         text_lo = max(code, key=lambda r: r[1] - r[0])[0] if code else None
         text_done = False
@@ -1211,6 +1296,7 @@ class Exporter(object):
                 runs = self._split_runs(lo, hi, code)
             else:
                 runs = [(lo, hi, bool(block.isExecute()))]
+            runs = self._carve_opd(runs, opd)
             data = None
             if self.opts.embed_bytes and block.isInitialized():
                 import jpype
@@ -1218,6 +1304,11 @@ class Exporter(object):
                 block.getBytes(start, buf)
                 data = memoryview(buf).cast("B").tobytes()
             for rlo, rhi, is_code in runs:
+                if is_code == "opd":
+                    # always with contents: GDB/BFD read descriptors from it
+                    elf.add_section(Section(".opd", C.SHT_PROGBITS, C.SHF_ALLOC | C.SHF_WRITE,
+                                            self.A(rlo), self._read_bytes(rlo, rhi), align=8))
+                    continue
                 if not is_code and block.isExecute() and str(self.lang.getProcessor()) == "ARM":
                     elf.add_symbol("$d", self.A(rlo), 0, C.STT_NOTYPE, C.STB_LOCAL, C.SHN_ABS)
                 sflags = base_flags | (C.SHF_EXECINSTR if is_code else 0)
@@ -1245,6 +1336,13 @@ class Exporter(object):
         if str(self.lang.getProcessor()) == "ARM":
             elf.add_section(Section(".ARM.attributes", 0x70000003, data=self._arm_attributes(flags)))
 
+        # descriptor symbols: <function name> at the descriptor (STT_OBJECT,
+        # so GDB keeps resolving code addresses to the code symbols)
+        fm = self.program.getFunctionManager()
+        for daddr, code_addr in getattr(self, "opd_descriptors", []):
+            f = fm.getFunctionAt(self.space.getAddress(code_addr))
+            if f is not None:
+                self.elf_symbols.append((_qualified(f), self.A(daddr), 24, C.STT_OBJECT))
         for sym in self.elf_symbols:
             name, value, size, stype = sym[:4]
             other = sym[4] if len(sym) > 4 else 0

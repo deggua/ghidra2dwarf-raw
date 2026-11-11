@@ -19,7 +19,7 @@ def main():
     # --- static info ---------------------------------------------------------
     out = run("list sensor_update")
     check("list shows decompiled source",
-          "sensor_update(sensor_t *s,int sample)" in out or "(*s->filter)(" in out, out)
+          "sensor_update(sensor_t *s,int sample)" in out or "s->filter)(" in out, out)
     out = run("ptype sensor_t")
     check("ptype struct with bitfields",
           "uint8_t enabled : 1;" in out and "uint8_t channel : 3;" in out
@@ -120,7 +120,7 @@ def check_rest():
     check("s->mode enum", str(val("s->mode")) == "MODE_IDLE", str(val("s->mode")))
     check_eq("s->pos.x", "s->pos.x", -3)
     su_line = line_of(r"^void sensor_update\(")
-    call_line = line_of(r"\(\*s->filter\)\(", su_line)
+    call_line = line_of(r"s->filter\)\(", su_line)   # (*s->filter)( or (**(code **)s->filter)(
     sal = gdb.selected_frame().find_sal()
     run("next")
     sal = gdb.selected_frame().find_sal()

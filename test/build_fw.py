@@ -29,6 +29,26 @@ def sh(cmd, **kw):
     return r.stdout
 
 
+def elf_section(path, wanted):
+    """(address, bytes) of a section of an ELF64 big/little-endian file."""
+    import struct
+    data = open(path, "rb").read()
+    if data[4] != 2:
+        return None
+    end = ">" if data[5] == 2 else "<"
+    shoff = struct.unpack_from(end + "Q", data, 0x28)[0]
+    shentsize, shnum, shstrndx = struct.unpack_from(end + "HHH", data, 0x3A)
+    def sh(i):
+        return struct.unpack_from(end + "IIQQQQIIQQ", data, shoff + i * shentsize)
+    stroff = sh(shstrndx)[4]
+    for i in range(shnum):
+        nm, typ, flags, addr, off, size = sh(i)[:6]
+        name = data[stroff + nm:data.index(b"\0", stroff + nm)].decode()
+        if name == wanted:
+            return addr, data[off:off + size]
+    return None
+
+
 def build(name, opt, out):
     t = TARGETS[name]
     os.makedirs(out, exist_ok=True)
@@ -61,14 +81,29 @@ def build(name, opt, out):
     sh([tool("objcopy"), "-O", "binary", elf, os.path.join(out, "fw.bin")])
 
     syms = {}
-    lines = []
+    entries = []
+    opd = elf_section(elf, ".opd")
     for line in sh([tool("nm"), "-S", "--defined-only", elf]).splitlines():
         parts = line.split()
         if len(parts) == 3:
             syms[parts[2]] = int(parts[0], 16)
         if len(parts) == 4 and parts[2] in "TtDdBbRr":
-            lines.append("%s 0x%s 0x%s %s" % (parts[3], parts[0], parts[1], parts[2]))
-            syms[parts[3]] = int(parts[0], 16)
+            sym, addr, size, kind = parts[3], int(parts[0], 16), int(parts[1], 16), parts[2]
+            if opd and opd[0] <= addr < opd[0] + len(opd[1]):
+                # ELFv1: the symbol is a function descriptor; the analyst
+                # knows the code address it points to.
+                off = addr - opd[0]
+                addr = int.from_bytes(opd[1][off:off + 8], "big")
+                kind, size = "T", 0
+            entries.append([sym, addr, size, kind])
+            syms[sym] = addr
+    # sizes unknown for descriptor-resolved code: distance to the next symbol
+    starts = sorted(set(e[1] for e in entries))
+    for e in entries:
+        if e[2] == 0:
+            nxt = [s for s in starts if s > e[1]]
+            e[2] = (nxt[0] - e[1]) if nxt else 4
+    lines = ["%s 0x%x 0x%x %s" % (n, a, s, k) for n, a, s, k in entries]
     with open(os.path.join(out, "symbols.txt"), "w") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -77,7 +112,11 @@ def build(name, opt, out):
     else:
         ram = [[syms["__bss_start"], max(syms["__bss_end"] - syms["__bss_start"], 8)]]
     layout = {"target": name, "base": t["base"], "ram": ram, "thumb": t["thumb"],
-              "lang": t["lang"], "cspec": t["cspec"], "irq": t["irq"]}
+              "lang": t["lang"], "cspec": t["cspec"], "irq": t["irq"], "elfv2": t["elfv2"],
+              "sret_memory": t["sret_memory"]}
+    if opd:
+        # PPC64 ELFv1: the TOC base an analyst sets r2 to (from a descriptor)
+        layout["toc"] = int.from_bytes(opd[1][8:16], "big")
     with open(os.path.join(out, "layout.json"), "w") as f:
         json.dump(layout, f, indent=1)
     return out

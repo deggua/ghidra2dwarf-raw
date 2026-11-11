@@ -204,6 +204,20 @@ def split_body():
     print("  split_func body: %s" % f.getBody())
 report("non-contiguous function", split_body)
 
+# --- struct return: ABIs returning small structs in memory (Linux PPC32,
+# PPC64 ELFv1) differ from Ghidra's register-pair model; fix the annotation
+# as an analyst would (pointer return + explicit pointer parameter).
+import json as _json
+with open(os.path.join(build_dir, "layout.json")) as _f:
+    _LAYOUT = _json.load(_f)
+if _LAYOUT.get("sret_memory"):
+    def struct_return():
+        from ghidra.app.cmd.function import ApplyFunctionSignatureCmd
+        from ghidra.app.util.parser import FunctionSignatureParser
+        sig = FunctionSignatureParser(dtm, None).parse(None, "point * make_point(point * ret, int x, int y)")
+        ApplyFunctionSignatureCmd(A("make_point"), sig, USER).applyTo(prog, monitor)
+    report("struct return via hidden pointer", struct_return)
+
 # --- custom storage: struct / bitfield values in registers and stack slots --
 # The C functions take plain integers; re-type them, keeping the storage
 # Ghidra assigned, as an analyst does with "Use Custom Storage".
