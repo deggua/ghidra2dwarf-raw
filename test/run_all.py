@@ -51,7 +51,7 @@ def job(target, opt, sanitized, work, verbose):
     # The sanitized-names runs also split the pseudo-C into many small files,
     # so all GDB checks run against a multi-file export.
     split = ["c_max_lines=%d" % SPLIT_LINES, "c_max_bytes=%d" % SPLIT_BYTES]
-    opts = ["skip_decompile=bad?func"] + (["sanitize_names=true"] + split if sanitized else [])
+    opts = ["skip_decompile=bad?func,shape_skipme"] + (["sanitize_names=true"] + split if sanitized else [])
     ok, notes, text = export_fw.export(build, out_dir, opts)
     report["lines"] += [n for n in notes if not n.startswith("ghidra2dwarf-raw: wrote")]
     if not ok:
@@ -98,7 +98,7 @@ def job(target, opt, sanitized, work, verbose):
     if not sanitized:
         # unwinding at every instruction vs GCC's own CFI
         msgs = []
-        for start, steps in (("shapes_main", 5000), ("edge_main", 3000)):
+        for start, steps in (("shapes_main", 10000), ("edge_main", 3000)):
             ok, lines = difftrace.difftrace(build, elf, steps, start,
                                             work=os.path.join(out_dir, "out"))
             msgs.append(lines[0])

@@ -72,7 +72,7 @@ def sanitize_type(t):
     """Sanitize the base name of a dumped type ("base *", "base[4]")."""
     m = re.match(r"^(.*?)((?: \*|\[\d+\]|:\d+)*)$", t)
     base, suffix = m.group(1), m.group(2)
-    if base.split() and all(w in C_TYPE_WORDS for w in base.split()):
+    if base.startswith("<") or base.split() and all(w in C_TYPE_WORDS for w in base.split()):
         return t
     return sanitize(base) + suffix
 

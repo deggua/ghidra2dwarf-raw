@@ -68,38 +68,48 @@ def _gui_options(opts):
         if isinstance(v, bool):
             values.defineBoolean(k, v)
         elif isinstance(v, int):
-            values.defineString(k, ("0x%x" % v) if k == "address_offset" else str(v))
+            values.defineString(k, ("0x%x" % v if v >= 0 else str(v)) if k == "address_offset" else str(v))
         else:
             values.defineString(k, "" if v is None else str(v))
 
     def apply(vmap, target):
         for k in keys:
-            if isinstance(getattr(Options(), k), bool):
-                target.set(k, "true" if vmap.getBoolean(k) else "false")
-            else:
-                text = str(vmap.getString(k) or "").strip()
-                if k == "basename" and not text:
-                    continue          # default: the program name
-                target.set(k, text)
+            try:
+                if isinstance(getattr(Options(), k), bool):
+                    target.set(k, "true" if vmap.getBoolean(k) else "false")
+                else:
+                    text = str(vmap.getString(k) or "").strip()
+                    if k == "basename" and not text:
+                        continue          # default: the program name
+                    target.set(k, text)
+            except Exception as e:  # noqa: BLE001
+                raise ValueError("%s: %s" % (k, e))
+
+    def out_dir_of(vmap):
+        f = vmap.getFile(_OUT_DIR)
+        if f is None or not str(f.getPath()).strip():
+            raise ValueError("choose an output directory")
+        d = os.path.expanduser(str(f.getPath()).strip())
+        # (relative to the program's directory, not Ghidra's working directory)
+        return d if os.path.isabs(d) else os.path.join(_default_dir(), d)
 
     @JImplements("docking.widgets.values.ValuesMapValidator")
     class Validator(object):
         @JOverride
         def validate(self, vmap, status):
             try:
-                if vmap.getFile(_OUT_DIR) is None:
-                    raise ValueError("choose an output directory")
+                out_dir_of(vmap)
                 apply(vmap, Options())
                 return True
             except Exception as e:  # noqa: BLE001
-                status.setStatusText("Invalid value: %s" % e)
+                status.setStatusText("Invalid value for %s" % e)
                 return False
 
     values.setValidator(Validator())
     values = askValues("Export DWARF/ELF for GDB",
                        "Output directory and options (defaults prefilled; see the README):", values)
     apply(values, opts)
-    return str(values.getFile(_OUT_DIR).getAbsolutePath())
+    return os.path.abspath(out_dir_of(values))
 
 
 def main():
@@ -118,7 +128,12 @@ def main():
         if isRunningHeadless():
             out_dir = _default_dir()
         else:
-            out_dir = _gui_options(opts)
+            from ghidra.util.exception import CancelledException
+            try:
+                out_dir = _gui_options(opts)
+            except CancelledException:
+                print("Export cancelled.")
+                return
     Exporter(currentProgram, monitor, out_dir, opts).run()
 
 

@@ -221,8 +221,9 @@ Things to check in your Ghidra project, all found while testing:
   CFI or variables, so stepping and backtraces there (and through calls made
   from there) go wrong. Recover the table (e.g. the `SwitchOverride.java`
   script with the case addresses), then re-export. Case code that is in the
-  function body but only reachable through an unresolved computed jump is
-  analyzed with the state at the jump.
+  function body but only reachable through an unresolved computed jump (not
+  a call, and not one made after the frame is popped, like an indirect tail
+  call) is analyzed with the state after the jump.
 * **Language variant.** Pick one that decodes all your instructions; e.g. POWER8+
   code needs `PowerPC:*:64:A2ALT`, since the `default` PPC64 languages lack VSX
   (`mtfprd`).
@@ -333,8 +334,10 @@ the call has clobbered r3. Using the decompiler's storage would print wrong
 values, so the exporter combines two analyses:
 
 1. **Which value** a variable holds at each PC: the reaching definition of the
-   decompiler's SSA instances over its basic blocks. A variable is shown until
-   it is reassigned, not just while the decompiler still needs it.
+   decompiler's SSA instances over its basic blocks (by their real extent: a
+   block can be several distant pieces, e.g. an early `return` stub that
+   branches back to the shared epilogue). A variable is shown until it is
+   reassigned, not just while the decompiler still needs it.
 2. **Where that value physically is** at each PC: a small abstract
    interpretation over the raw p-code of every instruction (`flow.py`). It
    tracks the stack pointer as *entry SP + delta*, register entry values,
@@ -545,7 +548,11 @@ The edge-case module (`firmware/edge.c`, `edge_asm.S`, `ghidra_setup_edge.py`,
 * code shapes found by an adversarial review (`firmware/shapes.c`): a
   conditional return before the frame setup, conditional moves, a 40 KB
   frame, arguments copied into a stack object a callee modifies, a store as
-  the first instruction, a realigned stack, a thunk; on ppc32 also
+  the first instruction, a realigned stack, a thunk; from a second review an
+  early return through a non-contiguous decompiler block, indirect calls
+  (delay slots), a computed-goto dispatcher with 70 cases and an indirect
+  tail call whose table is in RAM, and pointer parameters in prototypes the
+  exporter writes itself; on ppc32 also
   out-of-line `_savegpr`/`_restgpr` helpers, a return address parked in r30,
   and an exception handler that leaves through a shared `rfi` exit;
 * a memory map without the X flag (ppc32-linux).

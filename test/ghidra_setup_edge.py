@@ -324,6 +324,25 @@ def rename_locals():
     ifc.dispose()
 report("local names with '?'", rename_locals)
 
+# --- computed goto (shapes.c shape_disp): its cases are only reachable
+# through a table in RAM, so analysis leaves them out of the function; give
+# it its whole range as body, as an analyst would.
+def disp_body():
+    from ghidra.app.cmd.disassemble import DisassembleCommand
+    from java.math import BigInteger
+    a = A("shape_disp")
+    end = a.add(SYMS["shape_disp"][1] - 1)
+    if THUMB:
+        # (Thumb mode on the not yet disassembled parts only)
+        tmode = prog.getLanguage().getRegister("TMode")
+        for r in listing.getUndefinedRanges(AddressSet(a, end), False, monitor):
+            prog.getProgramContext().setValue(tmode, r.getMinAddress(), r.getMaxAddress(), BigInteger.ONE)
+    DisassembleCommand(AddressSet(a, end), None, True).applyTo(prog, monitor)
+    for g in list(fm.getFunctions(AddressSet(a.add(1), end), True)):
+        fm.removeFunction(g.getEntryPoint())
+    fm.getFunctionAt(a).setBody(AddressSet(a, end))
+report("computed goto: whole range as the function body", disp_body)
+
 # --- memory map without the X flag (hand-made by the analyst) ---------------------
 if _LAYOUT.get("noexec_blocks"):
     def noexec():

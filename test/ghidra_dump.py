@@ -6,7 +6,7 @@
 
 import json
 
-from ghidra.program.model.data import (Array, BitFieldDataType, Enum, Pointer, StringDataInstance,
+from ghidra.program.model.data import (Array, BitFieldDataType, Enum, FunctionDefinition, Pointer, StringDataInstance,
                                        Structure, TypeDef, Union)
 from ghidra.program.model.symbol import SourceType
 
@@ -22,6 +22,8 @@ def tname(dt, depth=0):
         return tname(dt.getDataType(), depth + 1) + " *"
     if isinstance(dt, Array):
         return "%s[%d]" % (tname(dt.getDataType(), depth + 1), dt.getNumElements())
+    if isinstance(dt, FunctionDefinition):
+        return "<function>"       # (names of function types aren't preserved)
     if isinstance(dt, BitFieldDataType):
         return "%s:%d" % (tname(dt.getBaseDataType(), depth + 1), dt.getBitSize())
     return str(dt.getName())

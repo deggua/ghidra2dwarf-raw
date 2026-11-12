@@ -117,6 +117,159 @@ int shape_wrap(int v)
     return shape_leaf(v);
 }
 
+/* ---- second review ------------------------------------------------------- */
+
+/* An early "return -1" whose stub branches back to the shared epilogue at
+   -O2: a decompiler basic block of two distant pieces. */
+char g_shape_heap[64];
+unsigned int g_shape_heap_used;
+const char g_shape_path[] = "/a/b";
+
+char *shape_lookup(const char *name)
+{
+    g_shape_sink += name[0];
+    return (char *)g_shape_path;
+}
+
+char *shape_alloc(unsigned int n)
+{
+    char *p = g_shape_heap + g_shape_heap_used;
+    if (g_shape_heap_used + n > sizeof g_shape_heap)
+        return 0;
+    g_shape_heap_used += n;
+    return p;
+}
+
+char *shape_copy_to(char *dst, const char *src)
+{
+    while (*src)
+        *dst++ = *src++;
+    *dst = 0;
+    return dst;
+}
+
+void shape_fill(char *dst, const char *src, unsigned int n)
+{
+    while (n--)
+        *dst++ = *src++;
+}
+
+int shape_finish(const char *name, char *dest)
+{
+    g_shape_sink += name[0] + (dest ? dest[0] : 0);
+    return g_shape_sink & 0xff;
+}
+
+void shape_release(char *p)
+{
+    if (p)
+        g_shape_sink ^= p[0];
+}
+
+int shape_build(const char *name)
+{
+    char *dest = 0;
+    char *p = shape_lookup(name);
+    int r;
+
+    if (__builtin_expect(p != 0 && *p != 0, 0)) {
+        dest = shape_alloc(16);
+        if (dest == 0)
+            return -1;
+        p = shape_copy_to(dest, p);
+        *p = ':';
+        shape_fill(p + 1, "xyz", 3);
+    }
+    r = shape_finish(name, dest);
+    shape_release(dest);
+    return r;
+}
+
+/* indirect calls (MIPS jalr with delay slots) */
+int shape_helper3(int x)
+{
+    g_shape_sink += x;
+    return x * 3;
+}
+
+int shape_cb(int x)
+{
+    g_shape_sink ^= x;
+    return x + 1;
+}
+
+int shape_two(int (*fp)(int), int n, int flag)
+{
+    if (flag)
+        return shape_helper3(flag) + 1;
+    return fp(n) + fp(n + 1) + n;
+}
+
+void shape_cb2(void)
+{
+    g_shape_sink++;
+}
+
+int shape_loop3(void (*fp)(void), int n)
+{
+    int i;
+
+    for (i = 0; i != n; i++)
+        fp();
+    return i;
+}
+
+/* Computed goto through a table in RAM that neither Ghidra nor the
+   decompiler can resolve (the test setup gives the function its whole
+   range as body, as an analyst would), with an indirect tail call among the
+   cases, and more cases than the analysis' old round limit. */
+int (*g_shape_fp)(int) = shape_helper3;
+volatile int g_shape_done;
+
+int shape_dhelper(int x)
+{
+    g_shape_sink += x;
+    return x * 5;
+}
+
+#define SD_L(k) &&d##k,
+#define SD_C(k) d##k: r = shape_dhelper(r + k) + k; goto out;
+#define SD_X10(m, a) m(a##0) m(a##1) m(a##2) m(a##3) m(a##4) m(a##5) m(a##6) m(a##7) m(a##8) m(a##9)
+int shape_disp(int op, int x)
+{
+    static void *tbl[] = { &&tail, SD_X10(SD_L, 1) SD_X10(SD_L, 2) SD_X10(SD_L, 3) SD_X10(SD_L, 4)
+                           SD_X10(SD_L, 5) SD_X10(SD_L, 6) SD_X10(SD_L, 7) };
+    int r = x * 2 + 1;
+
+    g_shape_sink = r;
+    if (g_shape_done == 12345)
+        tbl[1] = &&d11;             /* keeps the table writable (RAM) */
+    goto *tbl[op];
+tail:
+    return g_shape_fp(r + 2);
+    SD_X10(SD_C, 1) SD_X10(SD_C, 2) SD_X10(SD_C, 3) SD_X10(SD_C, 4)
+    SD_X10(SD_C, 5) SD_X10(SD_C, 6) SD_X10(SD_C, 7)
+out:
+    return r + x;
+}
+
+/* prototypes the exporter writes itself (skip_decompile, thunks) with
+   pointer parameters */
+int shape_take(const char *s, int *p)
+{
+    return s[0] + *p;
+}
+
+int shape_skipme(char *s, int *p, unsigned char b[4])
+{
+    return s[1] + *p + b[0];
+}
+
+int shape_wrap2(const char *s, int *p)
+{
+    return shape_take(s, p);
+}
+
 void shapes_main(void)
 {
     int i;
@@ -132,4 +285,16 @@ void shapes_main(void)
     shape_poke(&g_poke, 0xabcd);
     g_shape_result[4] = shape_align(3);
     g_shape_result[5] = shape_wrap(20);
+    g_shape_result[6] = shape_build("n");
+    g_shape_sink = shape_two(shape_cb, 5, 0);
+    g_shape_sink = shape_two(shape_cb, 1234, 7);
+    g_shape_sink = shape_loop3(shape_cb2, 5);
+    g_shape_sink = shape_disp(0, 5);
+    g_shape_sink = shape_disp(4, 6);
+    g_shape_sink = shape_disp(68, 7);
+    {
+        int v = 7;
+        unsigned char b[4] = { 1, 2, 3, 4 };
+        g_shape_sink = shape_wrap2("ab", &v) + shape_skipme("cd", &v, b);
+    }
 }

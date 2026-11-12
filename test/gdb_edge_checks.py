@@ -149,6 +149,82 @@ def check_shapes():
     check_correct_or_unavailable("thunk/wrapper parameter", "v", 20)
 
 
+def check_fp(name, expr, func):
+    """A function pointer is right (its symbol, also through a PPC64 ELFv1
+    descriptor) or unavailable."""
+    try:
+        v = val(expr)
+        if v.is_optimized_out:
+            print("SKIP %s (<optimized out>)" % name)
+            return
+        out = run("info symbol 0x%x" % (int(v) & 0xffffffffffffffff))
+        check(name, out.split()[0] == func if out.strip() else False, out)
+    except gdb.error as e:
+        check(name, False, str(e))
+
+
+def check_shapes_2():
+    """Shapes from the second review (firmware/shapes.c)."""
+    # early return through a non-contiguous decompiler block: the variable
+    # holding shape_copy_to's result must not show the old (lookup) value
+    m = re.search(r"\b(\w+) = shape_copy_to\(", func_text("shape_build"))
+    cont_to("shape_fill")
+    dst = int(val("dst"))
+    check_full_backtrace("early-return shape", ["shape_fill", "shape_build", "shapes_main"])
+    if m:
+        select_frame("shape_build")
+        check_correct_or_unavailable("copy_to result in the caller (%s)" % m.group(1), m.group(1), dst - 1)
+    else:
+        print("SKIP copy_to result (no variable assigned from shape_copy_to)")
+
+    # the shared epilogue belongs to the final "return", not the early one
+    start = line_of(r"^\w[\w *]* (?:__\w+ )?shape_build\(")
+    rets = [l for l in func_text("shape_build").split("\n") if re.match(r"^\s*return\b", l)]
+    if len(rets) > 1:
+        last = line_of("^" + re.escape(rets[-1]) + "$", start)
+        try:
+            sals = gdb.decode_line(spec(last))[1] or []
+        except gdb.error:
+            sals = []
+        where = [gdb.current_progspace().block_for_pc(int(x.pc)).function for x in sals]
+        check("final return line has code in its function",
+              any(w is not None and w.name == "shape_build" for w in where), [str(w) for w in where])
+    else:
+        print("SKIP final return line (one return in the decompiled shape_build)")
+
+    # indirect calls: caller-frame values right or unavailable (MIPS: delay
+    # slots must not be analyzed as unreached code)
+    cont_to("shape_helper3", "x == 7")
+    select_frame("shape_two")
+    check_fp("indirect-call caller: fp", "fp", "shape_cb")
+    check_correct_or_unavailable("indirect-call caller: n", "n", 1234)
+    check_correct_or_unavailable("indirect-call caller: flag", "flag", 7)
+    for _ in range(3):
+        cont_to("shape_cb2")
+    check_full_backtrace("loop of indirect calls", ["shape_cb2", "shape_loop3", "shapes_main"])
+    select_frame("shape_loop3")
+    check_fp("loop caller: fp", "fp", "shape_cb2")
+    check_correct_or_unavailable("loop caller: n", "n", 5)
+
+    # computed goto through a table in RAM, cases analyzed from the jump
+    cont_to("shape_helper3", "x == 13")
+    names = frame_names()
+    check("indirect tail call from a computed-goto function: backtrace",
+          "shapes_main" in names and names[-1] == "_reset", names)
+    cont_to("shape_dhelper")
+    check_full_backtrace("computed-goto case", ["shape_dhelper", "shape_disp", "shapes_main"])
+    cont_to("shape_dhelper")
+    check_full_backtrace("computed-goto case 68", ["shape_dhelper", "shape_disp", "shapes_main"])
+
+    # a function exported without decompilation (skip_decompile) still has
+    # its prototype's parameters
+    cont_to("shape_skipme")
+    check_correct_or_unavailable("skipped function parameter s[0]", "s[0]", ord("c"))
+    check_correct_or_unavailable("skipped function parameter *p", "*p", 7)
+    out = run("info args")
+    check("skipped function lists its parameters", "s = " in out and "p = " in out, out)
+
+
 def main():
     setup_session()
 
@@ -162,6 +238,10 @@ def main():
     if SANITIZED:
         m = re.search(r"\b\w+\?\w*\b", csrc)
         check("sanitized C files have no '?' identifiers", m is None, m.group(0) if m else "")
+    # prototypes the exporter writes itself keep pointer declarators
+    m = re.search(r"shape_skipme\(([^)]*)\)", csrc)
+    check("written prototype keeps pointer types", m is not None and re.search(r"char \*\s*s\b", m.group(1))
+          and re.search(r"int \*\s*p\b", m.group(1)) and "__" not in m.group(1), m.group(0) if m else csrc[:0])
 
     # --- name with '?': function + parameter -----------------------------------
     cont_to(GET_VALUE)  # breakpoint location syntax: no quoting needed
@@ -283,6 +363,7 @@ def main():
     check("custom storage: struct return type", "flagword" in out, out)
 
     check_shapes()
+    check_shapes_2()
 
     # --- globals at the end ----------------------------------------------------------
     cont_to("edge_done")

@@ -65,7 +65,12 @@ def fake_ask(title, message, values):
     status = Status()
     values.setString("decompile_timeout", "soon")
     check("invalid number rejected", not values.isValid(status) and status.text, status.text)
+    check("error names the field", "decompile_timeout" in (status.text or ""), status.text)
     values.setString("decompile_timeout", "30")
+    values.setString("basename", "../elsewhere/fw")
+    check("basename with directories rejected", not values.isValid(status) and "basename" in (status.text or ""),
+          status.text)
+    values.setString("basename", "")
     values.setString("address_offset", "0x1000")
     values.setString("c_max_lines", "5000")
     values.setBoolean("embed_bytes", True)

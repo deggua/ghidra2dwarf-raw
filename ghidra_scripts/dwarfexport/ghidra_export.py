@@ -107,6 +107,10 @@ class Options(object):
             value = str(value).lower() in ("1", "true", "yes", "on")
         elif isinstance(cur, int):
             value = int(str(value), 0)
+        elif key == "basename":
+            value = str(value)
+            if not value or "/" in value or "\\" in value or value in (".", ".."):
+                raise ValueError("a file name without directories is needed, not %r" % value)
         setattr(self, key, value)
 
 
@@ -703,10 +707,12 @@ class Exporter(object):
     def _write_sources(self):
         os.makedirs(self.src_dir, exist_ok=True)
         # remove stale parts of an earlier, longer export
-        keep = set(f["name"] for f in self.c_files) | {self.h_name}
-        prefix = self.base + "."
+        keep = set(f["name"] for f in self.c_files)
+        if self.opts.types_header:
+            keep.add(self.h_name)
+        ours = re.compile(r"^%s\.(\d+\.c|types\.h)$" % re.escape(self.base))
         for n in os.listdir(self.src_dir):
-            if n.startswith(prefix) and (n.endswith(".c") or n.endswith(".h")) and n not in keep:
+            if ours.match(n) and n not in keep:
                 os.remove(os.path.join(self.src_dir, n))
         for f in self.c_files:
             with open(os.path.join(self.src_dir, f["name"]), "w", encoding="utf-8", errors="replace") as out:
@@ -1052,7 +1058,9 @@ class Exporter(object):
             msg = res.getErrorMessage() if res is not None else (
                 "skipped (skip_decompile)" if skipped else "no result")
             sig = self._proto_text(func)
-            flines.append("%s /* decompilation failed: %s */" % (sig, str(msg).strip().replace("*/", "* /")))
+            self._export_prototype_params(die, func, ranges, flow)
+            msg = " ".join(str(msg).split())     # one line: the line table counts lines
+            flines.append("%s /* decompilation failed: %s */" % (sig, msg.replace("*/", "* /")))
             sig_line = base + 1
             self.types.ref(die, func.getReturnType())
             addr_lines = {}
@@ -1077,6 +1085,7 @@ class Exporter(object):
             self._code_decls = self._find_code_decls(markup)
             lines = DecompilerUtils.toLines(markup)
             addr_lines = {}
+            claims = {}
             sig_line = None
             for cl in lines:
                 toks = cl.getAllTokens().toArray()   # (one Java array: no per-element iterator calls)
@@ -1096,10 +1105,24 @@ class Exporter(object):
                     a = tok.getMinAddress()
                     if a is None or not self.in_space(a):
                         continue
-                    off = int(a.getOffset())
-                    prev = addr_lines.get(off)
-                    if prev is None or gline < prev:
-                        addr_lines[off] = gline
+                    claims.setdefault(int(a.getOffset()), set()).add(gline)
+            # An address several lines claim gets the lowest one -- except a
+            # shared epilogue the decompiler duplicated into several
+            # "return" lines: there the first return not above the previous
+            # instruction's line, so the normal path doesn't jump back to an
+            # early "return -1;".
+            def is_return(gl):
+                return 0 < gl <= len(flines) and re.match(r"\s*return\b", flines[gl - 1]) is not None
+            prev = None
+            for off in sorted(claims):
+                lines_ = sorted(claims[off])
+                rets = [l for l in lines_ if is_return(l)]
+                if len(rets) > 1:
+                    fwd = [l for l in rets if prev is None or l >= prev]
+                    addr_lines[off] = fwd[0] if fwd else lines_[0]
+                else:
+                    addr_lines[off] = lines_[0]
+                prev = addr_lines[off]
             if sig_line is None:
                 sig_line = base + 1
             proto = hf.getFunctionPrototype()
@@ -1157,12 +1180,39 @@ class Exporter(object):
         """C prototype with exported (name-filtered) names, for functions
         written without decompiler output."""
         def tn(dt):
-            return self.nm_type(str(dt.getDisplayName())) if dt is not None else "void"
+            if dt is None:
+                return "void"
+            # sanitize the type name, keep pointer/array declarator parts
+            m = re.match(r"^(.*?)((?:\s*\*|\[\d*\])*)$", str(dt.getDisplayName()))
+            return self.nm_type(m.group(1).strip()) + m.group(2)
         params = ["%s %s" % (tn(p.getDataType()), self.nm(str(p.getName()))) for p in func.getParameters()]
         if func.hasVarArgs():
             params.append("...")
         return "%s %s(%s)" % (tn(func.getReturnType()), self.nm(_qualified(func)),
                               ", ".join(params) if params else "void")
+
+    def _export_prototype_params(self, die, func, ranges, flow):
+        """Parameters of a function without decompiler output, from its
+        Ghidra prototype (located where their entry values still are)."""
+        ctx = _FunctionContext(self, func, None, ranges, flow)
+        for p in func.getParameters():
+            self.stats["variables"] += 1
+            pd = die.child(C.DW_TAG_formal_parameter)
+            self.dw.name(pd, str(p.getName()))
+            self.types.ref(pd, p.getDataType())
+            try:
+                loc = ctx.entry_value_location(p.getVariableStorage())
+            except Exception as e:  # noqa: BLE001
+                self.log("WARNING: %s/%s: location failed: %s" % (func.getName(), p.getName(), e))
+                loc = None
+            if loc is None:
+                continue
+            self.stats["variables_located"] += 1
+            kind, value = loc
+            if kind == "expr":
+                pd.add(C.DW_AT_location, C.DW_FORM_exprloc, value)
+            else:
+                pd.add(C.DW_AT_location, C.DW_FORM_sec_offset, self.dw.add_loclist(value))
 
     def _thunk_target(self, func):
         """The function a thunk forwards to: Ghidra's thunks, plus functions
@@ -1694,6 +1744,29 @@ class Exporter(object):
 # Per-function variable location computation
 # ----------------------------------------------------------------------------
 
+_COVER_FIELD = []
+
+
+def _block_cover(block):
+    """The decompiler basic block's AddressSet of instructions (its private
+    "cover" field; None if unavailable)."""
+    if not _COVER_FIELD:
+        try:
+            from ghidra.program.model.pcode import PcodeBlockBasic
+            f = PcodeBlockBasic.class_.getDeclaredField("cover")
+            f.setAccessible(True)
+            _COVER_FIELD.append(f)
+        except Exception:  # noqa: BLE001
+            _COVER_FIELD.append(None)
+    f = _COVER_FIELD[0]
+    if f is None:
+        return None
+    try:
+        return f.get(block)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class _FunctionContext(object):
     """Computes DWARF locations for decompiler variables of one function.
 
@@ -1714,8 +1787,8 @@ class _FunctionContext(object):
         self.hf = hf
         self.ranges = ranges
         self.entry = int(func.getEntryPoint().getOffset())
-        blocks = hf.getBasicBlocks()
-        self.entry_block = blocks.get(0) if blocks.size() else None
+        blocks = hf.getBasicBlocks() if hf is not None else None
+        self.entry_block = blocks.get(0) if blocks is not None and blocks.size() else None
 
     # -- storage -> expression ------------------------------------------------
     def _signed(self, value, size):
@@ -1801,11 +1874,63 @@ class _FunctionContext(object):
 
     # -- liveness ----------------------------------------------------------------
     def _block_bounds(self, block):
-        start = block.getStart()
-        stop = block.getStop()
-        if start is None or stop is None:
-            return None
-        return int(start.getOffset()), self.exp.insn_end(stop)
+        """(entry, end) of the block's first piece (see _block_seq)."""
+        seq = self._block_seq(block)
+        return seq[0] if seq else None
+
+    def _block_seq(self, block):
+        """The block's code as [(lo, hi)] pieces in execution order (entry
+        piece first). A decompiler block isn't always contiguous: an early
+        "return x;" stub that branches back to the shared epilogue is one
+        block of two distant pieces, and treating it as one address range
+        would credit everything in between to it."""
+        cache = self.__dict__.setdefault("_seq_cache", {})
+        idx = int(block.getIndex())
+        if idx in cache:
+            return cache[idx]
+        pieces = None
+        cover = _block_cover(block)
+        if cover is not None:
+            pieces = [(int(r.getMinAddress().getOffset()), self.exp.insn_end(r.getMaxAddress()))
+                      for r in cover.getAddressRanges() if self.exp.in_space(r.getMinAddress())]
+        if not pieces:
+            start, stop = block.getStart(), block.getStop()
+            pieces = ([(int(start.getOffset()), self.exp.insn_end(stop))]
+                      if start is not None and stop is not None else [])
+        first = block.getFirstOp() if pieces else None
+        if first is not None and len(pieces) > 1:
+            entry = int(first.getSeqnum().getTarget().getOffset())
+            head = [p for p in pieces if p[0] <= entry < p[1]]
+            if head:
+                pieces = head + [p for p in pieces if p is not head[0]]
+        cache[idx] = pieces
+        return pieces
+
+    def _block_pos(self, block, addr):
+        """Execution-order position of addr inside the block."""
+        for i, (lo, hi) in enumerate(self._block_seq(block)):
+            if lo <= addr < hi:
+                return (i, addr)
+        return (len(self._block_seq(block)), addr)
+
+    def _block_spans(self, block, start=None, end_addr=None, end=None, start_addr=None):
+        """Spans of the block from address start (default: its entry; in
+        the piece holding start_addr, default start) to the instruction at
+        end_addr, ending at end (default: block end)."""
+        seq = self._block_seq(block)
+        out = []
+        i0 = (self._block_pos(block, start_addr if start_addr is not None else start)[0]
+              if start is not None else 0)
+        i1 = self._block_pos(block, end_addr)[0] if end_addr is not None else len(seq) - 1
+        for i in range(i0, min(i1, len(seq) - 1) + 1):
+            lo, hi = seq[i]
+            if i == i0 and start is not None:
+                lo = max(lo, start)
+            if i == i1 and end is not None:
+                hi = min(hi, end)
+            if lo < hi:
+                out.append((lo, hi))
+        return out
 
     def live_intervals(self, vn):
         """[(start, end)] Ghidra offsets where the varnode holds its value."""
@@ -1815,13 +1940,13 @@ class _FunctionContext(object):
             if not vn.isInput() or self.entry_block is None:
                 return out
             dblock = self.entry_block
-            dpoint = self.entry
+            dpoint = daddr = self.entry
         else:
             dblock = defop.getParent()
             target = defop.getSeqnum().getTarget()
+            daddr = int(target.getOffset())
             if defop.getOpcode() == PcodeOp.MULTIEQUAL:
-                b = self._block_bounds(dblock)
-                dpoint = b[0] if b else int(target.getOffset())
+                dpoint = daddr                       # the block's entry
             else:
                 dpoint = self.exp.insn_end(target)
         dindex = int(dblock.getIndex())
@@ -1843,14 +1968,16 @@ class _FunctionContext(object):
                         live_out(parent.getIn(slot))
                 continue
             ublock = op.getParent()
+            uaddr = int(op.getSeqnum().getTarget().getOffset())
             uend = self.exp.insn_end(op.getSeqnum().getTarget())
-            if int(ublock.getIndex()) == dindex and dpoint < uend:
-                out.append((dpoint, uend))
+            if (int(ublock.getIndex()) == dindex
+                    and (self._block_pos(ublock, daddr) < self._block_pos(ublock, uaddr)
+                         or (defop is None or defop.getOpcode() == PcodeOp.MULTIEQUAL) and daddr == uaddr)):
+                out += self._block_spans(ublock, dpoint, uaddr, uend, start_addr=daddr)
             else:
-                b = self._block_bounds(ublock)
-                if b is None:
+                if not self._block_seq(ublock):
                     continue
-                out.append((b[0], uend))
+                out += self._block_spans(ublock, None, uaddr, uend)
                 for i in range(ublock.getInSize()):
                     live_out(ublock.getIn(i))
 
@@ -1860,13 +1987,12 @@ class _FunctionContext(object):
             if idx in visited:
                 continue
             visited.add(idx)
-            b = self._block_bounds(block)
-            if b is None:
+            if not self._block_seq(block):
                 continue
             if idx == dindex:
-                out.append((dpoint, b[1]))
+                out += self._block_spans(block, dpoint, start_addr=daddr)
                 continue
-            out.append(b)
+            out += self._block_seq(block)
             for i in range(block.getInSize()):
                 work.append(block.getIn(i))
         return out
@@ -1970,8 +2096,9 @@ class _FunctionContext(object):
         if d is None:
             return flow.default(key) if vn.isInput() else None
         if d.getOpcode() == PcodeOp.MULTIEQUAL:
-            b = self._block_bounds(d.getParent())
-            return flow.value_before(b[0], key) if b else None
+            # (at the block's entry: its first piece's start isn't the
+            # lowest address for a non-contiguous block)
+            return flow.value_before(int(d.getSeqnum().getTarget().getOffset()), key)
         return flow.value_after(int(d.getSeqnum().getTarget().getOffset()), key)
 
     def best_location(self, locs, own):
@@ -2016,10 +2143,12 @@ class _FunctionContext(object):
         if getattr(self, "_binfo", None) is None:
             info = {}
             for b in self.hf.getBasicBlocks():
-                bounds = self._block_bounds(b)
-                pcs = self._pcs_in([bounds]) if bounds is not None else []
+                seq = self._block_seq(b)
+                bounds = seq[0] if seq else None
+                # pcs in execution order, with their position keys
+                pcs = [((i, pc), pc) for i, piece in enumerate(seq) for pc in self._pcs_in([piece])]
                 preds = [int(b.getIn(k).getIndex()) for k in range(b.getInSize())]
-                info[int(b.getIndex())] = (bounds, pcs, preds)
+                info[int(b.getIndex())] = (bounds, pcs, preds, b)
             self._binfo = info
         return self._binfo
 
@@ -2042,18 +2171,22 @@ class _FunctionContext(object):
             d = vn.getDef()
             if d is None:
                 if vn.isInput():
-                    events[entry_bi].append((self.entry, -1, i))
+                    events[entry_bi].append(((0, self.entry), -1, i))
                 continue
             bi = int(d.getParent().getIndex())
             if bi not in events:
                 continue
+            blk = binfo[bi][3]
             if d.getOpcode() == PcodeOp.MULTIEQUAL:
-                bb = binfo[bi][0]
-                if bb is None:
+                if binfo[bi][0] is None:
                     continue
-                events[bi].append((bb[0], -1, i))
+                events[bi].append(((0, binfo[bi][0][0]), -1, i))
             else:
-                events[bi].append((self.exp.insn_end(d.getSeqnum().getTarget()),
+                # (takes effect after the defining instruction: position of
+                # the instruction's end, within the same piece)
+                t = int(d.getSeqnum().getTarget().getOffset())
+                pos = self._block_pos(blk, t)
+                events[bi].append(((pos[0], self.exp.insn_end(d.getSeqnum().getTarget())),
                                    int(d.getSeqnum().getOrder()), i))
         for ev in events.values():
             ev.sort()
@@ -2063,7 +2196,7 @@ class _FunctionContext(object):
         in_inst = {}
         for _ in range(4 * len(binfo) + 4):
             changed = False
-            for bi, (_, _, preds) in binfo.items():
+            for bi, (_, _, preds, _) in binfo.items():
                 if bi == entry_bi:
                     inn = None
                 else:
@@ -2081,7 +2214,7 @@ class _FunctionContext(object):
                 break
 
         result = {}
-        for bi, (bounds, pcs, _) in binfo.items():
+        for bi, (bounds, pcs, _, _) in binfo.items():
             if bounds is None:
                 continue
             cur = in_inst.get(bi)
@@ -2089,8 +2222,8 @@ class _FunctionContext(object):
                 cur = None
             ev = events[bi]
             j = 0
-            for pc in pcs:
-                while j < len(ev) and ev[j][0] <= pc:
+            for pos, pc in pcs:
+                while j < len(ev) and ev[j][0] <= pos:
                     cur = ev[j][2]
                     j += 1
                 if cur is not None:
@@ -2102,10 +2235,20 @@ class _FunctionContext(object):
         register under another name, e.g. MIPS64 "in_a0" for the 64-bit a0
         when the parameter is its 32-bit low part): show it wherever its
         entry value still physically exists."""
-        if (self.flow is None or not sym.isParameter() or storage is None
-                or storage.isBadStorage() or storage.isUnassignedStorage()):
+        if not sym.isParameter():
+            return None
+        return self.entry_value_location(storage)
+
+    def entry_value_location(self, storage):
+        """Where a parameter's entry value still physically exists (also
+        for functions without decompiler output); a stack parameter stays in
+        its slot."""
+        if self.flow is None or storage is None or storage.isBadStorage() or storage.isUnassignedStorage():
             return None
         vns = list(storage.getVarnodes())
+        if len(vns) == 1 and vns[0].getAddress().isStackAddress():
+            e = self.storage_expr(storage)
+            return ("expr", e) if e is not None else None
         pcs = list(self.flow.insns)
         if len(vns) == 1 and vns[0].isRegister():
             key = (int(vns[0].getOffset()), int(vns[0].getSize()))

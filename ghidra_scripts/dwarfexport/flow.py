@@ -835,10 +835,17 @@ class FunctionFlow(object):
             if tail_jump:
                 is_call = False
             nxt = o + int(ins.getLength())
+            # an unresolved computed jump (not a call, no known targets):
+            # a possible way into code nothing else reaches
+            open_jump = (bool(ft.isComputed()) and bool(ft.isJump()) and not is_call
+                         and not ft.isConditional() and not any(
+                             t is not None and body.contains(t) for t in ins.getFlows())
+                         and not self.extra_edges.get(o))
             self.decoded[o] = (is_call, bool(ft.isJump()), bool(ft.isTerminal()),
                                int(ins.getDelaySlotDepth()), succs, ops,
                                (nxt, int(fall.getOffset()) if fall is not None else nxt),
-                               bool(ft.isComputed()) and not ft.isConditional())
+                               open_jump,
+                               int(fall.getOffset()) if fall is not None and body.contains(fall) else None)
         self.insns.sort()
 
         init = State()
@@ -850,7 +857,8 @@ class FunctionFlow(object):
         work = [entry_off]
         queued = {entry_off}
         steps = 0
-        for _round in range(64):
+        max_rounds = len(self.insns) + 1
+        for _round in range(max_rounds):
             while work:
                 aoff = work.pop()
                 queued.discard(aoff)
@@ -905,6 +913,9 @@ class FunctionFlow(object):
                 if o not in queued:
                     queued.add(o)
                     work.append(o)
+        else:
+            self.m.log("WARNING: %s: code behind unresolved computed jumps not fully analyzed"
+                       % func.getName())
 
         # Delay slots (MIPS, SPARC, ...): Ghidra folds the slot instruction's
         # p-code into the branch, so the slot is never stepped on its own.
@@ -922,19 +933,40 @@ class FunctionFlow(object):
                         self.state_out[ds] = after
 
     def _unreached_seeds(self):
-        computed = [o for o in self.insns if self.decoded[o][7] and o in self.state_in]
-        if not computed:
+        """[(offset, state)]: the entries of code no analyzed path reaches,
+        in a function with an unresolved computed jump (a switch whose table
+        nobody recovered). Each block leader -- an instruction nothing falls
+        through into, other than a delay slot -- starts with the state after
+        the computed jump (the nearest preceding one), as the hardware sees
+        it. Jumps made after the frame is popped (indirect tail calls) are no
+        such switch and aren't used."""
+        insns = self.insns
+        jumps = [o for o in insns if self.decoded[o][7] and o in self.state_out]
+        if not jumps:
             return []
+        sp = self.m.sp_key
+
+        def sp_delta(st):
+            v = self.reg_value(st, sp)
+            return v[1] if v is not None and v[0] == SP else None
+        has_frame = any((sp_delta(st) or 0) < 0 for st in self.state_in.values())
+        if has_frame:
+            jumps = [o for o in jumps if sp_delta(self.state_in[o]) != 0]
+        if not jumps:
+            return []
+        slots = set()
+        for i, o in enumerate(insns):
+            if self.decoded[o][3]:
+                slots.update(insns[i + 1:i + 1 + self.decoded[o][3]])
+        # (a delay slot's own "fall-through" isn't a flow: the branch decides)
+        falls_into = set(self.decoded[o][8] for o in insns
+                         if o not in slots and self.decoded[o][8] is not None)
         seeds = []
-        prev_reached = True
-        for o in self.insns:
-            if o in self.state_in:
-                prev_reached = True
+        for o in insns:
+            if o in self.state_in or o in slots or o in falls_into:
                 continue
-            if prev_reached:
-                src = max([c for c in computed if c < o] or [min(computed)])
-                seeds.append((o, self.state_in[src].copy()))
-            prev_reached = False
+            src = max([j for j in jumps if j < o] or [min(jumps)])
+            seeds.append((o, self.state_out[src].copy()))
         return seeds
 
     # -- prologue ---------------------------------------------------------------
