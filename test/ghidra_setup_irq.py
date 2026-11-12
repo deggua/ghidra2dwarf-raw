@@ -30,10 +30,12 @@ def A(name):
     return toAddr("0x%x" % SYMS[name])
 
 
-for name in ("dec_vector", "sc_vector"):
+for name in ("dec_vector", "sc_vector", "dsi_vector", "align_vector"):
     st.addExternalEntryPoint(A(name))
 fm.getFunctionAt(A("prog_vector")).addTag("INTERRUPT")
-print("IRQ setup: entry points dec_vector, sc_vector; prog_vector tagged INTERRUPT")
+# a no-return function, as an analyst marks it
+fm.getFunctionAt(A("irq_fatal")).setNoReturn(True)
+print("IRQ setup: entry points dec_vector, sc_vector, dsi_vector, align_vector; prog_vector tagged INTERRUPT")
 
 for name, dt in (("g_ticks", IntegerDataType.dataType), ("g_syscalls", IntegerDataType.dataType),
                  ("g_traps", IntegerDataType.dataType), ("g_trap_pc", UnsignedIntegerDataType.dataType),

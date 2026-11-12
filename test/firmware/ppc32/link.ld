@@ -11,6 +11,10 @@ SECTIONS
     .vectors 0xfff00000 : {
         . = 0x100;
         KEEP(*(.reset))
+        . = 0x300;
+        KEEP(*(.vec.300))
+        . = 0x600;
+        KEEP(*(.vec.600))
         . = 0x700;
         KEEP(*(.vec.700))
         . = 0x900;

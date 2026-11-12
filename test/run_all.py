@@ -89,6 +89,16 @@ def job(target, opt, sanitized, work, verbose):
     import json
     with open(os.path.join(build, "layout.json")) as f:
         has_irq = json.load(f).get("irq")
+    if has_irq:
+        # handlers: the vectors and what they branch to -- not the ordinary
+        # functions a vector calls or branches to that other code uses too
+        # (irq_fatal, shape_probe), nor one returning with rfi (msr_keep)
+        line = [l for l in report["lines"] if l.startswith("Interrupt/exception handlers:")]
+        got = set(line[0].split(":", 1)[1].replace(" ", "").split(",")) if line else set()
+        want = {"align_vector", "dec_entry", "dec_vector", "dsi_vector", "irq_exit", "prog_entry",
+                "prog_vector", "sc_vector"}
+        if got != want:
+            fail("interrupt handlers: %s, expected %s" % (sorted(got), sorted(want)))
     suites = [("main", "gdb_checks.py"), ("edge", "gdb_edge_checks.py"),
               ("feat", "gdb_feature_checks.py")]
     if has_irq:

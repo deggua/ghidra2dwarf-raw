@@ -1079,11 +1079,12 @@ class FunctionFlow(object):
         cache[id(st)] = (st, regs, mem)
         return regs, mem
 
-    def locations_of(self, off, value, size=None):
+    def locations_of(self, off, value, size=None, exact=False):
         """All (kind, where) holding ``value`` on entry to instruction off:
         ("reg", key) or ("stack", sp_offset). With the variable's size:
         also stack slots holding the value converted to a float of that
-        size."""
+        size. exact: only stack slots of that size (a float held in a wider
+        FPR in double format: an 8-byte "stfd" slot is no float)."""
         st = self.state_in.get(off)
         if st is None or value is None:
             return []
@@ -1110,7 +1111,8 @@ class FunctionFlow(object):
             # containing/contained register was written)
             if self.reg_value(st, value[1]) == value:
                 out.append(("reg", value[1]))
-        out += [("stack", o) for o in mem_by_val.get(value, ())]
+        out += [("stack", o) for o in mem_by_val.get(value, ())
+                if not (exact and size and st.mem[o][0] != size)]
         if size:
             out += [("stack", o) for o in mem_by_val.get((CVT, value, size), ())]
         return out

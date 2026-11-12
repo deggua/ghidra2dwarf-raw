@@ -110,6 +110,9 @@ set_type("g_fptab", ArrayDataType(PointerDataType(), 2, -1))
 thing = find_type("thing")
 report("struct/field names with '?'", lambda: (thing.setName("Thing?Info"),
                                               thing.getComponent(0).setFieldName("field?1")))
+# (a field whose name starts with another renamed name: the global "switch")
+report("field named like a renamed name + suffix",
+       lambda: thing.getComponent(1).setFieldName("switch_count"))
 set_type("g_thing", thing)
 report("global name with '?'", lambda: rename_global("g_thing", "g?thing"))
 gv = fm.getFunctionAt(A("Get_Value"))

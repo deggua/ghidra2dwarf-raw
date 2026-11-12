@@ -235,10 +235,11 @@ int shape_dhelper(int x)
 #define SD_L(k) &&d##k,
 #define SD_C(k) d##k: r = shape_dhelper(r + k); goto out;
 #define SD_X10(m, a) m(a##0) m(a##1) m(a##2) m(a##3) m(a##4) m(a##5) m(a##6) m(a##7) m(a##8) m(a##9)
+#define SD_X4(m, a) m(a##0) m(a##1) m(a##2) m(a##3)
 int shape_disp(int op, int x)
 {
     static void *tbl[] = { &&tail, SD_X10(SD_L, 1) SD_X10(SD_L, 2) SD_X10(SD_L, 3) SD_X10(SD_L, 4)
-                           SD_X10(SD_L, 5) SD_X10(SD_L, 6) SD_X10(SD_L, 7) };
+                           SD_X10(SD_L, 5) SD_X10(SD_L, 6) SD_X4(SD_L, 7) };
     int r = x * 2 + 1;
 
     g_shape_sink = r;
@@ -248,7 +249,7 @@ int shape_disp(int op, int x)
 tail:
     return g_shape_fp(r + 2);
     SD_X10(SD_C, 1) SD_X10(SD_C, 2) SD_X10(SD_C, 3) SD_X10(SD_C, 4)
-    SD_X10(SD_C, 5) SD_X10(SD_C, 6) SD_X10(SD_C, 7)
+    SD_X10(SD_C, 5) SD_X10(SD_C, 6) SD_X4(SD_C, 7)
 out:
     return r + x;
 }
@@ -297,6 +298,14 @@ float shape_keepf(int a)
     float y = shape_getf(a + 1);
     shape_leaf(a + 2);
     return x + y;
+}
+
+/* a float result kept in double format (-O0: stored with stfd) */
+double shape_f2d(int a)
+{
+    double d = shape_getf(a);
+    shape_leaf(a + 40);
+    return d + d;
 }
 
 /* an early return inside a loop: return code the decompiler duplicates */
@@ -371,7 +380,7 @@ void shapes_main(void)
     g_shape_sink = shape_loop3(shape_cb2, 5);
     g_shape_sink = shape_disp(0, 5);
     g_shape_sink = shape_disp(4, 6);
-    g_shape_sink = shape_disp(68, 7);
+    g_shape_sink = shape_disp(64, 7);
     {
         int v = 7;
         unsigned char b[4] = { 1, 2, 3, 4 };
@@ -379,6 +388,7 @@ void shapes_main(void)
     }
     g_shape_sink = (int)shape_keepll(4);
     g_shape_sink = (int)shape_keepf(2);
+    g_shape_sink = (int)shape_f2d(2);
     g_shape_sink = shape_phi3(g_shape_arr, 3);
     for (i = 0; i < 8; i++)
         g_shape_sink = shape_switch(i, i + 10);

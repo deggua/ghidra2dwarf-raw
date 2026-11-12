@@ -67,7 +67,10 @@ void irq_test(void)
     while (g_ticks < 3)
         g_irq_result[2] = busy_work(100000000);
     irq_disable();
+    if (g_irq_result[0] == -1)
+        irq_fatal(1);                   /* (never: also called from a vector) */
     g_irq_result[3] = 0x1234;
     g_irq_result[4] = shape_os_caller(111, 222);
     g_irq_result[5] = early_init(5);
+    msr_keep();
 }

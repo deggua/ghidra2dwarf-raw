@@ -71,6 +71,24 @@
 
 /* ---- vectors -------------------------------------------------------- */
 
+    /* Two vectors leading into ordinary functions, which must not become
+       interrupt handlers (they never fire in the test): */
+    .section .vec.300, "ax"
+    .globl dsi_vector
+    .type dsi_vector, @function
+dsi_vector:                     /* calls a no-return function C code calls too */
+    li      r3, 0x300
+    bl      irq_fatal
+    .size dsi_vector, . - dsi_vector
+
+    .section .vec.600, "ax"
+    .globl align_vector
+    .type align_vector, @function
+align_vector:                   /* branches to a C function normal code calls */
+    li      r3, 0x600
+    b       shape_probe
+    .size align_vector, . - align_vector
+
     .section .vec.700, "ax"
     .globl prog_vector
     .type prog_vector, @function
@@ -135,6 +153,22 @@ dec_entry:
     .size dec_entry, . - dec_entry
 
 /* ---- helpers called from C ------------------------------------------ */
+
+    .globl irq_fatal
+    .type irq_fatal, @function
+irq_fatal:                      /* void irq_fatal(int code): never returns */
+    b       irq_fatal
+    .size irq_fatal, . - irq_fatal
+
+    .globl msr_keep
+    .type msr_keep, @function
+msr_keep:                       /* void msr_keep(void): rewrites the MSR, */
+    mfmsr   r3                  /* returning to the caller with rfi */
+    mflr    r4
+    mtsrr0  r4
+    mtsrr1  r3
+    rfi
+    .size msr_keep, . - msr_keep
 
     .globl do_syscall
     .type do_syscall, @function

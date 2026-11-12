@@ -41,6 +41,9 @@ with open(OUT, "w") as out:
         rec = {"i": i, "frames": []}
         try:
             f = gdb.newest_frame()
+            sal = f.find_sal()
+            if sal is not None and sal.symtab is not None:
+                rec["src"] = [sal.symtab.fullname(), sal.line]
             while f is not None and len(rec["frames"]) < DEPTH:
                 if f.type() == gdb.TAILCALL_FRAME:   # GDB's call-site pseudo frames (GCC info)
                     f = f.older()

@@ -18,6 +18,8 @@ int do_syscall(int num, int arg);
 void trap_now(void);
 void irq_enable(uint32_t dec);
 void irq_disable(void);
+void irq_fatal(int code);
+void msr_keep(void);
 
 int shape_probe(int v);
 int shape_os(int a, int b, int c);

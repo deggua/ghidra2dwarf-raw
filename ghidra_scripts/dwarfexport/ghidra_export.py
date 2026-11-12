@@ -818,16 +818,42 @@ class Exporter(object):
         # 0x100 is system reset: no interrupted context to return to
         return base in (0, 0xFFF00000, 0xFFFFFFFFFFF00000) and 0x200 <= rel < 0x3000 and rel % 0x100 == 0
 
+    @staticmethod
+    def _is_call_insn(ins):
+        """A real call (its own p-code has a CALL), whatever Ghidra's flow
+        override or no-return typing makes of it."""
+        try:
+            ops = ins.getPcode(False)
+        except Exception:  # noqa: BLE001
+            ops = ins.getPcode()
+        return any(int(op.getOpcode()) in (PcodeOp.CALL, PcodeOp.CALLIND) for op in ops)
+
+    def _is_branch_insn(self, ins):
+        """An unconditional branch ("b f"): after analysis Ghidra often types
+        it as a CALL_TERMINATOR (tail call) -- but so is "bl f" to a no-return
+        function, which is a call."""
+        ft = ins.getFlowType()
+        if ft.isConditional() or not (ft.isJump() and not ft.isCall() or ft.isCall() and ft.isTerminal()):
+            return False
+        return not self._is_call_insn(ins)
+
     def _find_interrupt_handlers(self):
         """Entry offsets of functions entered by the hardware, which get
         interrupt-frame CFI:
-          * functions returning with rfi/rfid/rfci/rfmci, eret, iret, ...;
           * functions tagged INTERRUPT in Ghidra;
           * external entry points at exception vector addresses;
-          * functions an interrupt stub jumps (not calls) to."""
+          * functions returning with rfi/rfid/rfci/rfmci, eret, iret, ...,
+            and functions an interrupt handler branches (not calls) to --
+            unless other code calls or branches to them too: a C function
+            a vector stub jumps to that normal code also calls (a fatal
+            error handler), or a function that returns with rfi to its
+            caller ("mtsrr0 lr; mtsrr1 r3; rfi" to set the MSR), is an
+            ordinary function."""
         fm = self.program.getFunctionManager()
+        refs = self.program.getReferenceManager()
         eps = set(self.entry_points)
         found = set()
+        candidates = set()
         funcs = [f for f in fm.getFunctions(True) if not f.isExternal() and self.in_space(f.getEntryPoint())]
         for f in funcs:
             entry = int(f.getEntryPoint().getOffset())
@@ -837,24 +863,39 @@ class Exporter(object):
                 continue
             for ins in self.listing.getInstructions(f.getBody(), True):
                 if self._IRQ_RETURN.match(str(ins.getMnemonicString())):
-                    found.add(entry)
+                    candidates.add(entry)
                     break
-        work = list(found)
-        while work:
-            f = fm.getFunctionAt(self.space.getAddress(work.pop()))
-            if f is None:
-                continue
-            for ins in self.listing.getInstructions(f.getBody(), True):
-                ft = ins.getFlowType()
-                # "b handler": after analysis Ghidra often types it as a
-                # CALL_TERMINATOR (tail call) rather than a jump
-                if not ft.isConditional() and (ft.isJump() and not ft.isCall()
-                                               or ft.isCall() and ft.isTerminal()):
-                    for t in ins.getFlows():
-                        g = fm.getFunctionAt(t)
-                        if g is not None and int(t.getOffset()) not in found:
-                            found.add(int(t.getOffset()))
-                            work.append(int(t.getOffset()))
+
+        def only_from_handlers(entry):
+            """Every code reference to the function is a branch from a
+            handler (none at all: entered by the hardware only)."""
+            for r in refs.getReferencesTo(self.space.getAddress(entry)):
+                if not r.getReferenceType().isFlow():
+                    continue
+                src = r.getFromAddress()
+                g = fm.getFunctionContaining(src)
+                if g is None or int(g.getEntryPoint().getOffset()) not in found:
+                    return False
+                ins = self.listing.getInstructionAt(src)
+                if ins is None or self._is_call_insn(ins):
+                    return False
+            return True
+
+        changed = True
+        while changed:
+            changed = False
+            for f in [fm.getFunctionAt(self.space.getAddress(e)) for e in sorted(found)]:
+                if f is None:
+                    continue
+                for ins in self.listing.getInstructions(f.getBody(), True):
+                    if self._is_branch_insn(ins):
+                        for t in ins.getFlows():
+                            if fm.getFunctionAt(t) is not None and int(t.getOffset()) not in found:
+                                candidates.add(int(t.getOffset()))
+            for c in sorted(candidates - found):
+                if only_from_handlers(c):
+                    found.add(c)
+                    changed = True
         # Handlers entered by a branch from another handler (a shared exit
         # path "b irq_exit"): {target entry: [(source entry, branch offset)]}
         self.irq_jumps = {}
@@ -863,9 +904,7 @@ class Exporter(object):
             if f is None:
                 continue
             for ins in self.listing.getInstructions(f.getBody(), True):
-                ft = ins.getFlowType()
-                if not ft.isConditional() and (ft.isJump() and not ft.isCall()
-                                               or ft.isCall() and ft.isTerminal()):
+                if self._is_branch_insn(ins):
                     for t in ins.getFlows():
                         if int(t.getOffset()) in found and int(t.getOffset()) != src:
                             self.irq_jumps.setdefault(int(t.getOffset()), []).append(
@@ -894,15 +933,25 @@ class Exporter(object):
         span = getattr(self, "types_header_lines", None)
         pairs = dict(self.nm.cache)
         pairs.update(self.nm_type.cache)
+        # (the writer's "typedef struct X X, *PX;" pointer names follow X)
+        for o, n in list(self.nm_type.cache.items()):
+            if o != n and "P" + o not in pairs:
+                pairs["P" + o] = "P" + n
         renames = sorted(((o, n) for o, n in pairs.items() if o != n),
                          key=lambda on: -len(on[0]))
         if span is None or not renames:
             return
+        # (whole names only: "default" -> "default_" must not touch a field
+        # "default_mode")
+        pats = {}
         for i in range(span[0], span[1]):
             line = self.h_lines[i]
             for o, n in renames:
                 if o in line:
-                    line = line.replace(o, n)
+                    pat = pats.get(o)
+                    if pat is None:
+                        pat = pats[o] = re.compile(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(o))
+                    line = pat.sub(lambda m, n=n: n, line)
             self.h_lines[i] = line
 
     _NAME_TOKENS = None
@@ -1339,6 +1388,7 @@ class Exporter(object):
             lines = DecompilerUtils.toLines(markup)
             addr_lines = {}
             claims = {}
+            ret_claims = {}       # {offset: lines whose "return" keyword claims it}
             call_claims = {}
             sig_line = None
             carry_at = None
@@ -1376,6 +1426,8 @@ class Exporter(object):
                     if a is None or not self.in_space(a):
                         continue
                     claims.setdefault(int(a.getOffset()), set()).add(gline)
+                    if str(tok.getText()) == "return":
+                        ret_claims.setdefault(int(a.getOffset()), set()).add(gline)
                     if isinstance(tok, ClangFuncNameToken) and gline != sig_line:
                         # the callee's name in a call: the call's line
                         call_claims.setdefault(int(a.getOffset()), gline)
@@ -1386,8 +1438,6 @@ class Exporter(object):
             # shared epilogue the decompiler duplicated into several "return"
             # lines: that is the function's closing "}" (as with GCC), since
             # which return the code belongs to depends on the path taken.
-            def is_return(gl):
-                return 0 < gl <= len(flines) and re.match(r"\s*return\b", flines[gl - 1]) is not None
             closing = max([i + 1 for i, t in enumerate(flines) if t.strip() == "}"] or [None])
             # Return code the decompiler duplicated into several blocks (an
             # epilogue shared by an early and the final return): which return
@@ -1396,7 +1446,9 @@ class Exporter(object):
             shared_ret = self._duplicated_return_code(hf, flow)
             for off in sorted(claims):
                 lines_ = sorted(claims[off])
-                rets = [l for l in lines_ if is_return(l)]
+                # (the "return" keywords only: a value computed once for
+                # several "return x;" is claimed by each of their "x")
+                rets = ret_claims.get(off, ())
                 if (len(rets) > 1 or off in shared_ret) and closing is not None:
                     addr_lines[off] = closing
                 else:
@@ -1424,13 +1476,23 @@ class Exporter(object):
                     pd = flow.decoded.get(ins_[i - 1])
                     if pd is not None and pd[8] == o and o not in targets:
                         continue
+                    # (through conditional branches; an unconditional jump
+                    # takes its target's line -- a "goto" path; only a
+                    # return leads to the closing "}")
                     line = None
                     for o2 in ins_[i:]:
                         if o2 in addr_lines:
                             line = addr_lines[o2]
                             break
                         d2 = flow.decoded.get(o2)
-                        if d2 is None or d2[0] or d2[1] or d2[2]:
+                        if d2 is None or d2[0]:
+                            break
+                        if d2[1] and d2[8] is None:
+                            tgt = [t for t in d2[4] if t in addr_lines]
+                            if len(tgt) == 1:
+                                line = addr_lines[tgt[0]]
+                            break
+                        if d2[2] and d2[8] is None:
                             break
                     if line is None:
                         line = closing
@@ -1792,9 +1854,21 @@ class Exporter(object):
     @staticmethod
     def _duplicated_return_code(hf, flow):
         """Offsets of instructions in more than one decompiler basic block,
-        one of them a return block (no successors)."""
+        one of them a return block (no successors) -- other than instructions
+        whose own p-code spans blocks: a conditional return (PPC beqlr, ARM
+        bxeq lr / pople {..,pc}) or a conditionally executed instruction
+        (ARM predication, AArch64 csel) is no shared epilogue."""
         if flow is None or hf is None:
             return set()
+
+        def splits(o):
+            d = flow.decoded.get(o)
+            if d is None:
+                return False
+            if d[2] and d[8] is not None:
+                return True
+            return any(op[0] in (PcodeOp.CBRANCH, PcodeOp.BRANCH) and op[2] is not None and op[2][0] == "c"
+                       for op in d[5])
         seen, rets = {}, set()
         for b in hf.getBasicBlocks():
             cover = _block_cover(b)
@@ -1805,7 +1879,7 @@ class Exporter(object):
                 seen[o] = seen.get(o, 0) + 1
             if b.getOutSize() == 0:
                 rets.update(offs)
-        return set(o for o in rets if seen[o] > 1)
+        return set(o for o in rets if seen[o] > 1 and not splits(o))
 
     @staticmethod
     def _find_code_decls(markup):
@@ -2864,7 +2938,8 @@ class _FunctionContext(object):
             for i in order:
                 # (a float in a wider FPR: also where it is stored converted)
                 size = int(vn.getSize()) if len(pieces) == 1 and vn.getSize() < keys[i][1] else None
-                e = self.best_location(self.flow.locations_of(pc, vals[i], size), keys[i])
+                e = self.best_location(self.flow.locations_of(pc, vals[i], size, exact=size is not None),
+                                       keys[i])
                 if e is None:
                     break
                 exprs.append((e, keys[i][1]))

@@ -134,6 +134,71 @@ def compare(ref, exp, cfi, syms):
     return compared, desync, bad
 
 
+def closing_violations(exp, syms):
+    """Steps of the export trace where an invocation of a function shows
+    one of its lines after having shown its closing "}" (the epilogue):
+    code that isn't the epilogue mapped to the "}". An invocation is the
+    function plus its unwound callers' (pc, sp)."""
+    texts = {}
+
+    def text(path, line):
+        if path not in texts:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    texts[path] = f.read().split("\n")
+            except OSError:
+                texts[path] = []
+        lines = texts[path]
+        return lines[line - 1] if 0 < line <= len(lines) else ""
+
+    def func(pc):
+        i = bisect.bisect_right(syms, (pc, "\xff")) - 1
+        return syms[i] if i >= 0 else (pc, hex(pc))
+
+    unrecovered = {}
+
+    def unrecovered_switch(path, line):
+        """Is the line in a function whose decompilation couldn't recover a
+        jump table? Its case code has no line info (README, "Unrecovered
+        switch tables")."""
+        text(path, line)
+        lines = texts[path]
+        lo = line - 1
+        while lo > 0 and not lines[lo].startswith("/* ---- "):
+            lo -= 1
+        if (path, lo) not in unrecovered:
+            hi = lo + 1
+            while hi < len(lines) and not lines[hi].startswith("/* ---- "):
+                hi += 1
+            unrecovered[(path, lo)] = any("Could not recover jumptable" in x for x in lines[lo:hi])
+        return unrecovered[(path, lo)]
+    closed = {}
+    bad = {}
+    prev = None
+    for r in exp:
+        fr, src = r.get("frames"), r.get("src")
+        if not fr or not src:
+            prev = None
+            continue
+        entry, fn = func(fr[0][0])
+        key = (fn, tuple(tuple(x) for x in fr[1:]))
+        # A new invocation (called again from the same call site): at the
+        # entry, or just after a step in the caller right before the return
+        # address (PPC64 local entry points, ELFv1 descriptors: the symbol
+        # isn't where calls enter).
+        just_called = (prev is not None and len(fr) > 1 and prev[0][1] == fr[1][1]
+                       and 0 < fr[1][0] - prev[0][0] <= 16)
+        prev = fr
+        if fr[0][0] == entry or just_called:
+            closed.pop(key, None)
+        t = text(src[0], src[1]).strip()
+        if t == "}":
+            closed[key] = src[1]
+        elif key in closed and closed[key] != src[1] and fn not in bad and not unrecovered_switch(*src):
+            bad[fn] = (r["i"], fr[0][0], src[1], t)
+    return bad
+
+
 def difftrace(build, elf, steps=3000, start_sym="edge_main", work=None):
     """Returns (ok, report lines)."""
     with open(os.path.join(build, "layout.json")) as f:
@@ -156,7 +221,12 @@ def difftrace(build, elf, steps=3000, start_sym="edge_main", work=None):
     lines = ["%d steps compared, %d desynced, %d mismatching PCs" % (compared, desync, len(bad))]
     for k, (i, t, e, err) in list(bad.items())[:15]:
         lines.append("step %d at %s\n      gcc   : %s\n      export: %s %s" % (i, k, t, e, err or ""))
-    return not bad and desync == 0 and compared > 0, lines
+    closing = closing_violations(exp, syms)
+    if closing:
+        lines.append("%d functions show a line after their closing brace:" % len(closing))
+        for fn, (i, pc, line, t) in list(closing.items())[:15]:
+            lines.append("step %d in %s at 0x%x: line %d \"%s\" after \"}\"" % (i, fn, pc, line, t))
+    return not bad and not closing and desync == 0 and compared > 0, lines
 
 
 if __name__ == "__main__":

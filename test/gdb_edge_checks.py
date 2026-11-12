@@ -226,7 +226,7 @@ def check_shapes_2():
     cont_to("shape_dhelper")
     check_full_backtrace("computed-goto case", ["shape_dhelper", "shape_disp", "shapes_main"])
     cont_to("shape_dhelper")
-    check_full_backtrace("computed-goto case 68", ["shape_dhelper", "shape_disp", "shapes_main"])
+    check_full_backtrace("computed-goto case 64", ["shape_dhelper", "shape_disp", "shapes_main"])
 
     # a function exported without decompilation (skip_decompile) still has
     # its prototype's parameters
@@ -309,6 +309,10 @@ def check_shapes_3():
         select_frame("shape_keepf")
     if os.environ.get("FP_RET_OK", "1") == "1":
         check_finish("finish shape_keepf (float return)", 7.5)
+    # a float result in double format in an FPR (-O0 PPC: stored with stfd):
+    # a float variable is never read from the double's slot
+    if os.environ.get("FP_ARGS_OK", "1") == "1":
+        check_kept_results("shape_f2d", "shape_getf", 42, {"a": 3.0}, True)
 
     # an early return in a loop: the shared return code is never shown as
     # the early "return -1;" on the normal path
@@ -626,7 +630,10 @@ def main():
     check_eq("signed bitfield", "g_sbits.s", -2)
     check_eq("bitfield after signed", "g_sbits.u", 13)
     check_eq("'?' global + '?' field", "%s.%s" % (Q(G_THING), Q(FIELD1)), 41)
-    check_eq("'?' global other field", "%s.ok" % Q(G_THING), 42)
+    check_eq("'?' global other field", "%s.switch_count" % Q(G_THING), 42)
+    hdr = all_source_text()
+    check("header keeps names that contain a renamed name", re.search(r"\bswitch_count;", hdr)
+          and "switch__count" not in hdr, [l for l in hdr.split("\n") if "switch" in l and "count" in l])
     out = run("ptype struct %s" % Q(THING_T))
     check("ptype '?' typedef/struct", FIELD1 in out, out)
     check_eq("quote replaced in name", "it_s", 7)

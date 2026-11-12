@@ -166,6 +166,14 @@ def main():
     check("RA in register (2nd call): backtrace", names[:3] == ["shape_probe", "early_init", "irq_test"]
           and names[-1] == "_reset", names)
 
+    # --- a function returning to its caller with rfi (sets the MSR) is no
+    # interrupt handler
+    cont_to("msr_keep")
+    names = frame_names()
+    # (-O2: a tail call, irq_test's frame is gone)
+    check("rfi used as a return: backtrace", names[0] == "msr_keep" and None not in names and len(names) >= 3
+          and names[-1] == "_reset", names)
+
     # --- end state ----------------------------------------------------------------
     cont_to("edge_main")
     check_eq("syscall result", "g_irq_result[0]", 42)

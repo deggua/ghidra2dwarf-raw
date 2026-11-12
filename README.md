@@ -267,15 +267,20 @@ that function's registers and arguments restored from the exception frame.
 
 A function is treated as a handler when:
 
-* it returns with an interrupt-return instruction (`rfi`, `rfid`, `rfci`,
-  `rfmci`, `eret`, `iret`, ...);
 * it has the Ghidra function tag `INTERRUPT` (for handlers whose return
   isn't in the function, e.g. ones that branch to a common exit path);
 * it is an entry point (Ghidra *external entry point*) at a classic PowerPC
   exception vector, 0x200-0x2f00 above 0 or 0xfff00000 (system reset at
-  0x100 has nothing to return to); or
-* one of the above jumps (not calls) to it. This covers vector stubs like
-  `nop; nop; b handler`.
+  0x100 has nothing to return to);
+* it returns with an interrupt-return instruction (`rfi`, `rfid`, `rfci`,
+  `rfmci`, `eret`, `iret`, ...), or a handler jumps (not calls) to it --
+  vector stubs like `nop; nop; b handler` -- as long as no other code calls
+  or branches to it. A C function that a vector stub jumps to but that
+  normal code also calls (a fatal-error handler), a no-return function a
+  handler calls with `bl` (Ghidra types such calls like jumps), and a
+  function that returns to its caller with `rfi` (`mtsrr0 lr; mtsrr1 r3;
+  rfi` to set the MSR) are ordinary functions. Tag a handler `INTERRUPT`
+  if it is also reached some other way.
 
 A handler entered by a branch from another one (a shared exit path such as
 `b irq_exit`) is analyzed with the state at that branch, so its CFI still
@@ -376,9 +381,11 @@ code.
   line). `case N:` labels get no code. Return code the decompiler duplicated
   into several `return` statements (an epilogue shared by an early and the
   final return) maps to the function's closing `}`, as with GCC, since which
-  return it belongs to depends on the path taken. An instruction no token
+  return it belongs to depends on the path taken; a conditional return (PPC
+  `beqlr`, ARM `bxeq lr`) keeps its `if` line. An instruction no token
   claims at a block start or jump target gets the line of the code that
-  follows it, not of whatever precedes it in memory.
+  follows it (through conditional branches; before an unconditional jump,
+  the jump target's line), not of whatever precedes it in memory.
 * **Variable locations**: location lists, see below. Parameters and locals
   carry their declaration line, and types their line in `<name>.types.h`.
 * **Call frame information** (`.debug_frame`): see below.
@@ -621,7 +628,7 @@ The edge-case module (`firmware/edge.c`, `edge_asm.S`, `ghidra_setup_edge.py`,
   frame, arguments copied into a stack object a callee modifies, a store as
   the first instruction, a realigned stack, a thunk; from a second review an
   early return through a non-contiguous decompiler block, indirect calls
-  (delay slots), a computed-goto dispatcher with 70 cases and an indirect
+  (delay slots), a computed-goto dispatcher with 65 cases and an indirect
   tail call whose table is in RAM, and pointer parameters in prototypes the
   exporter writes itself; from a third review 64-bit and float call results
   kept across a later call, an early return in a loop whose epilogue the
@@ -649,7 +656,9 @@ single-stepped twice from the same point (5,000 instructions from
 `shapes_main`, 3,000 from `edge_main`), once with GCC's own debug info and
 once with the export, and the unwound PC and SP of every frame must be
 identical at every instruction (wherever GCC has CFI, i.e. outside
-hand-written assembly).
+hand-written assembly). The same trace checks the line table: once an
+invocation of a function has shown its closing `}` (the epilogue), it must
+not show any other of its lines before it returns.
 
 All of it runs on all 20 targets at three `-O` levels, and with
 `sanitize_names=true`: 80 export-and-debug runs. The sanitized runs also
