@@ -902,8 +902,11 @@ class Exporter(object):
     _NAME_TOKENS = None
 
     def _token_text(self, tok):
-        """Token text, with identifiers passed through the name filter."""
+        """Token text, with identifiers passed through the name filter and
+        annotations in comments rendered."""
         text = str(tok.getText())
+        if isinstance(tok, ClangCommentToken):
+            return self._comment_text(text)
         if Exporter._NAME_TOKENS is None:
             from ghidra.app.decompiler import (ClangVariableToken, ClangFieldToken,
                                                ClangTypeToken, ClangLabelToken)
@@ -914,6 +917,100 @@ class Exporter(object):
                 return self.nm_type(text)
             return self.nm(text)
         return text
+
+    # -- comment annotations ----------------------------------------------------
+    # Ghidra comments can hold annotations ({@sym 00123456}, {@address ...},
+    # {@url "..." text}, ...) that its listing renders as a name or text.
+    _ANN_START = re.compile(r"\{@(\w+)")
+    _ANN_KINDS = ("sym", "symbol", "address", "addr", "url", "hyperlink", "href", "link", "program",
+                  "variable", "var", "execute")
+
+    @staticmethod
+    def _annotation_end(text, i):
+        """Index after the "}" closing the annotation at text[i] (quotes and
+        backslash escapes as Ghidra parses them); None if not closed."""
+        quoted = False
+        j = i + 2
+        while j < len(text):
+            c = text[j]
+            if c == "\\":
+                j += 2
+                continue
+            if c == '"':
+                quoted = not quoted
+            elif c == "}" and not quoted:
+                return j + 1
+            j += 1
+        return None
+
+    def _comment_text(self, text):
+        """A decompiler comment line with its annotations rendered as Ghidra
+        displays them, symbols by their exported names (what GDB knows). The
+        decompiler wraps long comments at spaces, so an annotation can start
+        on one comment line and end on the next: it is carried over."""
+        if self._ann_carry:
+            text = self._ann_carry + text.lstrip()
+            self._ann_carry = ""
+        out = []
+        i = 0
+        while True:
+            m = self._ANN_START.search(text, i)
+            if m is None:
+                out.append(text[i:])
+                break
+            if m.group(1).lower() not in self._ANN_KINDS:
+                out.append(text[i:m.end()])
+                i = m.end()
+                continue
+            end = self._annotation_end(text, m.start())
+            if end is None:
+                if text.rstrip().endswith("*/"):      # (the comment ends here: leave it)
+                    out.append(text[i:])
+                else:
+                    out.append(text[i:m.start()].rstrip())
+                    self._ann_carry = text[m.start():] + " "
+                break
+            out.append(text[i:m.start()])
+            out.append(self._render_annotation(text[m.start():end]))
+            i = end
+        return "".join(out)
+
+    def _render_annotation(self, raw):
+        from ghidra.app.util.viewer.field import Annotation, CommentUtils
+        try:
+            parts = [str(p) for p in Annotation(raw).getAnnotationParts()]
+        except Exception:  # noqa: BLE001
+            return raw
+        kind = parts[0].lower() if parts else ""
+        if kind in ("sym", "symbol") and len(parts) > 1:
+            sym = self._annotated_symbol(parts[1])
+            if sym is not None:
+                return self.nm(_qualified(sym))
+        elif kind == "execute":
+            # (Ghidra's handler for it isn't available headless)
+            return " ".join(parts[2:]) or (parts[1] if len(parts) > 1 else raw)
+        try:
+            shown = str(CommentUtils.getDisplayString(raw, self.program))
+        except Exception:  # noqa: BLE001
+            return raw
+        if kind in ("variable", "var") and shown and not shown.startswith("Annotation Exception"):
+            shown = self.nm(shown)
+        return shown
+
+    def _annotated_symbol(self, text):
+        """The symbol a {@sym ...} annotation refers to: by (namespaced)
+        name, else by address (its primary symbol)."""
+        from ghidra.app.util import NamespaceUtils
+        try:
+            syms = list(NamespaceUtils.getSymbols(text, self.program))
+            if syms:
+                return syms[0]
+            addr = self.program.getAddressFactory().getAddress(text)
+            if addr is not None:
+                return self.program.getSymbolTable().getPrimarySymbol(addr)
+        except Exception:  # noqa: BLE001
+            pass
+        return None
 
     # -- functions --------------------------------------------------------------
     def _decompiler(self):
@@ -1169,6 +1266,7 @@ class Exporter(object):
         flines = ["", "/* ---- %s @ %s ---- */" % (self.nm(name), func.getEntryPoint())]
         self._var_dies = []      # (die, name, is_param): declaration lines added once placed
         self._code_decls = {}
+        self._ann_carry = ""
         base = len(flines)  # line N of the function text -> base + N
 
         if markup is None or hf is None:
@@ -1214,6 +1312,7 @@ class Exporter(object):
             self._export_variables(die, func, hf, ranges, flow, params_only=True)
         else:
             self._code_decls = self._find_code_decls(markup)
+            self._ann_carry = ""
             lines = DecompilerUtils.toLines(markup)
             addr_lines = {}
             claims = {}

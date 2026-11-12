@@ -351,6 +351,18 @@ def aliases():
     st.createLabel(A("g_stats"), "g_stats_other", USER)
 report("alias labels on a function and on data", aliases)
 
+# --- annotations in a comment ({@sym ...} etc.), rendered in the C files ----------
+def annotated_comment():
+    from ghidra.program.model.listing import CommentType
+    f = fm.getFunctionAt(A("call_ptr"))
+    call = [i for i in listing.getInstructions(f.getBody(), True) if i.getFlowType().isCall()][0]
+    text = ("see {@sym %s} and {@symbol Get?Value} and {@sym Foo::init}, data {@sym g?thing} at "
+            "{@address %s}, {@sym no_such_symbol}, {@execute \"echo hi\" run it}, links " % (
+                A("split_func"), A("g_thing"))
+            + " ".join('{@url "http://example.org/%d" two words}' % i for i in range(10)) + " end")
+    listing.setComment(call.getAddress(), CommentType.PRE, text)
+report("annotated comment", annotated_comment)
+
 # --- memory map without the X flag (hand-made by the analyst) ---------------------
 if _LAYOUT.get("noexec_blocks"):
     def noexec():

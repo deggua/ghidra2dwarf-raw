@@ -361,6 +361,16 @@ def main():
     if SANITIZED:
         m = re.search(r"\b\w+\?\w*\b", csrc)
         check("sanitized C files have no '?' identifiers", m is None, m.group(0) if m else "")
+    # Ghidra comment annotations are rendered, symbols by their exported names
+    check("no raw comment annotations left", "{@" not in csrc,
+          [l for l in csrc.split("\n") if "{@" in l][:3])
+    text = " ".join(l.strip().lstrip("/*").strip() for l in func_text("call_ptr").split("\n"))
+    for want in ("see split_func and %s and %s, data %s at" % (GET_VALUE, FOO_INIT, G_THING),
+                 "No symbol: no_such_symbol", "run it, links"):
+        check("annotation rendered: %s" % want, want in text, text[:600])
+    thing = int(val("(unsigned long)&%s" % Q(G_THING)))
+    check("address annotation rendered", re.search(r"\bat 0*%x," % thing, text) is not None, text[:600])
+    check("annotations wrapped over lines rendered", text.count("two words") == 10, text)
     # prototypes the exporter writes itself keep pointer declarators
     m = re.search(r"shape_skipme\(([^)]*)\)", csrc)
     check("written prototype keeps pointer types", m is not None and re.search(r"char \*\s*s\b", m.group(1))

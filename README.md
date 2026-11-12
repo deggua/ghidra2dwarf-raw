@@ -347,6 +347,13 @@ code.
   or in stack slots) are exported with that storage. If a function fails to
   decompile, the `.c` file gets its prototype and the error, and the function
   still has symbols, ranges, CFI and a line-table entry.
+* **Comments**: the comments the decompiler shows (per your decompiler
+  options) are in the `.c` files, with Ghidra's annotations rendered the way
+  the listing displays them: `{@sym 00123456}` / `{@symbol name}` as the
+  symbol's name (its exported name, so it is what you type in GDB, also with
+  `sanitize_names`), `{@address ...}` as the address, `{@url "..." text}`,
+  `{@program ...}`, `{@variable ...}` and `{@execute "..." text}` as their
+  display text. An unknown symbol shows as `No symbol: name`, as in Ghidra.
 * **Line table**: each decompiled line is mapped to the instructions behind its
   tokens. The frame setup maps to the signature line, and the first body
   instruction carries `prologue_end`, so `break func` stops before any argument
@@ -612,7 +619,9 @@ The edge-case module (`firmware/edge.c`, `edge_asm.S`, `ghidra_setup_edge.py`,
   inside `_restgpr_29_x`), a return address parked in r30,
   and an exception handler that leaves through a shared `rfi` exit;
 * a memory map without the X flag (ppc32-linux);
-* alias labels on a function and on data items.
+* alias labels on a function and on data items;
+* a comment with Ghidra annotations (by address and by name, namespaced,
+  data, unknown, URLs wrapped over several comment lines).
 
 **Differential unwinding test** (`test/difftrace.py`): the firmware is
 single-stepped twice from the same point (5,000 instructions from
