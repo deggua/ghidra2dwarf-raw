@@ -21,7 +21,7 @@ import time
 
 from java.io import StringWriter
 from ghidra.app.decompiler import (DecompInterface, DecompileOptions, ClangFuncNameToken,
-                                   ClangCommentToken)
+                                   ClangCommentToken, ClangLabelToken)
 from ghidra.app.decompiler.component import DecompilerUtils
 try:
     from ghidra.app.decompiler import ClangCaseToken
@@ -559,9 +559,14 @@ class TypeBuilder(object):
 # ----------------------------------------------------------------------------
 
 class Exporter(object):
-    def __init__(self, program, monitor, out_dir, options=None):
+    def __init__(self, program, monitor, out_dir, options=None, tool=None):
         self.program = program
         self.monitor = monitor
+        # The tool (CodeBrowser) when run from the GUI: its decompiler display
+        # options (line width, which comments, comment style, ...) shape the
+        # C files the way the Decompiler window shows the code.
+        self.tool = tool
+        self._dec_opts = None
         self.opts = options or Options()
         self.out_dir = os.path.abspath(out_dir)
         base = self.opts.basename or _sanitize_basename(str(program.getName()))
@@ -665,6 +670,7 @@ class Exporter(object):
         self._write_types_header()
         self._export_functions()
         self._export_globals()
+        self._export_equates()
         if self.opts.all_types:
             self._export_all_types()
         self.types.flush()
@@ -949,7 +955,10 @@ class Exporter(object):
         decompiler wraps long comments at spaces, so an annotation can start
         on one comment line and end on the next: it is carried over."""
         if self._ann_carry:
-            text = self._ann_carry + text.lstrip()
+            rest = text.lstrip()
+            if rest.startswith("//"):             # ("Comment style": C++)
+                rest = rest[2:].lstrip()
+            text = self._ann_carry + rest
             self._ann_carry = ""
         out = []
         i = 0
@@ -1013,11 +1022,23 @@ class Exporter(object):
         return None
 
     # -- functions --------------------------------------------------------------
+    def _decompile_options(self):
+        """The decompiler options: the tool's (as the Decompiler window
+        uses them) when there is one, else Ghidra's defaults with the
+        program's settings. Read once, on the main thread."""
+        if self._dec_opts is None:
+            opts = DecompileOptions()
+            if self.tool is not None:
+                opts.grabFromToolAndProgram(self.tool.getOptions("Listing Fields"),
+                                            self.tool.getOptions("Decompiler"), self.program)
+            else:
+                opts.grabFromProgram(self.program)
+            self._dec_opts = opts
+        return self._dec_opts
+
     def _decompiler(self):
         ifc = DecompInterface()
-        opts = DecompileOptions()
-        opts.grabFromProgram(self.program)
-        ifc.setOptions(opts)
+        ifc.setOptions(self._decompile_options())
         ifc.toggleCCode(True)
         ifc.toggleSyntaxTree(True)
         ifc.setSimplificationStyle("decompile")
@@ -1088,6 +1109,7 @@ class Exporter(object):
         import collections
         import concurrent.futures
         import threading
+        self._decompile_options()     # (read the tool options here, not in a worker)
         n = int(self.opts.decompile_threads)
         if n < 0:
             try:
@@ -1267,6 +1289,7 @@ class Exporter(object):
         self._var_dies = []      # (die, name, is_param): declaration lines added once placed
         self._code_decls = {}
         self._ann_carry = ""
+        self._labels = []        # (name as in the C, address, line in the function text)
         base = len(flines)  # line N of the function text -> base + N
 
         if markup is None or hf is None:
@@ -1318,9 +1341,16 @@ class Exporter(object):
             claims = {}
             call_claims = {}
             sig_line = None
+            carry_at = None
             for cl in lines:
                 toks = cl.getAllTokens().toArray()   # (one Java array: no per-element iterator calls)
+                if self._ann_carry and not any(isinstance(t, ClangCommentToken) for t in toks):
+                    # the comment ended with an annotation still open: as is
+                    flines[carry_at] += " " + self._ann_carry.rstrip()
+                    self._ann_carry = ""
                 text = str(cl.getIndentString()) + "".join(self._token_text(t) for t in toks)
+                if self._ann_carry:
+                    carry_at = len(flines)
                 if self.qualified_renames and "::" in text:
                     # the decompiler emits "Ns::name" as several tokens
                     for q, new in self.qualified_renames:
@@ -1328,12 +1358,19 @@ class Exporter(object):
                             text = text.replace(q, new)
                 flines.append(text)
                 gline = base + int(cl.getLineNumber())
+                shown = [t for t in toks if str(t.getText()).strip()]
+                if (len(shown) == 2 and isinstance(shown[0], ClangLabelToken) and str(shown[1].getText()) == ":"
+                        and shown[0].getMinAddress() is not None and self.in_space(shown[0].getMinAddress())):
+                    self._labels.append((self._token_text(shown[0]), int(shown[0].getMinAddress().getOffset()),
+                                         gline))
                 for tok in toks:
                     if sig_line is None and isinstance(tok, ClangFuncNameToken):
                         sig_line = gline
-                    if isinstance(tok, ClangCommentToken) or (ClangCaseToken and isinstance(tok, ClangCaseToken)):
+                    if isinstance(tok, (ClangCommentToken, ClangLabelToken)) or (
+                            ClangCaseToken and isinstance(tok, ClangCaseToken)):
                         # "/* WARNING: ... */" comments carry addresses too; a
-                        # "case N:" label carries its case's first operation
+                        # "case N:" label carries its case's first operation,
+                        # a label (and "goto label") its target's
                         continue
                     a = tok.getMinAddress()
                     if a is None or not self.in_space(a):
@@ -1342,6 +1379,9 @@ class Exporter(object):
                     if isinstance(tok, ClangFuncNameToken) and gline != sig_line:
                         # the callee's name in a call: the call's line
                         call_claims.setdefault(int(a.getOffset()), gline)
+            if self._ann_carry:
+                flines[carry_at] += " " + self._ann_carry.rstrip()
+                self._ann_carry = ""
             # An address several lines claim gets the lowest one -- except a
             # shared epilogue the decompiler duplicated into several "return"
             # lines: that is the function's closing "}" (as with GCC), since
@@ -1408,6 +1448,7 @@ class Exporter(object):
         sig_line += off
         addr_lines = dict((a, l + off) for a, l in addr_lines.items())
         self._add_decl_lines(flines, sig_line, off, cfile["file_no"])
+        self._add_labels(die, self._labels, off, cfile["file_no"], ranges)
         die.add(C.DW_AT_decl_file, C.DW_FORM_udata, cfile["file_no"])
         die.add(C.DW_AT_decl_line, C.DW_FORM_udata, sig_line)
 
@@ -1588,6 +1629,52 @@ class Exporter(object):
             params.append("...")
         return "%s %s(%s)" % (tn(func.getReturnType()), self.nm(_qualified(func)),
                               ", ".join(params) if params else "void")
+
+    def _export_equates(self):
+        """Equates (named constants set on operands) appear by name in the
+        decompiled code: enumerators of an anonymous enum make the names
+        usable in GDB expressions. Left out: equates based on an enum type
+        (the decompiler prints the enum's member names, exported with the
+        type), names that are literals ("Convert": 0x64, 'd', -5), and names
+        of other global symbols."""
+        st = self.program.getSymbolTable()
+        found = []
+        for e in self.program.getEquateTable().getEquates():
+            name = str(e.getName())
+            try:
+                if e.isEnumBased():
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+            if not name or not (name[0].isalpha() or name[0] == "_"):
+                continue
+            if list(st.getGlobalSymbols(name)):
+                continue
+            found.append((name, int(e.getValue())))
+        if not found:
+            return
+        die = self.dw.cu.child(C.DW_TAG_enumeration_type)
+        die.add(C.DW_AT_byte_size, C.DW_FORM_udata, 8)
+        under = self.types.base_of_size(8, True)
+        if under is not None:
+            die.add(C.DW_AT_type, C.DW_FORM_ref4, under)
+        for name, value in sorted(found):
+            e = die.child(C.DW_TAG_enumerator)
+            self.dw.name(e, name)
+            e.add(C.DW_AT_const_value, C.DW_FORM_sdata, value)
+        self.stats["equates"] = len(found)
+
+    def _add_labels(self, die, labels, off, file_no, ranges):
+        """DW_TAG_label for the labels the C shows (goto targets: the user's
+        name or LAB_<address>), so "break func:label" works."""
+        for name, addr, line in labels:
+            if not any(lo <= addr < hi for lo, hi in ranges):
+                continue
+            lab = die.child(C.DW_TAG_label)
+            self.dw.name(lab, name, raw=True)
+            lab.add(C.DW_AT_decl_file, C.DW_FORM_udata, file_no)
+            lab.add(C.DW_AT_decl_line, C.DW_FORM_udata, line + off)
+            lab.add(C.DW_AT_low_pc, C.DW_FORM_addr, self.A(addr))
 
     def _add_decl_lines(self, flines, sig_line, off, file_no):
         """DW_AT_decl_file/line for the function's variables: parameters on

@@ -333,6 +333,23 @@ int shape_switch(int op, int x)
     return x;
 }
 
+/* a jump into a loop body (irreducible): the decompiler prints a goto and
+   a label */
+int shape_goto(int n)
+{
+    int s = 0;
+
+    if (n & 1)
+        goto mid;
+    while (n > 0) {
+        s += n;
+mid:
+        s ^= shape_leaf(n);
+        n -= 2;
+    }
+    return s;
+}
+
 void shapes_main(void)
 {
     int i;
@@ -365,4 +382,5 @@ void shapes_main(void)
     g_shape_sink = shape_phi3(g_shape_arr, 3);
     for (i = 0; i < 8; i++)
         g_shape_sink = shape_switch(i, i + 10);
+    g_shape_sink = shape_goto(5);
 }

@@ -81,6 +81,12 @@ GUI; defaults in `dwarfexport/ghidra_export.py:Options`):
 | `decompile_threads` | `-1` | Decompiler worker threads; `-1` = min(8, CPUs - 1), `1` = decompile serially. |
 | `irq_signal_frame` | `true` | Mark interrupt/exception handler frames as signal frames, see [Interrupt and exception handlers](#interrupt-and-exception-handlers). |
 
+The `.c` files are laid out the way the Decompiler window shows the code:
+run from the GUI, the export uses the CodeBrowser's decompiler display
+options (*Edit → Tool Options → Decompiler → Display*: line width, which
+comments to show, comment style, brace style, ...). Headless runs have no
+tool, so they use Ghidra's defaults.
+
 Re-export (and `symbol-file` again in GDB) whenever you change annotations.
 Don't edit the `.c` files: the line table points at their exact line numbers.
 
@@ -347,6 +353,14 @@ code.
   or in stack slots) are exported with that storage. If a function fails to
   decompile, the `.c` file gets its prototype and the error, and the function
   still has symbols, ranges, CFI and a line-table entry.
+* **Labels**: the labels the decompiled code shows (`goto` targets, with
+  your name or the decompiler's, such as `LAB_<address>`) are DWARF labels,
+  so `break func:label` works.
+* **Equates**: enumerators of an anonymous enum, so the names the
+  decompiled code uses are usable in GDB expressions (`p x == MY_LIMIT`).
+  Equates based on an enum type print as the enum's members, which are
+  exported with the type; equate names that are literals (from *Convert*:
+  `0x64`, `'d'`) and names of other global symbols are left out.
 * **Comments**: the comments the decompiler shows (per your decompiler
   options) are in the `.c` files, with Ghidra's annotations rendered the way
   the listing displays them: `{@sym 00123456}` / `{@symbol name}` as the
@@ -621,7 +635,14 @@ The edge-case module (`firmware/edge.c`, `edge_asm.S`, `ghidra_setup_edge.py`,
 * a memory map without the X flag (ppc32-linux);
 * alias labels on a function and on data items;
 * a comment with Ghidra annotations (by address and by name, namespaced,
-  data, unknown, URLs wrapped over several comment lines).
+  data, unknown, URLs wrapped over several comment lines);
+* a named label on a `goto` target and default `LAB_` labels
+  (`break func:label`), and equates (in code, unused, literal-named, named
+  like a global).
+
+The GUI check also runs the script's `main()` down its GUI path with a
+stand-in tool whose decompiler options set a 50-character line width, C++
+comments and end-of-line comments, and checks the C files follow them.
 
 **Differential unwinding test** (`test/difftrace.py`): the firmware is
 single-stepped twice from the same point (5,000 instructions from

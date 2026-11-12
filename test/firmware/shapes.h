@@ -57,4 +57,5 @@ uint64_t shape_keepll(int a);
 float shape_keepf(int a);
 int shape_phi3(int *p, int n);
 int shape_switch(int op, int x);
+int shape_goto(int n);
 void shapes_main(void);

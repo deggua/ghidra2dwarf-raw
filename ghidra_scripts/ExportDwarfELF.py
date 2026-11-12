@@ -137,7 +137,9 @@ def main():
             except CancelledException:
                 print("Export cancelled.")
                 return
-    Exporter(currentProgram, monitor, out_dir, opts).run()
+    # (in the GUI, the CodeBrowser's decompiler display options shape the C)
+    tool = None if isRunningHeadless() else getState().getTool()
+    Exporter(currentProgram, monitor, out_dir, opts, tool=tool).run()
 
 
 main()

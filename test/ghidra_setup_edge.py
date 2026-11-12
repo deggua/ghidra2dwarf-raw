@@ -363,6 +363,45 @@ def annotated_comment():
     listing.setComment(call.getAddress(), CommentType.PRE, text)
 report("annotated comment", annotated_comment)
 
+# --- a named label on a goto target (shapes.c shape_goto) -------------------------
+def goto_label():
+    from ghidra.app.decompiler import ClangLabelToken, DecompInterface
+    from ghidra.app.decompiler.component import DecompilerUtils
+    f = fm.getFunctionAt(A("shape_goto"))
+    ifc = DecompInterface()
+    ifc.openProgram(prog)
+    try:
+        res = ifc.decompileFunction(f, 60, monitor)
+        labels = [t for cl in DecompilerUtils.toLines(res.getCCodeMarkup()) for t in cl.getAllTokens().toArray()
+                  if isinstance(t, ClangLabelToken) and t.getMinAddress() is not None]
+    finally:
+        ifc.dispose()
+    if not labels:
+        print("EDGE skipped: goto label (no label in the decompiled shape_goto)")
+        return
+    st.createLabel(labels[0].getMinAddress(), "mid_loop", f, USER)
+report("named goto label", goto_label)
+
+
+# --- equates: on shape_phi3's "s > 100" compare, one unused, a literal name
+# ("Convert"), one named like a global ------------------------------------------
+def equates():
+    eqt = prog.getEquateTable()
+    f = fm.getFunctionAt(A("shape_phi3"))
+    done = False
+    for ins in listing.getInstructions(f.getBody(), True):
+        for op in range(ins.getNumOperands()):
+            sc = ins.getScalar(op)
+            if sc is not None and sc.getValue() in (100, 101) and not done:
+                eqt.createEquate("PHI_LIMIT", sc.getValue()).addReference(ins.getAddress(), op)
+                done = True
+    if not done:
+        print("EDGE skipped: equate (no 100/101 operand in shape_phi3)")
+    eqt.createEquate("UNUSED_EQ", -7)
+    eqt.createEquate("0x7b", 123)
+    eqt.createEquate("g_counter", 99)
+report("equates", equates)
+
 # --- memory map without the X flag (hand-made by the analyst) ---------------------
 if _LAYOUT.get("noexec_blocks"):
     def noexec():

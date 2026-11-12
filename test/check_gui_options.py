@@ -6,6 +6,7 @@
 # @runtime PyGhidra
 
 import os
+import re
 import sys
 
 from java.io import File
@@ -86,4 +87,54 @@ check("output directory returned", os.path.abspath(out) == os.path.abspath(scrat
 check("edits applied", (opts.decompile_timeout, opts.address_offset, opts.c_max_lines, opts.embed_bytes)
       == (30, 0x1000, 5000, True), vars(opts))
 check("empty basename keeps the default", opts.basename is None, opts.basename)
+
+# --- main() in the GUI: the export follows the tool's decompiler display
+# options (line width, which comments, comment style), as the Decompiler
+# window shows the code
+import glob
+
+from ghidra.app.decompiler import DecompileOptions
+from ghidra.framework.options import ToolOptions
+from ghidra.program.model.listing import CommentType
+
+fields, dec = ToolOptions("Listing Fields"), ToolOptions("Decompiler")
+DecompileOptions().registerOptions(fields, dec, currentProgram)
+WIDTH = 50
+dec.setInt("Display.Maximum characters in a code line", WIDTH)
+dec.setBoolean("Display.Display EOL comments", True)
+dec.setEnum("Display.Comment style", DecompileOptions.CommentStyleEnum.CPPStyle)
+
+
+class FakeTool(object):
+    def getOptions(self, name):
+        return fields if name == "Listing Fields" else dec
+
+
+class FakeState(object):
+    def getTool(self):
+        return FakeTool()
+
+
+f = [g for g in currentProgram.getFunctionManager().getFunctions(True) if g.getName() == "sensor_update"][0]
+ins = list(currentProgram.getListing().getInstructions(f.getBody(), True))
+currentProgram.getListing().setComment(ins[len(ins) // 2].getAddress(), CommentType.EOL,
+                                       "eol note on {@sym sensor_update} done")
+ns.update(isRunningHeadless=lambda: False, getState=lambda: FakeState(), getScriptArgs=lambda: [])
+ns["main"]()
+srcs = sorted(glob.glob(os.path.join(scratch, "*.src", "*.c")))
+check("GUI export wrote C files", srcs, os.listdir(scratch))
+text = "\n".join(open(p_, encoding="utf-8").read() for p_ in srcs)
+lines = text.split("\n")
+# (the comment is wrapped at the line width: read its lines together)
+comments = re.sub(r"(//[^\n]*)\n\s*// ", r"\1 ", text)
+while comments != re.sub(r"(//[^\n]*)\n\s*// ", r"\1 ", comments):
+    comments = re.sub(r"(//[^\n]*)\n\s*// ", r"\1 ", comments)
+check("tool option: EOL comments shown, annotation rendered",
+      re.search(r"//.*eol note on sensor_update done", comments) is not None,
+      [l for l in lines if "eol note" in l])
+check("tool option: C++ comment style", any(l.strip().startswith("// WARNING") for l in lines)
+      and not any(l.strip().startswith("/* WARNING") for l in lines), [l for l in lines if "WARNING" in l][:3])
+code = [l for l in lines if l.strip() and not l.strip().startswith(("//", "/* ----"))]
+long_ = [l for l in code if len(l) > WIDTH]
+check("tool option: line width", len(long_) <= len(code) // 50, long_[:5])
 print("GUI SUMMARY %d passed, %d failed" % (results.count(True), results.count(False)))

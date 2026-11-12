@@ -13,6 +13,7 @@ DW_TAG_subroutine_type = 0x15
 DW_TAG_typedef = 0x16
 DW_TAG_union_type = 0x17
 DW_TAG_unspecified_parameters = 0x18
+DW_TAG_label = 0x0a
 DW_TAG_variable = 0x34
 DW_TAG_subrange_type = 0x21
 DW_TAG_base_type = 0x24

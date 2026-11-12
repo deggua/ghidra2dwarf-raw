@@ -348,6 +348,50 @@ def check_shapes_3():
         check("switch op=%d: case labels have no code" % k, not labels, labels)
 
 
+def check_shapes_4():
+    """Labels and equates."""
+    # a label the C shows (a goto target) is a DWARF label: "break func:label"
+    if re.search(r"^\s*mid_loop:\s*$", func_text("shape_goto"), re.M):
+        lab = line_of(r"^\s*mid_loop:\s*$", line_of(r"/\* ---- shape_goto @"))
+        f = cont_to("shape_goto:mid_loop")
+        check("break func:label stops in the function", f.name() == "shape_goto", f.name())
+        sal = f.find_sal()
+        check("label stop shows a statement, not the label line", sal.line != lab and source_line(sal).strip(),
+              (sal.line, source_line(sal)))
+    else:
+        print("SKIP named label (no mid_loop label in the decompiled shape_goto)")
+    # default LAB_<address> labels resolve to their address
+    default = None
+    for m in re.finditer(r"/\* ---- (\w+) @ [0-9a-f]+ ---- \*/(.*?)(?=/\* ---- |\Z)", all_source_text(), re.S):
+        lm = re.search(r"^\s*(LAB_([0-9a-f]+)):\s*$", m.group(2), re.M)
+        if lm:
+            default = (m.group(1), lm.group(1), int(lm.group(2), 16))
+            break
+    if default is None:
+        print("SKIP default LAB_ label (none in the C files)")
+    else:
+        try:
+            sals = gdb.decode_line("%s:%s" % default[:2])[1] or []
+        except gdb.error as e:
+            sals = []
+            print("decode_line: %s" % e)
+        check("break func:LAB_<address> resolves to the label", any(int(x.pc) == default[2] for x in sals),
+              (default, [hex(int(x.pc)) for x in sals]))
+
+    # equates are usable by name in expressions
+    if "PHI_LIMIT" in func_text("shape_phi3"):
+        try:
+            v = int(val("PHI_LIMIT"))
+        except gdb.error as e:
+            v = str(e)
+        check("equate in the C is known to GDB", v in (100, 101), v)
+    else:
+        print("SKIP equate in code (shape_phi3 doesn't use PHI_LIMIT)")
+    check_eq("unused equate", "UNUSED_EQ", -7)
+    out = run("ptype g_counter")
+    check("an equate named like a global doesn't shadow it", "enum" not in out, out)
+
+
 def main():
     setup_session()
 
@@ -504,6 +548,7 @@ def main():
     check_shapes()
     check_shapes_2()
     check_shapes_3()
+    check_shapes_4()
 
     # --- globals at the end ----------------------------------------------------------
     cont_to("edge_done")
