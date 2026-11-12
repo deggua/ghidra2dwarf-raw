@@ -48,14 +48,17 @@ def job(target, opt, sanitized, work, verbose):
         fail("build: %s" % e)
         return report
     out_dir = os.path.join(work, name)
-    opts = ["skip_decompile=bad?func"] + (["sanitize_names=true"] if sanitized else [])
+    # The sanitized-names runs also split the pseudo-C into many small files,
+    # so all GDB checks run against a multi-file export.
+    split = ["c_max_lines=%d" % SPLIT_LINES, "c_max_bytes=%d" % SPLIT_BYTES]
+    opts = ["skip_decompile=bad?func"] + (["sanitize_names=true"] + split if sanitized else [])
     ok, notes, text = export_fw.export(build, out_dir, opts)
     report["lines"] += [n for n in notes if not n.startswith("ghidra2dwarf-raw: wrote")]
     if not ok:
         fail("export (see %s/ghidra.log)" % out_dir)
         return report
     elf = os.path.join(out_dir, "out", "fw.bin.elf")
-    csrc = os.path.join(out_dir, "out", "fw.bin.c")
+    csrc = os.path.join(out_dir, "out", "fw.bin.src")
     r = subprocess.run(["llvm-dwarfdump", "--verify", elf], capture_output=True, text=True)
     if "No errors." not in r.stdout:
         fail("llvm-dwarfdump --verify:\n" + r.stdout[-2000:])
@@ -66,6 +69,11 @@ def job(target, opt, sanitized, work, verbose):
         report["counts"]["serial"] = "ok" if same else "differs"
         if not same:
             fail("serial export (decompile_threads=1) differs: " + why)
+    if sanitized:
+        why = check_split(os.path.join(out_dir, "out", "fw.bin.src"))
+        report["counts"]["split"] = why or "ok"
+        if why:
+            fail("split C files: " + why)
     rt_ok, rt_diffs = roundtrip.roundtrip(out_dir, sanitized)
     report["counts"]["rt"] = "ok" if rt_ok else "%d diffs" % len(rt_diffs)
     if not rt_ok:
@@ -101,15 +109,41 @@ def job(target, opt, sanitized, work, verbose):
     return report
 
 
+SPLIT_LINES = 300
+SPLIT_BYTES = 20000
+
+
+def check_split(src):
+    """Several .c files, each within the limits unless it holds a single
+    (oversized) function, plus the types header."""
+    names = sorted(n for n in os.listdir(src) if n.endswith(".c"))
+    if len(names) < 2:
+        return "expected several .c files, got %s" % names
+    if not any(n.endswith(".types.h") for n in os.listdir(src)):
+        return "no types header"
+    for n in names:
+        with open(os.path.join(src, n), "rb") as f:
+            data = f.read()
+        lines = data.count(b"\n")
+        funcs = data.count(b"/* ---- ")
+        if (lines > SPLIT_LINES or len(data) > SPLIT_BYTES) and funcs > 1:
+            return "%s has %d lines / %d bytes with %d functions" % (n, lines, len(data), funcs)
+        if funcs == 0:
+            return "%s has no functions" % n
+    return None
+
+
 def serial_matches(build, out_dir, opts):
     sdir = out_dir + "-serial"
     ok, _, _ = export_fw.export(build, sdir, list(opts) + ["decompile_threads=1"])
     if not ok:
         return False, "serial export failed (see %s/ghidra.log)" % sdir
     a, b = os.path.join(out_dir, "out"), os.path.join(sdir, "out")
-    with open(os.path.join(a, "fw.bin.c"), "rb") as f1, open(os.path.join(b, "fw.bin.c"), "rb") as f2:
-        if f1.read() != f2.read():
-            return False, "fw.bin.c"
+    for name in sorted(os.listdir(os.path.join(a, "fw.bin.src"))):
+        with open(os.path.join(a, "fw.bin.src", name), "rb") as f1, \
+                open(os.path.join(b, "fw.bin.src", name), "rb") as f2:
+            if f1.read() != f2.read():
+                return False, name
     for sec in ("--debug-info", "--debug-loc", "--debug-frame", "--debug-line", "--symbols"):
         outs = []
         for d in (a, b):
@@ -160,6 +194,25 @@ def main():
             results[rep["name"]] = rep
             print_report(rep)
 
+    # the GUI options dialog (headless, with askValues stubbed), once
+    proj = next((os.path.join(work, n, "project") for n in sorted(results)
+                 if os.path.isdir(os.path.join(work, n, "project"))), None)
+    if proj is not None:
+        ghidra = os.environ.get("GHIDRA_INSTALL_DIR", os.path.join(os.path.dirname(REPO), "ghidra_12.2_PUBLIC"))
+        scratch = os.path.join(work, "gui-check")
+        os.makedirs(scratch, exist_ok=True)
+        r = subprocess.run([os.path.join(ghidra, "support", "pyghidraRun"), "-H", proj, "fwtest", "-process",
+                            "fw.bin", "-noanalysis", "-readOnly", "-postScript",
+                            os.path.join(HERE, "check_gui_options.py"), scratch],
+                           input="y\n", capture_output=True, text=True)
+        summary = [l for l in r.stdout.splitlines() if l.startswith("GUI SUMMARY")]
+        gui_ok = bool(summary) and " 0 failed" in summary[0]
+        all_ok &= gui_ok
+        print("=== GUI options dialog: %s" % (summary[0][len("GUI SUMMARY "):] if summary else "no result"))
+        for l in r.stdout.splitlines():
+            if l.startswith("GUI FAIL") or "Traceback" in l:
+                print("  " + l)
+
     print("\n=== summary")
     for name in sorted(results):
         rep = results[name]
@@ -169,6 +222,7 @@ def main():
             rep["counts"].get("edge", "-"),
             " feat: " + rep["counts"].get("feat", "-") + " rt: " + rep["counts"].get("rt", "-")
             + " diff: " + ("ok" if rep["counts"].get("diff") == "ok" else rep["counts"].get("diff", "-"))
+            + ((" split: " + rep["counts"]["split"]) if "split" in rep["counts"] else "")
             + ((" irq: " + rep["counts"]["irq"]) if "irq" in rep["counts"] else "")))
     print("ALL TESTS PASSED" if all_ok else "SOME TESTS FAILED")
     return 0 if all_ok else 1

@@ -8,8 +8,9 @@ A PyGhidra script exports a Ghidra program as:
 
 | File | Contents |
 |------|----------|
-| `<name>.c`   | pseudo-C: the decompiler output of every function (optionally preceded by the program's data types as C) |
-| `<name>.elf` | an ELF *symbol file*: sections mirroring the program's memory map, a symbol table, and DWARF 4 debug info whose line table points into `<name>.c` |
+| `<name>.src/<name>.0.c`, `.1.c`, ... | pseudo-C: the decompiler output of every function, split into files of at most 1 MB / 100,000 lines (`c_max_bytes`, `c_max_lines`) |
+| `<name>.src/<name>.types.h` | the program's data types as C (included by the `.c` files) |
+| `<name>.elf` | an ELF *symbol file*: sections mirroring the program's memory map, a symbol table, and DWARF 4 debug info whose line table points into the `.c` files |
 
 Load the ELF into GDB while attached to the real target or an emulator (QEMU),
 and `break`, `list`, `next`, `step`, `finish`, `bt`, `up`, `info locals`,
@@ -49,8 +50,9 @@ no native dependencies: the DWARF and ELF writers are pure Python.
 
 ## Export
 
-**GUI:** run `ExportDwarfELF.py` (category *DWARF*) and pick an output
-directory.
+**GUI:** run `ExportDwarfELF.py` (category *DWARF*). A dialog asks for the
+output directory and every option below, prefilled with the defaults (and
+rejects invalid values before it closes).
 
 **Headless:**
 
@@ -59,26 +61,28 @@ $GHIDRA/support/pyghidraRun -H <project dir> <project name> -process <program> -
     -postScript ghidra2dwarf-raw/ghidra_scripts/ExportDwarfELF.py <out dir> [key=value ...]
 ```
 
-Options (`key=value` script arguments in headless mode; defaults in
-`dwarfexport/ghidra_export.py:Options` for the GUI):
+Options (`key=value` script arguments in headless mode, the dialog in the
+GUI; defaults in `dwarfexport/ghidra_export.py:Options`):
 
 | Option | Default | Meaning |
 |--------|---------|---------|
 | `address_offset` | `0` | Added to every address. Use it if the Ghidra image base differs from where the code runs. |
 | `embed_bytes` | `false` | Store the initialized memory blocks' bytes in the ELF (PROGBITS), for offline `objdump`/`gdb disassemble`. Otherwise they're NOBITS placeholders. |
 | `cfi` | `true` | Generate `.debug_frame` (call frame info) from p-code. |
-| `types_header` | `true` | Put the program's data types (as C) at the top of the `.c` file. |
+| `types_header` | `true` | Write the program's data types as C to `<name>.types.h`, included by the `.c` files. |
+| `c_max_bytes` | `1000000` | Start a new `.c` file when the next function would make the current one larger than this (0 = no limit). Functions are never split, so a single larger function gets a file of its own. |
+| `c_max_lines` | `100000` | The same limit in lines. |
 | `all_types` | `true` | Emit DWARF for every struct/union/enum/typedef, not only the ones in use (so `ptype`/casts work for all of them). |
 | `decompile_timeout` | `60` | Per-function decompiler timeout, in seconds. |
 | `basename` | program name | Output file base name. |
-| `sanitize_names` | `false` | Rewrite every name into a plain C identifier (`Get?Value` → `Get_Value`, `Foo::init` → `Foo__init`, a variable named `switch` → `switch_`), consistently in the DWARF, the ELF symbols and the `.c` file. See [Names](#names). |
+| `sanitize_names` | `false` | Rewrite every name into a plain C identifier (`Get?Value` → `Get_Value`, `Foo::init` → `Foo__init`, a variable named `switch` → `switch_`), consistently in the DWARF, the ELF symbols and the source files. See [Names](#names). |
 | `skip_decompile` | | Comma-separated function names (or entry addresses) not to decompile, e.g. ones that hang the decompiler. They still get symbols, address ranges, CFI and a one-line prototype. |
 | `elf_flags` | `-1` (auto) | ELF header `e_flags`. By default derived from the language and compiler spec (ARM EABI5, BE8 and float ABI; MIPS o32/n32/o64/EABI/n64 and ISA; PPC64 ELFv1/ELFv2). GDB uses it to pick the ABI. |
 | `decompile_threads` | `-1` | Decompiler worker threads; `-1` = min(8, CPUs - 1), `1` = decompile serially. |
 | `irq_signal_frame` | `true` | Mark interrupt/exception handler frames as signal frames, see [Interrupt and exception handlers](#interrupt-and-exception-handlers). |
 
 Re-export (and `symbol-file` again in GDB) whenever you change annotations.
-Don't edit the `.c` file: the line table points at its exact line numbers.
+Don't edit the `.c` files: the line table points at their exact line numbers.
 
 ## Debug
 
@@ -103,15 +107,32 @@ $1 = {name = "temp\000\000\000", id = 257, flags = 17 '\021', enabled = 1 '\001'
 #4  0xfff00124 in _reset () at fw.bin.c:89
 ```
 
-GDB finds the `.c` file through the absolute output directory recorded in the
-DWARF (`DW_AT_comp_dir`). If you move the files, use
-`set substitute-path <old dir> <new dir>` or `directory <new dir>`.
+GDB finds the `.c` files through the absolute output directory recorded in
+the DWARF (`DW_AT_comp_dir`). If you move them, use
+`set substitute-path <old dir> <new dir>` or `directory <new dir>/<name>.src`.
+
+### Large programs
+
+GDB highlights a whole source file the first time it shows a line of it.
+That's why the pseudo-C is split: listing a line of the 7.3 MB single file
+from the glibc export took 4.7 s, and of a 1 MB part 0.7 s (once per file
+per session). Lower `c_max_bytes` if that's still too slow, or
+`set style sources off` in GDB.
+
+An index (`gdb-add-index`) doesn't help: the export is a single compile unit
+that GDB reads in about 0.1 s for glibc, with or without the index. If you
+want one anyway, `gdb-add-index` needs tools that know the target, else it
+fails with *objcopy: Unable to recognise the format of the input file*:
+
+```sh
+GDB=gdb-multiarch OBJCOPY=powerpc-linux-gnu-objcopy gdb-add-index <name>.elf
+```
 
 ## Names
 
 Ghidra allows names that aren't C identifiers (`Get?Value`, `field?1`,
 `Foo::init`, `operator<<`, names with spaces, non-ASCII). By default they are
-exported verbatim, so the DWARF, the `.c` file and the Ghidra database all
+exported verbatim, so the DWARF, the `.c` files and the Ghidra database all
 agree. GDB handles them as follows:
 
 * Breakpoint locations need no quoting: `break Get?Value`, `break Foo::init`.
@@ -291,7 +312,7 @@ code.
 * **Global variables**: every defined data item with a name, with its type.
 * **Functions**: name, address range(s) (non-contiguous bodies use
   `DW_AT_ranges`), return type, varargs, and the decompiler's parameters and
-  locals under the names used in the `.c` file. Custom-storage parameters
+  locals under the names used in the `.c` files. Custom-storage parameters
   (e.g. a struct or bitfield value in a register, split over two registers,
   or in stack slots) are exported with that storage. If a function fails to
   decompile, the `.c` file gets its prototype and the error, and the function
@@ -435,6 +456,8 @@ test/
     ghidra_setup_edge.py  Ghidra-only annotations for the edge cases
     ghidra_setup_irq.py   INTERRUPT tag / entry points for the exception vectors
     roundtrip.py       re-imports the exported ELF into Ghidra (DWARF only) and diffs it
+    difftrace.py, gdb_trace.py  unwinding at every instruction vs GCC's own CFI
+    check_gui_options.py  the GUI options dialog, headless (askValues stubbed)
     ghidra_dump.py, ghidra_dwarf_only.py  helpers for the round trip
 ```
 
@@ -535,7 +558,11 @@ identical at every instruction (wherever GCC has CFI, i.e. outside
 hand-written assembly).
 
 All of it runs on all 20 targets at three `-O` levels, and with
-`sanitize_names=true`: 80 export-and-debug runs. (The ppc32 ROM must stay
+`sanitize_names=true`: 80 export-and-debug runs. The sanitized runs also
+split the pseudo-C into many small files (300 lines / 20 KB each), so every
+GDB check runs against a multi-file export too, and every -O1 export is
+repeated with `decompile_threads=1` and must be identical. The GUI options
+dialog is checked headless with `askValues` stubbed. (The ppc32 ROM must stay
 under 16 KB: QEMU's mac99 machine overwrites larger `-bios` images from
 0xfff04000 on; the build checks this.)
 

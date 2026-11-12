@@ -27,7 +27,7 @@ def main():
     out = run("ptype enum mode")
     check("ptype enum", "MODE_FAULT" in out and "MODE_CALIBRATE" in out, out)
     out = run("info line sensor_update")
-    check("info line maps into C file", os.path.basename(CSRC) in out, out)
+    check("info line maps into a C file", any(n in out for n in SRC_NAMES), out)
     check("reset frame has a symbol", gdb.selected_frame().name() == "_reset", gdb.selected_frame().name())
 
     # --- recursion: fact(5) -> ... -> fact(1) ----------------------------------

@@ -153,15 +153,15 @@ def main():
     setup_session()
 
     # --- names in the generated C match the DWARF names ---------------------
-    with open(CSRC, encoding="utf-8") as f:
-        csrc = f.read()
+    csrc = all_source_text()
     check("C file uses exported function name",
           re.search(r"int (?:__\w+ )?%s\(int %s\)" % (re.escape(GET_VALUE), re.escape(P_ARG)), csrc) is not None)
     check("C file uses exported namespaced name", "%s(10)" % FOO_INIT in csrc)
     check("C file uses exported type name", "struct %s" % THING_T in csrc)
     check("no unquotable quote left in C names", "it's" not in csrc)
     if SANITIZED:
-        check("sanitized C file has no '?' identifiers", re.search(r"\b\w+\?\w*\b", csrc.split("/* ---- Data types ---- */")[0]) is None)
+        m = re.search(r"\b\w+\?\w*\b", csrc)
+        check("sanitized C files have no '?' identifiers", m is None, m.group(0) if m else "")
 
     # --- name with '?': function + parameter -----------------------------------
     cont_to(GET_VALUE)  # breakpoint location syntax: no quoting needed
@@ -217,7 +217,7 @@ def main():
     rets = [l for l in body if re.match(r"^\s*return\b", l)]
     ret_text = rets[-1]
     ret_line = line_of("^" + re.escape(ret_text) + "$", start)
-    cont_to("%s:%d" % (os.path.basename(CSRC), ret_line))
+    cont_to(spec(ret_line))
     out = run("info locals")
     check("locals with '?' names listed", LOC in out, out)
     check("stack array local content", "abcdefg" in out, out)
@@ -254,7 +254,7 @@ def main():
         cont_to("call_ptr")
     else:
         call_line = line_of(r"\(\*pcVar\d+\)\(\);", line_of(r"^int (?:__\w+ )?call_ptr\("))
-        cont_to("%s:%d" % (os.path.basename(CSRC), call_line))
+        cont_to(spec(call_line))
         pc_var = m.group(1)
         out = run("ptype %s" % pc_var)
         check("code * is a function pointer", "(" in out and "*" in out, out)
@@ -357,7 +357,7 @@ def main():
     check_eq("duplicate type name A", "g_dupA.a2", 2)
     check_eq("duplicate type name B", "g_dupB.b1", 3)
     out = run("info line %s" % Q(BAD))
-    check("undecompilable function has line info", os.path.basename(CSRC) in out, out)
+    check("undecompilable function has line info", any(n in out for n in SRC_NAMES), out)
     check("skipped function in C file", "decompilation failed" in func_text(BAD), func_text(BAD)[:200])
 
 

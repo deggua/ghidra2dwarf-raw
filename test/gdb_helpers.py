@@ -109,7 +109,9 @@ def cont_to(bp_spec, cond=None):
         gdb.Breakpoint(spec, internal=True)
     run("continue")
     f = gdb.selected_frame()
-    if BACKSTOP and bp_spec not in BACKSTOP and f.find_sal().line == BACKSTOP_LINE[0]:
+    sal = f.find_sal()
+    if (BACKSTOP and bp_spec not in BACKSTOP and sal.line == BACKSTOP_LINE[0] and sal.symtab is not None
+            and os.path.basename(sal.symtab.filename) == os.path.basename(BACKSTOP_LINE[0].path)):
         raise RuntimeError("never reached %s (ran to the idle loop)" % bp_spec)
     return f
 
@@ -117,25 +119,79 @@ def cont_to(bp_spec, cond=None):
 BACKSTOP_LINE = []
 
 
+# CSRC is the exported source directory (<basename>.src): the pseudo-C is
+# split over <basename>.<N>.c files, the types are in <basename>.types.h.
+def _src_files():
+    if os.path.isfile(CSRC):
+        return [CSRC]
+    names = [n for n in os.listdir(CSRC) if n.endswith(".c")]
+    names.sort(key=lambda n: int(n.rsplit(".", 2)[-2]))
+    return [os.path.join(CSRC, n) for n in names]
+
+
+SRC_FILES = _src_files()
+SRC_NAMES = [os.path.basename(f) for f in SRC_FILES]
+_TEXT = {}
+
+
+def _read(path):
+    if path not in _TEXT:
+        with open(path, encoding="utf-8") as f:
+            _TEXT[path] = f.read()
+    return _TEXT[path]
+
+
+def all_source_text():
+    """All generated source text (C files and the types header)."""
+    paths = list(SRC_FILES)
+    if os.path.isdir(CSRC):
+        paths += [os.path.join(CSRC, n) for n in sorted(os.listdir(CSRC)) if n.endswith(".h")]
+    return "\n".join(_read(p) for p in paths)
+
+
+class Line(int):
+    """A line number in one of the generated C files (compares as int)."""
+
+    def __new__(cls, n, path):
+        o = int.__new__(cls, n)
+        o.path = path
+        return o
+
+    def __add__(self, k):
+        return Line(int(self) + k, self.path)
+
+    def __sub__(self, k):
+        return Line(int(self) - k, self.path)
+
+
+def spec(line):
+    """GDB location "file:line" for a Line."""
+    return "%s:%d" % (os.path.basename(line.path), line)
+
+
 def func_text(name):
-    """Decompiled text of a function in the C file."""
-    with open(CSRC) as f:
-        text = f.read()
-    m = re.search(r"/\* ---- %s @ [0-9a-f]+ ---- \*/(.*?)(?=/\* ---- |\Z)" % re.escape(name), text, re.S)
-    return m.group(1) if m else ""
+    """Decompiled text of a function in the C files."""
+    for path in SRC_FILES:
+        m = re.search(r"/\* ---- %s @ [0-9a-f]+ ---- \*/(.*?)(?=/\* ---- |\Z)" % re.escape(name),
+                      _read(path), re.S)
+        if m:
+            return m.group(1)
+    return ""
 
 
-def _lines():
-    with open(CSRC) as f:
-        return f.read().split("\n")
+def _lines(path):
+    return _read(path).split("\n")
 
 
 def line_of(pattern, after=None):
-    """First line number in the C file matching regex (after a line no)."""
-    with open(CSRC) as f:
-        for i, line in enumerate(f, 1):
-            if (after is None or i > after) and re.search(pattern, line):
-                return i
+    """First line in the C files matching regex (after a Line)."""
+    start = SRC_FILES.index(after.path) if isinstance(after, Line) else 0
+    for fi in range(start, len(SRC_FILES)):
+        for i, line in enumerate(_lines(SRC_FILES[fi]), 1):
+            if fi == start and after is not None and i <= after:
+                continue
+            if re.search(pattern, line):
+                return Line(i, SRC_FILES[fi])
     raise KeyError(pattern)
 
 
@@ -163,8 +219,9 @@ def setup_session():
     except KeyError:
         # the idle loop's stores are visible: "do { ... } while( true );"
         end = line_of(r"^\s*\} while\( true \);", fw_main_line)
-        loop_line = max(i for i in range(fw_main_line, end) if re.match(r"^\s*do \{", _lines()[i - 1]))
-    BACKSTOP.append("%s:%d" % (os.path.basename(CSRC), loop_line))
+        loop_line = Line(max(i for i in range(fw_main_line, end)
+                             if re.match(r"^\s*do \{", _lines(fw_main_line.path)[i - 1])), fw_main_line.path)
+    BACKSTOP.append(spec(loop_line))
     BACKSTOP_LINE.append(loop_line)
 
 

@@ -38,7 +38,7 @@ def delete_all():
 
 
 def pc_of_line(line):
-    sals = gdb.decode_line("%s:%d" % (os.path.basename(CSRC), line))[1]
+    sals = gdb.decode_line(spec(line))[1]
     return min(int(s.pc) for s in sals) if sals else None
 
 
@@ -155,7 +155,7 @@ def main():
     # --- until a later line ------------------------------------------------------
     fw_line = line_of(r"^void (?:__\w+ )?fw_main\(void\)")
     sum_line = line_of(r"sum_history\(", fw_line)
-    run("until %s:%d" % (os.path.basename(CSRC), sum_line))
+    run("until %s" % spec(sum_line))
     f = gdb.selected_frame()
     check("until reaches the line", f.name() == "fw_main" and f.find_sal().line == sum_line,
           "%s:%s" % (f.name(), f.find_sal().line))
@@ -182,7 +182,7 @@ def main():
     if target is None:
         print("SKIP jump (no call to sum_history before the idle loop)")
     else:
-        run("tbreak %s:%d" % (os.path.basename(CSRC), loop_line))
+        run("tbreak %s" % spec(loop_line))
         run("jump *0x%x" % target)
         f = gdb.selected_frame()
         check("jump continues to the idle loop", f.name() == "fw_main" and f.find_sal().line >= loop_line,

@@ -165,9 +165,10 @@ class LineSequence(object):
     """A contiguous run of code: rows [(address, line[, flags])] sorted by
     address, terminated at ``end`` (exclusive). flags: ROW_PROLOGUE_END."""
 
-    def __init__(self, rows, end):
+    def __init__(self, rows, end, file=1):
         self.rows = rows
         self.end = end
+        self.file = file
 
 
 # --------------------------------------------------------------------------
@@ -286,9 +287,9 @@ class DwarfBuilder(object):
         self.ranges += self.uaddr(0) + self.uaddr(0)
         return off
 
-    def add_sequence(self, rows, end):
+    def add_sequence(self, rows, end, file=1):
         if rows:
-            self.sequences.append(LineSequence(rows, end))
+            self.sequences.append(LineSequence(rows, end, file))
 
     # -- attribute encoding --------------------------------------------------
     def _encode_attr(self, form, value):
@@ -423,6 +424,9 @@ class DwarfBuilder(object):
         for seq in sorted(self.sequences, key=lambda s: s.rows[0][0]):
             addr = None
             line = 1
+            if seq.file != 1:
+                prog.append(C.DW_LNS_set_file)
+                prog += uleb(seq.file)
             for row in seq.rows:
                 row_addr, row_line = row[0], row[1]
                 flags = row[2] if len(row) > 2 else 0
