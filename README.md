@@ -8,7 +8,7 @@ A PyGhidra script exports a Ghidra program as:
 
 | File | Contents |
 |------|----------|
-| `<name>.src/<name>.0.c`, `.1.c`, ... | pseudo-C: the decompiler output of every function, split into files of at most 1 MB / 100,000 lines (`c_max_bytes`, `c_max_lines`) |
+| `<name>.src/<name>.0.c`, `.1.c`, ... | pseudo-C: the decompiler output of every function, split into files of at most 100 KB / 100,000 lines (`c_max_bytes`, `c_max_lines`) |
 | `<name>.src/<name>.types.h` | the program's data types as C (included by the `.c` files) |
 | `<name>.elf` | an ELF *symbol file*: sections mirroring the program's memory map, a symbol table, and DWARF 4 debug info whose line table points into the `.c` files |
 
@@ -70,7 +70,7 @@ GUI; defaults in `dwarfexport/ghidra_export.py:Options`):
 | `embed_bytes` | `false` | Store the initialized memory blocks' bytes in the ELF (PROGBITS), for offline `objdump`/`gdb disassemble`. Otherwise they're NOBITS placeholders. |
 | `cfi` | `true` | Generate `.debug_frame` (call frame info) from p-code. |
 | `types_header` | `true` | Write the program's data types as C to `<name>.types.h`, included by the `.c` files. |
-| `c_max_bytes` | `1000000` | Start a new `.c` file when the next function would make the current one larger than this (0 = no limit). Functions are never split, so a single larger function gets a file of its own. |
+| `c_max_bytes` | `100000` | Start a new `.c` file when the next function would make the current one larger than this (0 = no limit). Functions are never split, so a single larger function gets a file of its own. |
 | `c_max_lines` | `100000` | The same limit in lines. |
 | `all_types` | `true` | Emit DWARF for every struct/union/enum/typedef, not only the ones in use (so `ptype`/casts work for all of them). |
 | `decompile_timeout` | `60` | Per-function decompiler timeout, in seconds. |
@@ -116,8 +116,8 @@ the DWARF (`DW_AT_comp_dir`). If you move them, use
 GDB highlights a whole source file the first time it shows a line of it.
 That's why the pseudo-C is split: listing a line of the 7.3 MB single file
 from the glibc export took 4.7 s, and of a 1 MB part 0.7 s (once per file
-per session). Lower `c_max_bytes` if that's still too slow, or
-`set style sources off` in GDB.
+per session); the default limit is 100 KB per file. Lower `c_max_bytes` if
+that's still too slow, or `set style sources off` in GDB.
 
 An index (`gdb-add-index`) doesn't help: the export is a single compile unit
 that GDB reads in about 0.1 s for glibc, with or without the index. If you
@@ -287,6 +287,12 @@ code.
   type is a symbol only: GDB says it "has unknown type", so cast it
   (`p *(int *)&'name'`). Code labels inside functions are
   left out so GDB keeps showing `<func+off>`.
+* **Aliases** (several labels on one function or data item): every name
+  works in GDB (`break alias`, `p alias`, `ptype alias`), while addresses are
+  still shown with the primary name. A data alias is a second DWARF variable
+  of the same type at the same address; a function alias is a zero-size local
+  ELF symbol. (Ghidra itself doesn't allow overlapping functions or
+  overlapping data items.)
 * **Types**: base types, pointers, typedefs, structs (including bitfields,
   packed layouts, anonymous members, flexible array members), unions, enums
   (including 8-byte and > `INT_MAX` values), multi-dimensional arrays, and
@@ -555,7 +561,8 @@ The edge-case module (`firmware/edge.c`, `edge_asm.S`, `ghidra_setup_edge.py`,
   exporter writes itself; on ppc32 also
   out-of-line `_savegpr`/`_restgpr` helpers, a return address parked in r30,
   and an exception handler that leaves through a shared `rfi` exit;
-* a memory map without the X flag (ppc32-linux).
+* a memory map without the X flag (ppc32-linux);
+* alias labels on a function and on data items.
 
 **Differential unwinding test** (`test/difftrace.py`): the firmware is
 single-stepped twice from the same point (5,000 instructions from

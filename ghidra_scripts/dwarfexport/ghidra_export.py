@@ -33,7 +33,7 @@ from ghidra.program.model.data import (
     WideChar32DataType,
 )
 from ghidra.program.model.pcode import PcodeOp
-from ghidra.program.model.symbol import SymbolType
+from ghidra.program.model.symbol import SourceType, SymbolType
 
 from . import consts as C
 from .dwarf import DwarfBuilder, uleb, ROW_PROLOGUE_END
@@ -87,7 +87,7 @@ class Options(object):
         # whenever the next function would push the current one over either
         # limit (0 = no limit); data types go to <basename>.types.h.
         # (GDB's source highlighting stalls on huge files.)
-        self.c_max_bytes = 1000000
+        self.c_max_bytes = 100000
         self.c_max_lines = 100000
         # Decompiler worker threads; -1 = min(8, CPUs - 1). 1 = serial.
         self.decompile_threads = -1
@@ -1038,13 +1038,23 @@ class Exporter(object):
             flow = None
         if self.cfi is not None and flow is not None:
             self.cfi.add_function(flow, ranges, interrupt=entry in self.interrupts)
+        # other labels at the entry (aliases): local zero-size symbols, so
+        # "break alias" works while GDB keeps naming addresses by the
+        # function (it passes over zero-size symbols for that)
+        aliases = self._aliases(func.getEntryPoint(), func.getSymbol())
         if self._is_thumb(func.getEntryPoint()):
             # ARM ELF: Thumb function symbols have bit 0 set, and mapping
             # symbols ($t/$a) tell GDB the instruction set of each region.
             self.elf_symbols.append((name, self.A(entry) | 1, size, C.STT_FUNC))
+            for a in aliases:
+                self.elf_symbols.append((a, self.A(entry) | 1, 0, C.STT_FUNC, 0, C.STB_LOCAL))
             self.elf_symbols.append(("$t", self.A(entry), 0, C.STT_NOTYPE, 0, C.STB_LOCAL))
         else:
-            self.elf_symbols.append((name, self.A(entry), size, C.STT_FUNC) + self._symbol_isa_bits(func))
+            bits = self._symbol_isa_bits(func)
+            self.elf_symbols.append((name, self.A(entry), size, C.STT_FUNC) + bits)
+            for a in aliases:
+                self.elf_symbols.append((a, self.A(entry), 0, C.STT_FUNC, bits[0] if bits else 0,
+                                         C.STB_LOCAL))
             if str(self.lang.getProcessor()) == "ARM":
                 self.elf_symbols.append(("$a", self.A(entry), 0, C.STT_NOTYPE, 0, C.STB_LOCAL))
 
@@ -1143,14 +1153,34 @@ class Exporter(object):
         # point itself, with all arguments still in their registers.
         local_entry = (self._ppc64_local_entry(func)
                        if str(self.lang.getProcessor()) == "PowerPC" and self.addr_size == 8 else 0)
-        pe = flow.prologue_end(local_entry) if flow is not None else None
+        pe = flow.prologue_end(local_entry, body=self._statement_pcs(addr_lines, sig_line)) \
+            if flow is not None else None
         if pe is not None:
-            body_line = addr_lines.get(pe)
+            # The line shown when stepping into / breaking on the function:
+            # the earliest statement whose code starts in the straight-line
+            # run at the prologue end (compilers schedule instructions of a
+            # later statement first; GCC's own line info shows the first).
+            run = []
+            i = bisect.bisect_left(flow.insns, pe)
+            while i < len(flow.insns) and ranges[0][0] <= flow.insns[i] < ranges[0][1]:
+                o = flow.insns[i]
+                run.append(o)
+                d = flow.decoded.get(o)
+                if d is None or d[0] or d[1] or d[2]:      # call, jump, return
+                    break
+                i += 1
+            cands = [addr_lines[a] for a in run if a in addr_lines and addr_lines[a] != sig_line]
+            body_line = min(cands) if cands else addr_lines.get(pe)
             if body_line is None:
                 later = [a for a in addr_lines if a > pe and ranges[0][0] <= a < ranges[0][1]]
                 body_line = addr_lines[min(later)] if later else sig_line
             addr_lines[pe] = body_line
             if pe != entry:
+                # the whole prologue is the signature line (as with GCC): the
+                # decompiler may tie e.g. the PPC64 ELFv2 TOC setup to a
+                # pseudo statement
+                for a in [a for a in addr_lines if entry <= a < pe]:
+                    addr_lines[a] = sig_line
                 addr_lines[entry] = sig_line
         else:
             addr_lines[entry] = sig_line
@@ -1176,6 +1206,25 @@ class Exporter(object):
             self.dw.add_sequence(out_rows, self.A(lo) + (hi - lo), cfile["file_no"])
 
     # -- variables -------------------------------------------------------------
+    @staticmethod
+    def _statement_pcs(addr_lines, sig_line):
+        """Instructions the decompiler attributes to a statement (a line of
+        the function body, not its signature)."""
+        return set(a for a, l in addr_lines.items() if l != sig_line)
+
+    def _aliases(self, addr, primary):
+        """Names of the other user/analysis labels at addr (not primary)."""
+        out = []
+        for s in self.program.getSymbolTable().getSymbols(addr):
+            if s.isDynamic() or s.getSource() == SourceType.DEFAULT or s.equals(primary):
+                continue
+            if s.getSymbolType() not in (SymbolType.LABEL, SymbolType.FUNCTION):
+                continue
+            n = _qualified(s)
+            if n not in out:
+                out.append(n)
+        return sorted(out)
+
     def _proto_text(self, func):
         """C prototype with exported (name-filtered) names, for functions
         written without decompiler output."""
@@ -1339,11 +1388,9 @@ class Exporter(object):
             name = _qualified(sym)
             dt = data.getDataType()
             length = int(data.getLength())
-            die = self.dw.cu.child(C.DW_TAG_variable)
-            self.dw.name(die, name)
-            die.add(C.DW_AT_external, C.DW_FORM_flag_present)
+            type_die = None
             if dt is not None and dt.getLength() > 0:
-                self.types.ref(die, dt)
+                type_die = self.types.get(dt)
             elif length > 0:
                 # dynamic-size data: strings become arrays of their character
                 # type (GDB prints them as strings), anything else a byte array
@@ -1356,10 +1403,21 @@ class Exporter(object):
                     arr.add(C.DW_AT_type, C.DW_FORM_ref4, self.types.base_of_size(1, False))
                     count = length
                 arr.child(C.DW_TAG_subrange_type).add(C.DW_AT_count, C.DW_FORM_udata, count)
-                die.add(C.DW_AT_type, C.DW_FORM_ref4, arr)
-            die.add(C.DW_AT_location, C.DW_FORM_exprloc,
-                    self.dw.expr().addr(self.A(addr.getOffset())).bytes())
-            self.elf_symbols.append((name, self.A(addr.getOffset()), length, C.STT_OBJECT))
+                type_die = arr
+            # The primary label, then any other labels on the same data
+            # (aliases): each a variable of the same type and address. Only
+            # the primary gets an ELF symbol, so GDB names the address by it
+            # (with several symbols at one address its choice is arbitrary).
+            location = self.dw.expr().addr(self.A(addr.getOffset())).bytes()
+            for i, vname in enumerate([name] + self._aliases(addr, sym)):
+                die = self.dw.cu.child(C.DW_TAG_variable)
+                self.dw.name(die, vname)
+                die.add(C.DW_AT_external, C.DW_FORM_flag_present)
+                if type_die is not None:
+                    die.add(C.DW_AT_type, C.DW_FORM_ref4, type_die)
+                die.add(C.DW_AT_location, C.DW_FORM_exprloc, location)
+                if i == 0:
+                    self.elf_symbols.append((vname, self.A(addr.getOffset()), length, C.STT_OBJECT))
             seen.add(int(addr.getOffset()))
             self.stats["globals"] += 1
 

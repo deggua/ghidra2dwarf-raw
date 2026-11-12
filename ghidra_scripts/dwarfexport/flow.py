@@ -971,9 +971,11 @@ class FunctionFlow(object):
 
     # -- prologue ---------------------------------------------------------------
     def _is_prologue_insn(self, ins, st_in):
-        """True if the instruction only sets up the frame: adjusts SP, saves
-        entry register values / the back chain to the stack, or copies the
-        return address register."""
+        """True if the instruction sets up the frame -- adjusts SP, saves
+        entry register values / the back chain to the stack, copies the
+        return address, or sets a frame pointer from SP -- and does nothing
+        else. An instruction that only sets flags (the "cmpw" of a first
+        "if") is body code, not prologue."""
         st = st_in.copy()
         self.step(st, int(ins.getAddress().getOffset()))
         if self.side_effect:
@@ -981,6 +983,7 @@ class FunctionFlow(object):
             # first instruction of a device register accessor) is body code:
             # "break func" must stop before it
             return False
+        setup = False
         for k in set(st.regs) | set(st_in.regs):
             if k[0] == "u" or self.m.dwarf_of(k) is None and not self.m.containers(k):
                 # scratch / pseudo registers (ARM mult_addr, flags): not
@@ -990,9 +993,11 @@ class FunctionFlow(object):
             after = st.regs[k] if k in st.regs else self.default(k)
             if before == after:
                 continue
-            if k == self.m.sp_key and after is not None and after[0] == SP:
+            if after is not None and after[0] == SP and (k == self.m.sp_key or self.m.is_preserved(k)):
+                setup = True          # SP adjustment, frame pointer
                 continue
             if self.m.ra_key is not None and after == (INIT, self.m.ra_key):
+                setup = True          # return address copy (mflr r0)
                 continue
             return False
         for o, (size, v) in st.mem.items():
@@ -1000,12 +1005,16 @@ class FunctionFlow(object):
                 continue
             if v is None or v[0] not in (INIT, SP):
                 return False
-        return True
+            setup = True              # register save, argument spill, back chain
+        return setup
 
-    def prologue_end(self, skip=0):
+    def prologue_end(self, skip=0, body=()):
         """Offset of the first instruction after the frame setup (the entry
         point itself for frameless functions). ``skip`` bytes at the entry
-        are always prologue (e.g. the PPC64 ELFv2 global-entry TOC setup)."""
+        are always prologue (e.g. the PPC64 ELFv2 global-entry TOC setup).
+        ``body``: offsets the decompiler attributes to a statement -- they
+        end the prologue (at -O2 a store of an argument can be "m.id = id",
+        not a spill)."""
         entry = int(self.func.getEntryPoint().getOffset())
         off = entry + skip
         addr = self.func.getEntryPoint().add(skip)
@@ -1017,7 +1026,7 @@ class FunctionFlow(object):
             ft = ins.getFlowType()
             if ft.isJump() or ft.isCall() or ft.isTerminal() or ins.getDelaySlotDepth() > 0:
                 break
-            if not self._is_prologue_insn(ins, st):
+            if off in body or not self._is_prologue_insn(ins, st):
                 break
             nxt = ins.getFallThrough()
             if nxt is None or not self.func.getBody().contains(nxt):

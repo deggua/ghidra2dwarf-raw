@@ -45,6 +45,29 @@ def pc_of_line(line):
 def main():
     setup_session()
 
+    # --- "break func" shows the function's first statement -------------------
+    # (not a later one: no flag-setting compare taken for prologue, and the
+    # earliest statement among instructions scheduled before the first branch)
+    late = []
+    for fn in ("clamp", "fact", "filter_offset", "mul64", "many_args", "process_all", "sensor_update",
+               "update_stats", "shape_leaf", "shape_csel", "shape_build", "shape_alias", "shape_poke"):
+        try:
+            b = gdb.Breakpoint(fn, internal=True)
+            pc = int(b.locations[0].address)
+            b.delete()
+        except (gdb.error, IndexError, RuntimeError):
+            continue
+        blk = gdb.current_progspace().block_for_pc(pc)
+        while blk is not None and blk.function is None:
+            blk = blk.superblock
+        sal = gdb.find_pc_line(pc)
+        if blk is None or sal.symtab is None:
+            continue
+        lines = sorted(set(e.line for e in sal.symtab.linetable() if blk.start <= e.pc < blk.end and e.line))
+        if len(lines) >= 2 and sal.line > lines[1]:
+            late.append("%s: line %d, first statement %d" % (fn, sal.line, lines[1]))
+    check("break func shows the first statement", not late, late)
+
     # --- first clamp(): v=514 via filter_double ----------------------------
     cont_to("clamp")
     check_eq("clamp v", "v", 514)

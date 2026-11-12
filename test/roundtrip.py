@@ -136,8 +136,11 @@ def compare(orig, rt, sanitized):
         if w is None:
             diffs.append("global %s @%s missing" % (v["name"], addr))
             continue
-        if w["name"] != fix(v["name"]):
-            diffs.append("global @%s name %s -> %s" % (addr, v["name"], w["name"]))
+        # (with aliases, the re-import may make another of the names primary:
+        # all names must survive)
+        if sorted(fix(n) for n in v.get("names", [v["name"]])) != sorted(w.get("names", [w["name"]])) \
+                and w["name"] != fix(v["name"]):
+            diffs.append("global @%s names %s -> %s" % (addr, v.get("names"), w.get("names")))
         if norm_type(w["type"]) != norm_type(ty(v["type"])):
             diffs.append("global %s type %s -> %s" % (v["name"], v["type"], w["type"]))
     # Same-named types come back as "name", "name.conflict", ... in any order:

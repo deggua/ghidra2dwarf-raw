@@ -14,7 +14,7 @@
 #            types_header=true|false   all_types=true|false     decompile_timeout=60
 #            sanitize_names=true|false skip_decompile=f1,f2     basename=name
 #            irq_signal_frame=true|false  elf_flags=-1  decompile_threads=-1
-#            c_max_bytes=1000000       c_max_lines=100000
+#            c_max_bytes=100000        c_max_lines=100000
 #
 # @category DWARF
 # @runtime PyGhidra

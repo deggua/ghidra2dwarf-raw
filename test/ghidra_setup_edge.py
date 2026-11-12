@@ -343,6 +343,14 @@ def disp_body():
     fm.getFunctionAt(a).setBody(AddressSet(a, end))
 report("computed goto: whole range as the function body", disp_body)
 
+# --- several labels on one function / data item (aliases) ----------------------
+def aliases():
+    st.createLabel(A("clamp"), "clamp_alias", USER)
+    st.createLabel(A("g_counter"), "g_counter_alias", USER)
+    st.createLabel(A("g_stats"), "g_stats_alias", USER)
+    st.createLabel(A("g_stats"), "g_stats_other", USER)
+report("alias labels on a function and on data", aliases)
+
 # --- memory map without the X flag (hand-made by the analyst) ---------------------
 if _LAYOUT.get("noexec_blocks"):
     def noexec():

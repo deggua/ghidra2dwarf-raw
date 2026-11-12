@@ -61,7 +61,9 @@ for d in listing.getDefinedData(True):
             n = str(sdi.getCharsetName()).upper()
             cs = 4 if "32" in n else 2 if "16" in n else 1
             t = "%s[%d]" % ({1: "char", 2: "wchar16", 4: "wchar32"}[cs], d.getLength() // cs)
-    globs["%x" % d.getAddress().getOffset()] = {"name": str(s.getName(True)), "type": t,
+    names = sorted(str(x.getName(True)) for x in prog.getSymbolTable().getSymbols(d.getAddress())
+                   if x.getSource() != SourceType.DEFAULT)
+    globs["%x" % d.getAddress().getOffset()] = {"name": str(s.getName(True)), "names": names, "type": t,
                                                 "size": int(d.getLength())}
 
 types = {}   # name -> [definitions] (same-named types in different categories)

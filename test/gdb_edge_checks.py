@@ -376,6 +376,30 @@ def main():
     check_eq("poke result", "g_poke", 0xabcd)
     check_eq("sorted", "g_shape_arr[0] == 0 && g_shape_arr[5] == 5 && g_shape_arr[9] == 9", 1)
     check_eq("double global", "g_dbl", 6.375)
+
+    # aliases: extra labels on the same function / data item
+    check_eq("data alias has the primary's address", "&g_counter_alias == &g_counter", 1)
+    check_eq("data alias has the primary's value", "g_counter_alias == g_counter", 1)
+    check("data alias has the primary's type", run("ptype g_stats_alias") == run("ptype g_stats"),
+          run("ptype g_stats_alias"))
+    check_eq("second data alias", "&g_stats_other == &g_stats", 1)
+    check_eq("data alias field access", "g_stats_alias.min == g_stats.min", 1)
+    out = run("info symbol &g_counter")
+    check("primary name shown for an aliased address", out.startswith("g_counter "), out)
+    try:
+        pcs = [int(x.pc) for x in (gdb.decode_line("clamp_alias")[1] or [])]
+    except gdb.error as e:
+        pcs = []
+        print("decode_line clamp_alias: %s" % e)
+    fn = [gdb.current_progspace().block_for_pc(pc).function for pc in pcs]
+    check("function alias resolves into the function", any(f is not None and f.name == "clamp" for f in fn),
+          [str(f) for f in fn])
+    out = run("info symbol (unsigned long)&clamp")
+    check("primary function name shown for an aliased entry", out.startswith("clamp"), out)
+    out = run("x/i (unsigned long)&clamp")
+    check("disassembly names the function, not its alias", "<clamp" in out and "alias" not in out, out)
+    out = run("p &g_counter")
+    check("data address printed with the primary name", "<g_counter>" in out, out)
     check_eq("union float view", "g_union.f", 1.5)
     check_eq("union int view", "g_union.u", 0x3FC00000)
     check_eq("2-D array", "g_matrix[2][3]", -12)
