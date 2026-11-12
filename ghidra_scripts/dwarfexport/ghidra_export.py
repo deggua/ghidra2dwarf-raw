@@ -1662,7 +1662,8 @@ class Exporter(object):
         text_done = False
         for block in self.memory.getBlocks():
             start = block.getStart()
-            if not block.isLoaded() or block.isOverlay() or not self.in_space(start):
+            if (not block.isLoaded() or block.isOverlay() or not self.in_space(start)
+                    or block.isExternalBlock()):     # (Ghidra's synthetic EXTERNAL block of imports)
                 continue
             base_flags = C.SHF_ALLOC | (C.SHF_WRITE if block.isWrite() else 0)
             lo = int(start.getOffset())
