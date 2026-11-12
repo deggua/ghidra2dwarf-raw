@@ -118,23 +118,100 @@ for name, addr, size, kind in syms:
 # bytes); analyze now that the functions are in place.
 analyzeAll(prog)
 
+# Switch cases that analysis didn't disassemble, fixed as an analyst would:
+# if the decompiler recovers the table (PPC64 -O0: TOC-relative tables), at
+# its cases; if not ("Could not recover jumptable": a 64-bit index only
+# bounded by a 32-bit compare on PPC64/n32, a table address loaded from a
+# literal pool in writable memory on ARM), over the function's whole range
+# (see README, "Unrecovered switch tables").
+SIZES = dict((addr, size) for name, addr, size, kind in syms if kind in "Tt")
+
+
+def disassemble_cases():
+    from ghidra.app.decompiler import DecompInterface
+    from ghidra.program.model.address import AddressSet
+    ifc = DecompInterface()
+    ifc.openProgram(prog)
+    listing = prog.getListing()
+    try:
+        for f in list(fm.getFunctions(True)):
+            res = ifc.decompileFunction(f, 60, monitor)
+            hf = res.getHighFunction() if res is not None else None
+            if hf is None:
+                continue
+            added = False
+            for jt in hf.getJumpTables():
+                for c in jt.getCases():
+                    if listing.getInstructionAt(c) is None:
+                        DisassembleCommand(c, None, True).applyTo(prog, monitor)
+                        added = True
+            a = f.getEntryPoint()
+            size = SIZES.get(int(a.getOffset()))
+            if not size:
+                continue
+            whole = AddressSet(a, a.add(size - 1))
+            dc = res.getDecompiledFunction()
+            if dc is not None and "Could not recover jumptable" in str(dc.getC()):
+                # (at aligned addresses only: given a range, the disassembler
+                # also tries starts inside instructions)
+                # (the language's alignment can be smaller than the ISA's:
+                # 2 on PPC64 variants that include VLE)
+                proc = str(prog.getLanguage().getProcessor())
+                align = 4 if proc in ("PowerPC", "MIPS", "AARCH64") or (proc == "ARM" and TMODE is None) \
+                    else prog.getLanguage().getInstructionAlignment()
+                for ins in list(listing.getInstructions(whole, True)):
+                    if int(ins.getAddress().getOffset()) % align:
+                        # (analysis decoded data before the cases misaligned)
+                        listing.clearCodeUnits(ins.getMinAddress(), ins.getMaxAddress(), False)
+                for r in list(listing.getUndefinedRanges(whole, False, monitor)):
+                    x = r.getMinAddress()
+                    x = x.add((-int(x.getOffset())) % align)
+                    while x.compareTo(r.getMaxAddress()) <= 0:
+                        if listing.getInstructionContaining(x) is None:
+                            if TMODE is not None:
+                                prog.getProgramContext().setValue(TMODE, x, x, BigInteger.ONE)
+                            DisassembleCommand(x, whole, True).applyTo(prog, monitor)
+                        x = x.add(align)
+                for g in list(fm.getFunctions(AddressSet(a.add(1), a.add(size - 1)), True)):
+                    fm.removeFunction(g.getEntryPoint())
+                added = True
+            if added:
+                try:
+                    f.setBody(f.getBody().union(whole))
+                except Exception as e:  # noqa: BLE001
+                    print("SETUP: %s: body not extended over its cases: %s" % (f.getName(), e))
+    finally:
+        ifc.dispose()
+
+
 # PPC64 ELFv2: local calls target "func+8" (after the TOC setup), so analysis
-# creates functions there and splits ours; undo that as an analyst would.
-if prog.getLanguage().getProcessor().toString() == "PowerPC" and prog.getDefaultPointerSize() == 8:
+# creates functions there and splits ours (also at code that several jump
+# table cases branch to); undo that as an analyst would.
+def fix_ppc64_splits():
+    if prog.getLanguage().getProcessor().toString() != "PowerPC" or prog.getDefaultPointerSize() != 8:
+        return
     from ghidra.program.model.address import AddressSet
     for name, addr, size, kind in syms:
-        if kind not in "Tt" or name in ("bad_bytes", "split_tail"):
+        if kind not in "Tt" or name in ("bad_bytes", "split_tail") or size < 2:
             continue
         a = toAddr("0x%x" % addr)
-        inner = fm.getFunctionAt(a.add(8))
-        if inner is not None and inner.getName().startswith("FUN_"):
-            fm.removeFunction(a.add(8))
+        inner = [g for g in fm.getFunctions(AddressSet(a.add(1), a.add(size - 1)), True)
+                 if g.getName().startswith("FUN_")]
+        if inner:
+            for g in inner:
+                fm.removeFunction(g.getEntryPoint())
             f = fm.getFunctionAt(a)
             if f is not None:
                 f.setBody(AddressSet(a, a.add(size - 1)))
         f = fm.getFunctionAt(a)
         if f is not None and f.isThunk():
             f.setThunkedFunction(None)
+
+
+fix_ppc64_splits()
+disassemble_cases()
+analyzeChanges(prog)     # (calls in the new code may split functions again)
+fix_ppc64_splits()
 
 # PPC64 ELFv2 passes stack arguments at SP+96; Ghidra's PPC64 compiler specs
 # model the ELFv1 layout (SP+112). Correct the affected parameters with

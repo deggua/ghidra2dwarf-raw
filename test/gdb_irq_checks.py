@@ -80,7 +80,20 @@ def main():
     check_eq("faulting pc argument", "pc == (unsigned long)&trap_now", 1)
     check_irq_backtrace("program check", "program_check", "prog_entry", ("trap_now",))
 
+    # the shared exit (reached by "b irq_exit" from prog_entry) still unwinds
+    # into the interrupted code: its state comes from the branching handler
+    cont_to("*(unsigned long)&irq_exit")
+    names = [func_at(f.pc()) for f in frames()]
+    check("shared handler exit unwinds to the interrupted function",
+          "trap_now" in names and names[-1] == "_reset", names)
+
     # --- decrementer: nops + b dec_entry at the 0x900 vector ------------------
+    # "break dec_entry" stops after the handler has stored SRR0, so the
+    # backtrace already reaches the interrupted code
+    cont_to("dec_entry")
+    names = [func_at(f.pc()) for f in frames()]
+    check("break on a handler: backtrace reaches the interrupted code",
+          len(names) > 1 and names[1] in ("busy_work", "irq_test") and names[-1] == "_reset", names)
     cont_to("timer_tick")
     fs = check_irq_backtrace("decrementer", "timer_tick", "dec_entry", ("busy_work", "irq_test"))
     if len(fs) > 2:
@@ -129,6 +142,19 @@ def main():
         print("SKIP savegpr caller q (<optimized out>)")
     else:
         check_eq("savegpr: caller's q restored from the helper's save slot", "q", 222)
+
+    # --- inside the out-of-line restore helper (_restgpr_29_x, PPC32) ------------
+    try:
+        restgpr = int(val("(unsigned long)&_restgpr_29_x"))
+    except gdb.error:
+        restgpr = None
+    if restgpr is None:
+        print("SKIP restgpr backtrace (no _restgpr_29_x)")
+    else:
+        cont_to("*0x%x" % (restgpr + 8))
+        names = frame_names()
+        check("restgpr: backtrace from inside the helper", "shape_os_caller" in names and "irq_test" in names
+              and names[-1] == "_reset", names)
 
     # --- return address parked in r30 (no stack frame) ---------------------------
     cont_to("shape_probe", "v == 5")

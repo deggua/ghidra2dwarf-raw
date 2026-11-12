@@ -57,6 +57,11 @@ def job(target, opt, sanitized, work, verbose):
     if not ok:
         fail("export (see %s/ghidra.log)" % out_dir)
         return report
+    # (the only expected warning: ppc32-linux's memory map without X)
+    warnings = [l for l in text.splitlines() if l.startswith("WARNING: ")
+                and "holds functions but is not executable" not in l]
+    if warnings:
+        fail("%d export warnings: %s" % (len(warnings), warnings[0]))
     elf = os.path.join(out_dir, "out", "fw.bin.elf")
     csrc = os.path.join(out_dir, "out", "fw.bin.src")
     r = subprocess.run(["llvm-dwarfdump", "--verify", elf], capture_output=True, text=True)
@@ -74,6 +79,9 @@ def job(target, opt, sanitized, work, verbose):
         report["counts"]["split"] = why or "ok"
         if why:
             fail("split C files: " + why)
+    bad_sp = sp_located_values(elf)
+    if bad_sp:
+        fail("non-pointer variables located in the stack pointer register: %s" % bad_sp[:8])
     rt_ok, rt_diffs = roundtrip.roundtrip(out_dir, sanitized)
     report["counts"]["rt"] = "ok" if rt_ok else "%d diffs" % len(rt_diffs)
     if not rt_ok:
@@ -107,6 +115,30 @@ def job(target, opt, sanitized, work, verbose):
         report["counts"]["diff"] = "ok" if report["ok"] else "; ".join(msgs)
     report["time"] = time.time() - t0
     return report
+
+
+def sp_located_values(elf):
+    """Variables of non-pointer type whose location is the stack pointer
+    register (the SP's value can't be an int/float variable: a coincidental
+    location match). The SP register name comes from the CIE's CFA rule."""
+    import re
+    frame = subprocess.run(["llvm-dwarfdump", "--debug-frame", elf], capture_output=True, text=True).stdout
+    m = re.search(r"DW_CFA_def_cfa: (\S+) ", frame)
+    if not m:
+        return []
+    sp = m.group(1)
+    info = subprocess.run(["llvm-dwarfdump", "--debug-info", "--show-form", elf], capture_output=True, text=True).stdout
+    bad = []
+    for die in re.split(r"\n(?=0x[0-9a-f]+: )", info):
+        if not re.search(r"DW_TAG_(variable|formal_parameter)", die):
+            continue
+        t = re.search(r'DW_AT_type \[\w+\]\s+\([^"]*"([^"]+)"\)', die)
+        if t is None or "*" in t.group(1):
+            continue
+        if re.search(r"DW_OP_regx? ?\d* ?%s\b|DW_OP_reg\d+ %s\b" % (re.escape(sp), re.escape(sp)), die):
+            n = re.search(r'DW_AT_name[^\n]*?"([^"]+)"', die)
+            bad.append(n.group(1) if n else "?")
+    return bad
 
 
 SPLIT_LINES = 300

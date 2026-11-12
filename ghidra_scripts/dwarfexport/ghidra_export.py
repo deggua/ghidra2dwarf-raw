@@ -23,6 +23,10 @@ from java.io import StringWriter
 from ghidra.app.decompiler import (DecompInterface, DecompileOptions, ClangFuncNameToken,
                                    ClangCommentToken)
 from ghidra.app.decompiler.component import DecompilerUtils
+try:
+    from ghidra.app.decompiler import ClangCaseToken
+except ImportError:  # (older Ghidra)
+    ClangCaseToken = ()
 from ghidra.app.util.bin.format.dwarf import DWARFRegisterMappingsManager
 from ghidra.program.database.data import PointerTypedefInspector
 from ghidra.program.model.data import (
@@ -99,6 +103,16 @@ class Options(object):
         # symbols, ranges, CFI and a one-line prototype in the .c file.
         self.skip_decompile = ""
 
+    # valid ranges of the numeric options (None: unbounded)
+    _RANGES = {
+        "address_offset": (-(1 << 64) + 1, (1 << 64) - 1),
+        "decompile_timeout": (1, None),
+        "c_max_bytes": (0, None),
+        "c_max_lines": (0, None),
+        "decompile_threads": (-1, 256),
+        "elf_flags": (-1, 0xffffffff),
+    }
+
     def set(self, key, value):
         if not hasattr(self, key):
             raise KeyError("unknown option %r" % key)
@@ -107,6 +121,9 @@ class Options(object):
             value = str(value).lower() in ("1", "true", "yes", "on")
         elif isinstance(cur, int):
             value = int(str(value), 0)
+            lo, hi = self._RANGES.get(key, (None, None))
+            if (lo is not None and value < lo) or (hi is not None and value > hi):
+                raise ValueError("%s must be in %s..%s, not %d" % (key, lo, "" if hi is None else hi, value))
         elif key == "basename":
             value = str(value)
             if not value or "/" in value or "\\" in value or value in (".", ".."):
@@ -478,7 +495,9 @@ class TypeBuilder(object):
     def _fill_array(self, die, dt):
         self.ref(die, dt.getDataType())
         sub = die.child(C.DW_TAG_subrange_type)
-        sub.add(C.DW_AT_count, C.DW_FORM_udata, int(dt.getNumElements()))
+        if int(dt.getNumElements()) > 0:
+            sub.add(C.DW_AT_count, C.DW_FORM_udata, int(dt.getNumElements()))
+        # (no count: a flexible array member, "data[]")
 
     def _fill_func(self, die, dt):
         die.add(C.DW_AT_prototyped, C.DW_FORM_flag_present)
@@ -650,6 +669,7 @@ class Exporter(object):
             self._export_all_types()
         self.types.flush()
         self.types.add_tag_typedefs()
+        self._add_type_decl_lines()
 
         ranges = sorted(self.func_ranges)
         cu.add(C.DW_AT_ranges, C.DW_FORM_sec_offset, dw.add_ranges(ranges))
@@ -665,6 +685,32 @@ class Exporter(object):
             self.elf_path, self.src_dir, len(self.c_files), time.time() - t0))
 
     # -- C file -----------------------------------------------------------------
+    def _add_type_decl_lines(self):
+        """DW_AT_decl_file/line of struct/union/enum/typedef DIEs: their
+        definitions in <name>.types.h (so "info types" shows lines and GDB
+        can list the header)."""
+        if not self.opts.types_header or not self.h_lines:
+            return
+        h_no = self.dw.add_file(self.h_name, self.src_dir_no)
+        where = {}
+        tag_re = re.compile(r"^\s*(?:typedef\s+)?(struct|union|enum)\s+([^\s{;]+)\s*\{")
+        td_re = re.compile(r"^\s*typedef\s.*?([^\s*;()\[\]]+)\s*(?:\[[^\]]*\]\s*)*;\s*$")
+        for i, text in enumerate(self.h_lines, 1):
+            m = tag_re.match(text)
+            if m:
+                where.setdefault((m.group(1), m.group(2)), i)
+                continue
+            m = td_re.match(text)
+            if m:
+                where.setdefault(("typedef", m.group(1)), i)
+        for (kind, _, _), (die, dt) in self.types._entries():
+            if kind not in ("struct", "union", "enum", "typedef"):
+                continue
+            line = where.get((kind, str(dt.getName())))
+            if line is not None:
+                die.add(C.DW_AT_decl_file, C.DW_FORM_udata, h_no)
+                die.add(C.DW_AT_decl_line, C.DW_FORM_udata, line)
+
     def _file_preamble(self, index):
         p = self.program
         return [
@@ -803,6 +849,21 @@ class Exporter(object):
                         if g is not None and int(t.getOffset()) not in found:
                             found.add(int(t.getOffset()))
                             work.append(int(t.getOffset()))
+        # Handlers entered by a branch from another handler (a shared exit
+        # path "b irq_exit"): {target entry: [(source entry, branch offset)]}
+        self.irq_jumps = {}
+        for src in found:
+            f = fm.getFunctionAt(self.space.getAddress(src))
+            if f is None:
+                continue
+            for ins in self.listing.getInstructions(f.getBody(), True):
+                ft = ins.getFlowType()
+                if not ft.isConditional() and (ft.isJump() and not ft.isCall()
+                                               or ft.isCall() and ft.isTerminal()):
+                    for t in ins.getFlows():
+                        if int(t.getOffset()) in found and int(t.getOffset()) != src:
+                            self.irq_jumps.setdefault(int(t.getOffset()), []).append(
+                                (src, int(ins.getAddress().getOffset())))
         return found
 
     def _collect_qualified_renames(self):
@@ -867,6 +928,42 @@ class Exporter(object):
             raise RuntimeError("decompiler failed to open program: %s" % ifc.getLastMessage())
         return ifc
 
+    @staticmethod
+    def _history_dependent(res):
+        """Could the decompiled text depend on what this decompiler process
+        decompiled before? The decompiler numbers locals (uVar3, fVar4) in
+        storage order, and storage in its "join" space (a value over several
+        registers, a float in a wider FPR) is allocated in the order the
+        process first meets it. That matters with two or more such locals."""
+        hf = res.getHighFunction() if res is not None else None
+        if hf is None:
+            return False
+        n = 0
+        for sym in hf.getLocalSymbolMap().getSymbols():
+            if sym.isParameter():
+                continue
+            try:
+                st = sym.getStorage()
+                dt = sym.getDataType()
+                if st.isCompoundStorage() or (dt is not None and dt.getLength() != st.size()):
+                    n += 1
+            except Exception:  # noqa: BLE001
+                n += 1
+        return n >= 2
+
+    def _decompile(self, ifc, func, timeout):
+        """Decompile; a function whose text could depend on the process'
+        history is decompiled again in a fresh one, so the output doesn't
+        depend on the order or the threads the functions were decompiled in."""
+        res = ifc.decompileFunction(func, timeout, self.monitor)
+        if self._history_dependent(res) and not self.monitor.isCancelled():
+            fresh = self._decompiler()
+            try:
+                res = fresh.decompileFunction(func, timeout, self.monitor)
+            finally:
+                fresh.dispose()
+        return res
+
     def _export_functions(self):
         fm = self.program.getFunctionManager()
         funcs = [f for f in fm.getFunctions(True)
@@ -913,7 +1010,7 @@ class Exporter(object):
             try:
                 for func in funcs:
                     yield func, (None if self._skipped(func) else
-                                 serial_ifc().decompileFunction(func, timeout, self.monitor))
+                                 self._decompile(serial_ifc(), func, timeout))
             finally:
                 for ifc in serial:
                     ifc.dispose()
@@ -929,7 +1026,7 @@ class Exporter(object):
                     ifc = local.ifc = self._decompiler()
                     with lock:
                         ifcs.append(ifc)
-                return None if self._skipped(func) else ifc.decompileFunction(func, timeout, self.monitor)
+                return None if self._skipped(func) else self._decompile(ifc, func, timeout)
             finally:
                 # JPype attached this pool thread to the JVM; detach it, or
                 # every export leaks Java threads (GUI sessions)
@@ -955,7 +1052,7 @@ class Exporter(object):
                     # decompiles are slower under the pool's load: give a
                     # function that timed out there one serial attempt, so
                     # the result doesn't depend on machine load
-                    res = serial_ifc().decompileFunction(func, timeout, self.monitor)
+                    res = self._decompile(serial_ifc(), func, timeout)
                 yield func, res
         finally:
             for ifc in list(ifcs):
@@ -1025,14 +1122,23 @@ class Exporter(object):
         if hf is not None:
             # switch jump tables the decompiler recovered: edges the raw
             # computed jump doesn't show
+            missing = []
             try:
                 for jt in hf.getJumpTables():
                     sw = int(jt.getSwitchAddress().getOffset())
                     extra[sw] = [int(c.getOffset()) for c in jt.getCases()]
+                    missing += [c for c in jt.getCases() if self.listing.getInstructionAt(c) is None]
             except Exception:  # noqa: BLE001
                 pass
+            if missing:
+                # (the decompiler decodes them itself; everything else
+                # works from the listing's instructions)
+                self.log("WARNING: %s: switch cases at %s are not disassembled: no CFI or variable "
+                         "locations there. Disassemble them and re-export." % (
+                             name, ", ".join(str(c) for c in sorted(set(missing))[:4])))
         try:
-            flow = FunctionFlow(self.machine, func, extra)
+            flow = FunctionFlow(self.machine, func, extra,
+                                init_state=self._irq_entry_state(func) or self._helper_entry_state(func))
         except Exception as e:
             self.log("WARNING: flow analysis failed for %s: %s" % (name, e))
             flow = None
@@ -1061,6 +1167,8 @@ class Exporter(object):
         # The function's text is assembled with line numbers relative to its
         # block, then placed in a C file and shifted (see _place_function).
         flines = ["", "/* ---- %s @ %s ---- */" % (self.nm(name), func.getEntryPoint())]
+        self._var_dies = []      # (die, name, is_param): declaration lines added once placed
+        self._code_decls = {}
         base = len(flines)  # line N of the function text -> base + N
 
         if markup is None or hf is None:
@@ -1079,10 +1187,23 @@ class Exporter(object):
             # write a forwarding call instead, and only the thunk's parameters.
             target = self._thunk_target(func)
             tname = self.nm(_qualified(target)) if target is not None else "?"
-            args = ", ".join(self.nm(str(p.getName())) for p in func.getParameters())
+            # (the same parameters as its DWARF: the decompiler's)
+            lsm = hf.getLocalSymbolMap()
+            hparams = [lsm.getParamSymbol(i) for i in range(lsm.getNumParams())]
+            hparams = [p for p in hparams if p is not None]
+            args = ", ".join(self.nm(str(p.getName())) for p in hparams)
             ret = func.getReturnType()
             void = ret is None or isinstance(ret, VoidDataType) or ret.getLength() <= 0
-            flines += [self._proto_text(func), "{",
+            sig_text = self._proto_text(func)
+            if hparams and not func.getParameters():
+                # an unprototyped thunk: its signature from the decompiler
+                proto = hf.getFunctionPrototype()
+                rt = proto.getReturnType() if proto is not None else func.getReturnType()
+                sig_text = "%s %s(%s)" % (self.nm_type(str(rt.getDisplayName())) if rt is not None else "void",
+                                          self.nm(_qualified(func)),
+                                          ", ".join("%s %s" % (self.nm_type(str(p.getDataType().getDisplayName())),
+                                                               self.nm(str(p.getName()))) for p in hparams))
+            flines += [sig_text, "{",
                              "  %s%s(%s);   /* thunk */" % ("" if void else "return ", tname, args), "}"]
             sig_line = base + 1
             addr_lines = {}
@@ -1096,6 +1217,7 @@ class Exporter(object):
             lines = DecompilerUtils.toLines(markup)
             addr_lines = {}
             claims = {}
+            call_claims = {}
             sig_line = None
             for cl in lines:
                 toks = cl.getAllTokens().toArray()   # (one Java array: no per-element iterator calls)
@@ -1110,29 +1232,71 @@ class Exporter(object):
                 for tok in toks:
                     if sig_line is None and isinstance(tok, ClangFuncNameToken):
                         sig_line = gline
-                    if isinstance(tok, ClangCommentToken):
-                        continue  # "/* WARNING: ... */" comments carry addresses too
+                    if isinstance(tok, ClangCommentToken) or (ClangCaseToken and isinstance(tok, ClangCaseToken)):
+                        # "/* WARNING: ... */" comments carry addresses too; a
+                        # "case N:" label carries its case's first operation
+                        continue
                     a = tok.getMinAddress()
                     if a is None or not self.in_space(a):
                         continue
                     claims.setdefault(int(a.getOffset()), set()).add(gline)
+                    if isinstance(tok, ClangFuncNameToken) and gline != sig_line:
+                        # the callee's name in a call: the call's line
+                        call_claims.setdefault(int(a.getOffset()), gline)
             # An address several lines claim gets the lowest one -- except a
-            # shared epilogue the decompiler duplicated into several
-            # "return" lines: there the first return not above the previous
-            # instruction's line, so the normal path doesn't jump back to an
-            # early "return -1;".
+            # shared epilogue the decompiler duplicated into several "return"
+            # lines: that is the function's closing "}" (as with GCC), since
+            # which return the code belongs to depends on the path taken.
             def is_return(gl):
                 return 0 < gl <= len(flines) and re.match(r"\s*return\b", flines[gl - 1]) is not None
-            prev = None
+            closing = max([i + 1 for i, t in enumerate(flines) if t.strip() == "}"] or [None])
+            # Return code the decompiler duplicated into several blocks (an
+            # epilogue shared by an early and the final return): which return
+            # it belongs to depends on the path, even if only one of the
+            # copies' statements carries its address.
+            shared_ret = self._duplicated_return_code(hf, flow)
             for off in sorted(claims):
                 lines_ = sorted(claims[off])
                 rets = [l for l in lines_ if is_return(l)]
-                if len(rets) > 1:
-                    fwd = [l for l in rets if prev is None or l >= prev]
-                    addr_lines[off] = fwd[0] if fwd else lines_[0]
+                if (len(rets) > 1 or off in shared_ret) and closing is not None:
+                    addr_lines[off] = closing
                 else:
                     addr_lines[off] = lines_[0]
-                prev = addr_lines[off]
+                # a call instruction belongs to the call's line, even if the
+                # code of another statement is folded into it (MIPS delay slot)
+                d = flow.decoded.get(off) if flow is not None else None
+                if off in call_claims and d is not None and d[0]:
+                    addr_lines[off] = call_claims[off]
+            if flow is not None:
+                # An instruction no token claims, at a block start (the one
+                # before doesn't fall through to it, or it is a jump target):
+                # the line of the first claimed instruction of its run (else
+                # the closing "}"), instead of the line of whatever precedes
+                # it in memory.
+                ins_ = flow.insns
+                targets = set()
+                for o in ins_:
+                    d = flow.decoded.get(o)
+                    if d is not None and d[1]:
+                        targets.update(t for t in d[4] if t != d[8])
+                for i, o in enumerate(ins_):
+                    if o in addr_lines or i == 0:
+                        continue
+                    pd = flow.decoded.get(ins_[i - 1])
+                    if pd is not None and pd[8] == o and o not in targets:
+                        continue
+                    line = None
+                    for o2 in ins_[i:]:
+                        if o2 in addr_lines:
+                            line = addr_lines[o2]
+                            break
+                        d2 = flow.decoded.get(o2)
+                        if d2 is None or d2[0] or d2[1] or d2[2]:
+                            break
+                    if line is None:
+                        line = closing
+                    if line is not None:
+                        addr_lines[o] = line
             if sig_line is None:
                 sig_line = base + 1
             proto = hf.getFunctionPrototype()
@@ -1144,6 +1308,7 @@ class Exporter(object):
         cfile, off = self._place_function(flines)
         sig_line += off
         addr_lines = dict((a, l + off) for a, l in addr_lines.items())
+        self._add_decl_lines(flines, sig_line, off, cfile["file_no"])
         die.add(C.DW_AT_decl_file, C.DW_FORM_udata, cfile["file_no"])
         die.add(C.DW_AT_decl_line, C.DW_FORM_udata, sig_line)
 
@@ -1155,6 +1320,17 @@ class Exporter(object):
                        if str(self.lang.getProcessor()) == "PowerPC" and self.addr_size == 8 else 0)
         pe = flow.prologue_end(local_entry, body=self._statement_pcs(addr_lines, sig_line)) \
             if flow is not None else None
+        if pe is not None and entry in self.interrupts and self.cfi is not None:
+            pe = self._after_irq_save(flow, pe)
+        if flow is not None:
+            # A delay slot belongs to its branch's line: a caller frame's PC
+            # is "return address - 1", inside the slot after a jal, and must
+            # show the call's line (as with GCC).
+            for i, o in enumerate(flow.insns):
+                d = flow.decoded.get(o)
+                if d is not None and d[3] and o in addr_lines:
+                    for slot in flow.insns[i + 1:i + 1 + d[3]]:
+                        addr_lines[slot] = addr_lines[o]
         if pe is not None:
             # The line shown when stepping into / breaking on the function:
             # the earliest statement whose code starts in the straight-line
@@ -1212,6 +1388,80 @@ class Exporter(object):
         the function body, not its signature)."""
         return set(a for a, l in addr_lines.items() if l != sig_line)
 
+    def _after_irq_save(self, flow, pe):
+        """An interrupt handler's breakpoint goes after it has stored its
+        return register (SRR0, ...) if that happens before the first call or
+        branch: from there the backtrace reaches the interrupted code."""
+        irq = self.cfi._irq_return_reg(flow)
+        if irq is None:
+            return pe
+        key = irq[0]
+        i = bisect.bisect_left(flow.insns, pe)
+        while i < len(flow.insns):
+            o = flow.insns[i]
+            st = flow.state_in.get(o)
+            if st is not None and any(v == ("init", key) for _, v in st.mem.values()):
+                return o
+            d = flow.decoded.get(o)
+            if d is None or d[0] or d[1] or d[2]:
+                break
+            i += 1
+        return pe
+
+    def _helper_entry_state(self, func):
+        """PPC32 GCC-style epilogue helper "_restgpr_N_x", entered by a
+        branch from a function's epilogue: r11 is that function's CFA, the
+        return address is at 4(r11) and rN..r31 are saved just below r11.
+        Its own analysis starts from that, so its CFI unwinds correctly."""
+        from .flow import State, SP as FSP, INIT as FINIT
+        m = re.match(r"^_restgpr_(\d+)_x$", str(func.getName()))
+        if m is None or str(self.lang.getProcessor()) != "PowerPC" or self.addr_size != 4:
+            return None
+        first = int(m.group(1))
+        lang = self.lang
+
+        def key(name):
+            r = lang.getRegister(name)
+            return (int(r.getAddress().getOffset()), int(r.getMinimumByteSize())) if r is not None else None
+        r11, lr = key("r11"), self.machine.ra_key
+        if r11 is None or lr is None or not 13 <= first <= 31:
+            return None
+        st = State()
+        st.regs[r11] = (FSP, 0)
+        st.regs[self.machine.sp_key] = None
+        st.regs[lr] = None
+        st.mem[4] = (4, (FINIT, lr))
+        for n in range(first, 32):
+            k = key("r%d" % n)
+            st.regs[k] = None
+            st.mem[-4 * (32 - n)] = (4, (FINIT, k))
+        return st
+
+    def _irq_entry_state(self, func):
+        """For a handler entered only by branches from other handlers (a
+        shared exit path): the state at those branches, so its CFI knows the
+        exception frame (where SRR0 and the interrupted registers are)."""
+        entry = int(func.getEntryPoint().getOffset())
+        srcs = getattr(self, "irq_jumps", {}).get(entry)
+        if not srcs or entry in self.entry_points:
+            return None
+        fm = self.program.getFunctionManager()
+        states = []
+        for src, off in srcs:
+            try:
+                sf = FunctionFlow(self.machine, fm.getFunctionAt(self.space.getAddress(src)))
+            except Exception:  # noqa: BLE001
+                return None
+            st = sf.state_out.get(off)
+            if st is None:
+                return None
+            states.append(st)
+        first = states[0]
+        sp = self.machine.sp_key
+        if any(s.regs.get(sp) != first.regs.get(sp) or s.mem != first.mem for s in states[1:]):
+            return None        # the branches disagree on the frame: no guess
+        return first
+
     def _aliases(self, addr, primary):
         """Names of the other user/analysis labels at addr (not primary)."""
         out = []
@@ -1240,6 +1490,32 @@ class Exporter(object):
         return "%s %s(%s)" % (tn(func.getReturnType()), self.nm(_qualified(func)),
                               ", ".join(params) if params else "void")
 
+    def _add_decl_lines(self, flines, sig_line, off, file_no):
+        """DW_AT_decl_file/line for the function's variables: parameters on
+        the signature line, locals on their declaration line."""
+        body = None
+        for die, vname, is_param in self._var_dies:
+            line = None
+            if is_param:
+                line = sig_line           # (sig_line is already file-relative)
+            else:
+                if body is None:
+                    # the declarations: from the line after the signature to
+                    # the first empty line of the body
+                    body = []
+                    for i in range(sig_line - off, len(flines)):
+                        if body and not flines[i].strip():
+                            break
+                        body.append((i + 1 + off, flines[i]))
+                pat = re.compile(r"(?<![\w?:'$])%s(?![\w?:'$])\s*(\[[^\]]*\]\s*)*;" % re.escape(self.nm(vname)))
+                for ln, text in body:
+                    if pat.search(text):
+                        line = ln
+                        break
+            if line is not None:
+                die.add(C.DW_AT_decl_file, C.DW_FORM_udata, file_no)
+                die.add(C.DW_AT_decl_line, C.DW_FORM_udata, line)
+
     def _export_prototype_params(self, die, func, ranges, flow):
         """Parameters of a function without decompiler output, from its
         Ghidra prototype (located where their entry values still are)."""
@@ -1247,6 +1523,7 @@ class Exporter(object):
         for p in func.getParameters():
             self.stats["variables"] += 1
             pd = die.child(C.DW_TAG_formal_parameter)
+            self._var_dies.append((pd, str(p.getName()), True))
             self.dw.name(pd, str(p.getName()))
             self.types.ref(pd, p.getDataType())
             try:
@@ -1327,6 +1604,24 @@ class Exporter(object):
             self._export_variable(func_die, sym, ctx, sym.isParameter())
 
     @staticmethod
+    def _duplicated_return_code(hf, flow):
+        """Offsets of instructions in more than one decompiler basic block,
+        one of them a return block (no successors)."""
+        if flow is None or hf is None:
+            return set()
+        seen, rets = {}, set()
+        for b in hf.getBasicBlocks():
+            cover = _block_cover(b)
+            if cover is None:
+                return set()
+            offs = _cover_offsets(cover, flow.insns)
+            for o in offs:
+                seen[o] = seen.get(o, 0) + 1
+            if b.getOutSize() == 0:
+                rets.update(offs)
+        return set(o for o in rets if seen[o] > 1)
+
+    @staticmethod
     def _find_code_decls(markup):
         """{variable name: pointer depth} for variables the decompiler
         declares as "code *" -- its placeholder for function pointers of
@@ -1352,6 +1647,7 @@ class Exporter(object):
         tag = C.DW_TAG_formal_parameter if is_param else C.DW_TAG_variable
         die = func_die.child(tag)
         self.dw.name(die, str(sym.getName()))
+        self._var_dies.append((die, str(sym.getName()), is_param))
         depth = getattr(self, "_code_decls", {}).get(str(sym.getName()))
         if depth and classify(sym.getDataType()) == "ptr":
             die.add(C.DW_AT_type, C.DW_FORM_ref4, self.types.code_pointer(depth))
@@ -1806,6 +2102,20 @@ class Exporter(object):
 _COVER_FIELD = []
 
 
+def _cover_offsets(cover, insns):
+    """The instruction offsets (of the sorted list insns) in an AddressSet."""
+    out = []
+    it = cover.getAddressRanges()
+    while it.hasNext():
+        r = it.next()
+        lo, hi = int(r.getMinAddress().getOffset()), int(r.getMaxAddress().getOffset())
+        i = bisect.bisect_left(insns, lo)
+        while i < len(insns) and insns[i] <= hi:
+            out.append(insns[i])
+            i += 1
+    return out
+
+
 def _block_cover(block):
     """The decompiler basic block's AddressSet of instructions (its private
     "cover" field; None if unavailable)."""
@@ -2029,8 +2339,11 @@ class _FunctionContext(object):
             ublock = op.getParent()
             uaddr = int(op.getSeqnum().getTarget().getOffset())
             uend = self.exp.insn_end(op.getSeqnum().getTarget())
+            same_insn_after = (defop is not None and daddr == uaddr
+                               and int(defop.getSeqnum().getOrder()) < int(op.getSeqnum().getOrder()))
             if (int(ublock.getIndex()) == dindex
                     and (self._block_pos(ublock, daddr) < self._block_pos(ublock, uaddr)
+                         or same_insn_after
                          or (defop is None or defop.getOpcode() == PcodeOp.MULTIEQUAL) and daddr == uaddr)):
                 out += self._block_spans(ublock, dpoint, uaddr, uend, start_addr=daddr)
             else:
@@ -2092,6 +2405,11 @@ class _FunctionContext(object):
                         return False
                 elif dv.isConstant():
                     if mv[0] == "r" or (mv[0] == "c" and mv[1] != int(dv.getOffset())):
+                        return False
+                elif dv.getAddress().isMemoryAddress():
+                    # a value read from memory (a global, a literal pool
+                    # constant): only the same memory operand matches
+                    if mv[0] != "a" or mv[1] != int(dv.getOffset()):
                         return False
             return True
 
@@ -2182,7 +2500,7 @@ class _FunctionContext(object):
         own = (int(vn.getOffset()), int(vn.getSize())) if vn.isRegister() else None
         out = []
         for pc in pcs:
-            e = self.best_location(flow.locations_of(pc, value), own)
+            e = self.best_location(flow.locations_of(pc, value, int(vn.getSize())), own)
             if e is not None:
                 out.append((pc, flow.insn_end(pc), e))
         return out
@@ -2272,7 +2590,7 @@ class _FunctionContext(object):
             if not changed:
                 break
 
-        result = {}
+        per_pc = {}
         for bi, (bounds, pcs, _, _) in binfo.items():
             if bounds is None:
                 continue
@@ -2285,6 +2603,15 @@ class _FunctionContext(object):
                 while j < len(ev) and ev[j][0] <= pos:
                     cur = ev[j][2]
                     j += 1
+                per_pc.setdefault(pc, set()).add(cur)
+        # A PC in several decompiler blocks (the decompiler duplicates
+        # shared return code and loop tests): only where they agree on the
+        # current instance; otherwise the value depends on the path taken.
+        result = {}
+        for pc in sorted(per_pc):
+            insts = per_pc[pc]
+            if len(insts) == 1:
+                cur = next(iter(insts))
                 if cur is not None:
                     result.setdefault(cur, []).append(pc)
         return result
@@ -2327,6 +2654,46 @@ class _FunctionContext(object):
                 merged.append((st_, en, e))
         merged.sort(key=lambda x: x[0])
         return ("list", [(A(a), A(a) + (b - a), e) for a, b, e in merged])
+
+    def join_pcs(self, vn, storage, pcs):
+        """[(pc, end, expr)] for a join-space instance (a value split over
+        several registers, or a float in a wider FPR) defined by a machine
+        instruction: each piece located through the flow analysis. None if
+        not applicable (pieces not all registers, no defining instruction)."""
+        d = vn.getDef()
+        pieces = list(storage.getVarnodes())
+        if d is None or not pieces or not all(p.isRegister() for p in pieces):
+            return None
+        off = int(d.getSeqnum().getTarget().getOffset())
+        keys = [(int(p.getOffset()), int(p.getSize())) for p in pieces]
+        vals = [self.flow.value_after(off, k) for k in keys]
+        if any(v is None for v in vals):
+            return []
+        order = list(range(len(pieces)))
+        if len(pieces) > 1 and not self.exp.big_endian:
+            order.reverse()          # DWARF pieces in memory order
+        out = []
+        for pc in pcs:
+            exprs = []
+            for i in order:
+                # (a float in a wider FPR: also where it is stored converted)
+                size = int(vn.getSize()) if len(pieces) == 1 and vn.getSize() < keys[i][1] else None
+                e = self.best_location(self.flow.locations_of(pc, vals[i], size), keys[i])
+                if e is None:
+                    break
+                exprs.append((e, keys[i][1]))
+            else:
+                if len(exprs) == 1:
+                    expr = exprs[0][0]
+                else:
+                    buf = bytearray()
+                    for e, size in exprs:
+                        buf += e
+                        buf.append(C.DW_OP_piece)
+                        buf += uleb(size)
+                    expr = bytes(buf)
+                out.append((pc, self.flow.insn_end(pc), expr))
+        return out
 
     def compound_input_pcs(self, storage, pcs):
         """Spans where every register piece of an input still holds its
@@ -2405,6 +2772,14 @@ class _FunctionContext(object):
                 if vn.isInput() and pcs is not None:
                     entries.extend(self.compound_input_pcs(storage, pcs))
                     continue
+                if pcs is not None and self.flow is not None:
+                    joined = self.join_pcs(vn, storage, pcs)
+                    if joined is not None:
+                        # (where every piece's value physically still is: a
+                        # 64-bit call result moves out of r3:r4, a float out
+                        # of f1, at the next call or reuse)
+                        entries.extend(joined)
+                        continue
                 e = self.storage_expr(storage)
             else:
                 e = None

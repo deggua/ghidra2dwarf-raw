@@ -38,12 +38,23 @@ void shape_release(char *p);
 int shape_build(const char *name);
 int shape_helper3(int x);
 int shape_cb(int x);
-int shape_two(int (*fp)(int), int n, int flag);
+/* (named types: Ghidra's C parser names an anonymous function-pointer type
+   after its parameter, so "int (*fp)(int)" and "void (*fp)(void)" would be
+   one type "fp") */
+typedef int (*shape_int_fn)(int);
+typedef void (*shape_void_fn)(void);
+int shape_two(shape_int_fn fp, int n, int flag);
 void shape_cb2(void);
-int shape_loop3(void (*fp)(void), int n);
+int shape_loop3(shape_void_fn fp, int n);
 int shape_dhelper(int x);
 int shape_disp(int op, int x);
 int shape_take(const char *s, int *p);
 int shape_skipme(char *s, int *p, unsigned char b[4]);
 int shape_wrap2(const char *s, int *p);
+uint64_t shape_get64(int a);
+float shape_getf(int a);
+uint64_t shape_keepll(int a);
+float shape_keepf(int a);
+int shape_phi3(int *p, int n);
+int shape_switch(int op, int x);
 void shapes_main(void);

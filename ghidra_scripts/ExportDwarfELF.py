@@ -91,7 +91,10 @@ def _gui_options(opts):
             raise ValueError("choose an output directory")
         d = os.path.expanduser(str(f.getPath()).strip())
         # (relative to the program's directory, not Ghidra's working directory)
-        return d if os.path.isabs(d) else os.path.join(_default_dir(), d)
+        d = d if os.path.isabs(d) else os.path.join(_default_dir(), d)
+        if os.path.exists(d) and not os.path.isdir(d):
+            raise ValueError("output directory: %s is a file" % d)
+        return d
 
     @JImplements("docking.widgets.values.ValuesMapValidator")
     class Validator(object):
@@ -117,9 +120,9 @@ def main():
     args = [str(a) for a in getScriptArgs()]
     out_dir = None
     for a in args:
-        if "=" in a:
-            k, v = a.split("=", 1)
-            opts.set(k.strip(), v.strip())
+        k = a.split("=", 1)[0].strip()
+        if "=" in a and hasattr(opts, k):
+            opts.set(k, a.split("=", 1)[1].strip())
         elif out_dir is None:
             out_dir = a
         else:

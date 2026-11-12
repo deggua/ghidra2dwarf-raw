@@ -198,7 +198,7 @@ int shape_cb(int x)
     return x + 1;
 }
 
-int shape_two(int (*fp)(int), int n, int flag)
+int shape_two(shape_int_fn fp, int n, int flag)
 {
     if (flag)
         return shape_helper3(flag) + 1;
@@ -210,7 +210,7 @@ void shape_cb2(void)
     g_shape_sink++;
 }
 
-int shape_loop3(void (*fp)(void), int n)
+int shape_loop3(shape_void_fn fp, int n)
 {
     int i;
 
@@ -233,7 +233,7 @@ int shape_dhelper(int x)
 }
 
 #define SD_L(k) &&d##k,
-#define SD_C(k) d##k: r = shape_dhelper(r + k) + k; goto out;
+#define SD_C(k) d##k: r = shape_dhelper(r + k); goto out;
 #define SD_X10(m, a) m(a##0) m(a##1) m(a##2) m(a##3) m(a##4) m(a##5) m(a##6) m(a##7) m(a##8) m(a##9)
 int shape_disp(int op, int x)
 {
@@ -270,6 +270,69 @@ int shape_wrap2(const char *s, int *p)
     return shape_take(s, p);
 }
 
+/* ---- third review ----------------------------------------------------- */
+
+/* call results in a register pair / FPR, kept across the next call */
+uint64_t shape_get64(int a)
+{
+    return ((uint64_t)a << 32) | (unsigned int)(a + 1);
+}
+
+float shape_getf(int a)
+{
+    return (float)a * 1.5f;
+}
+
+uint64_t shape_keepll(int a)
+{
+    uint64_t x = shape_get64(a);
+    uint64_t y = shape_get64(a + 1);
+    shape_leaf(a + 2);
+    return x ^ y;
+}
+
+float shape_keepf(int a)
+{
+    float x = shape_getf(a);
+    float y = shape_getf(a + 1);
+    shape_leaf(a + 2);
+    return x + y;
+}
+
+/* an early return inside a loop: return code the decompiler duplicates */
+int shape_phi3(int *p, int n)
+{
+    int s = 0, i;
+
+    for (i = 0; i < n; i++) {
+        if (p[i] < 0)
+            return -1;
+        s += shape_leaf(p[i]);
+    }
+    if (s > 100)
+        s = s - 100;
+    else
+        s = s + n;
+    return s;
+}
+
+/* a jump table; cases whose first statement isn't a call */
+int shape_switch(int op, int x)
+{
+    switch (op) {
+    case 0: return shape_leaf(x);
+    case 1: x = x * x; break;
+    case 2: x = x - 5; break;
+    case 3: x = x << 2; break;
+    case 4: x = x | 1; break;
+    case 5: x = -x; break;
+    case 6: x = x >> 1; break;
+    default: return -1;
+    }
+    shape_leaf(x);
+    return x;
+}
+
 void shapes_main(void)
 {
     int i;
@@ -297,4 +360,9 @@ void shapes_main(void)
         unsigned char b[4] = { 1, 2, 3, 4 };
         g_shape_sink = shape_wrap2("ab", &v) + shape_skipme("cd", &v, b);
     }
+    g_shape_sink = (int)shape_keepll(4);
+    g_shape_sink = (int)shape_keepf(2);
+    g_shape_sink = shape_phi3(g_shape_arr, 3);
+    for (i = 0; i < 8; i++)
+        g_shape_sink = shape_switch(i, i + 10);
 }

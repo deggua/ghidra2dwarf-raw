@@ -31,6 +31,7 @@ INIT = "init"
 DEF = "def"
 PHI = "phi"
 CONST = "const"
+CVT = "cvt"     # (CVT, value, size): value converted to a float of size bytes
 
 MAX_STEPS = 500000
 
@@ -127,6 +128,7 @@ class MachineInfo(object):
             reg = self.lang.getRegister(name)
             if reg is not None:
                 self.irq_ret.append(((int(reg.getAddress().getOffset()), int(reg.getMinimumByteSize())), col))
+        self.irq_keys = set(k for k, _ in self.irq_ret)
         self.volatile = [k for k in self.mapped
                          if k != self.sp_key and k not in self.unaffected and k != self.ra_key]
 
@@ -311,12 +313,15 @@ class FunctionFlow(object):
     ``state_out``  {offset: State} after each reachable instruction
     """
 
-    def __init__(self, machine, func, extra_edges=None):
+    def __init__(self, machine, func, extra_edges=None, init_state=None):
         self.m = machine
         self.func = func
         # {instruction offset: [target offsets]}: computed jumps the
         # decompiler resolved (switch jump tables)
         self.extra_edges = extra_edges or {}
+        # the state on entry, if not a fresh call (a handler's shared exit
+        # path entered by a branch from another handler)
+        self.init_state = init_state
         self.listing = machine.listing
         self.state_in = {}
         self.state_out = {}
@@ -686,7 +691,7 @@ class FunctionFlow(object):
                     del st.mem[o]
                 st.mem[soff] = (size, val)
                 if (val is not None and val[0] == INIT and val[1] not in st.saved
-                        and self.m.dwarf_of(val[1]) is not None):
+                        and (self.m.dwarf_of(val[1]) is not None or val[1] in self.m.irq_keys)):
                     st.saved[val[1]] = soff
             else:
                 self.side_effect = True
@@ -713,6 +718,12 @@ class FunctionFlow(object):
             # Low-order bytes of a value (e.g. MIPS64 "sw a0,.." stores
             # the 32-bit low part of the 64-bit a0): same origin, narrower.
             val = self._narrow(self._get(st, i0), out[2] if len(out) > 2 else 0)
+        elif opc == PcodeOp.FLOAT_FLOAT2FLOAT:
+            # A float converted to another precision (PPC "stfs" of an FPR,
+            # which holds floats in double format): the same number, which a
+            # variable of the converted size may be located in.
+            inner = self._get(st, i0)
+            val = (CVT, inner, out[2]) if inner is not None and inner[0] != CVT and len(out) > 2 else None
         elif opc in (PcodeOp.INT_ZEXT, PcodeOp.INT_SEXT) and out[0] == "r" and i0[0] in "ru":
             # Widening writes (x86-64 "mov ebx, edi" is RBX = zext(EBX),
             # MIPS64/PPC64 32-bit ops sign-extend): the wide register gets
@@ -847,10 +858,14 @@ class FunctionFlow(object):
                                open_jump,
                                int(fall.getOffset()) if fall is not None and body.contains(fall) else None)
         self.insns.sort()
+        self.is_leaf = not any(d[0] for d in self.decoded.values())
 
-        init = State()
-        if self.m.ra_stack is not None:
-            init.mem[self.m.ra_stack] = (self.m.ptr_size, (INIT, ("ra",)))
+        if self.init_state is not None:
+            init = self.init_state.copy()
+        else:
+            init = State()
+            if self.m.ra_stack is not None:
+                init.mem[self.m.ra_stack] = (self.m.ptr_size, (INIT, ("ra",)))
         entry_off = int(entry.getOffset())
         self.state_in[entry_off] = init
         preds = {}
@@ -1064,9 +1079,11 @@ class FunctionFlow(object):
         cache[id(st)] = (st, regs, mem)
         return regs, mem
 
-    def locations_of(self, off, value):
+    def locations_of(self, off, value, size=None):
         """All (kind, where) holding ``value`` on entry to instruction off:
-        ("reg", key) or ("stack", sp_offset)."""
+        ("reg", key) or ("stack", sp_offset). With the variable's size:
+        also stack slots holding the value converted to a float of that
+        size."""
         st = self.state_in.get(off)
         if st is None or value is None:
             return []
@@ -1094,6 +1111,8 @@ class FunctionFlow(object):
             if self.reg_value(st, value[1]) == value:
                 out.append(("reg", value[1]))
         out += [("stack", o) for o in mem_by_val.get(value, ())]
+        if size:
+            out += [("stack", o) for o in mem_by_val.get((CVT, value, size), ())]
         return out
 
 
@@ -1160,8 +1179,9 @@ class CfiGenerator(object):
         else:
             for k, v in sorted((kv for kv in st.regs.items() if kv[0][0] != "u"), key=lambda kv: kv[0]):
                 # a frame pointer: only a call-preserved register is still
-                # valid when this frame is a caller frame
-                if v is not None and v[0] == SP and m.is_preserved(k):
+                # valid when this frame is a caller frame (a function that
+                # makes no calls is never one)
+                if v is not None and v[0] == SP and (m.is_preserved(k) or flow.is_leaf):
                     num = m.dwarf_of(k)
                     if num is not None:
                         cfa = (num, m.stackshift - v[1])
@@ -1187,6 +1207,10 @@ class CfiGenerator(object):
             slot = slots.get(ret_key)
             if slot is not None and slot[1] == ret_key[1]:
                 saved[col] = slot[0] - m.stackshift
+            elif ret_key in st.saved:
+                # the handler changed the saved PC (e.g. +4 to skip a trap
+                # instruction): the slot is still where rfi returns from
+                saved[col] = st.saved[ret_key] - m.stackshift
             for k in m.mapped:
                 num = m.dwarf_of(k)
                 if num is None or k == m.sp_key:
@@ -1313,13 +1337,19 @@ class CfiGenerator(object):
             # One FDE per run of instructions with a known CFA. Where the CFA
             # is lost (stack realignment, alloca, unreachable code) no FDE
             # covers the code, so GDB falls back to its prologue analyzer
-            # instead of using a stale row.
+            # instead of using a stale row. Bytes that aren't instructions in
+            # the listing (e.g. switch cases nobody disassembled) end a run
+            # too: the row before them says nothing about that code.
             start = None
             rows = []
             prev = None
+            end = None
             for off in flow.insns:
                 if off < lo or off >= hi:
                     continue
+                if start is not None and off != end:
+                    self.dw.fdes.append(FrameDescription(self.A(start), self.A(end), rows, cie))
+                    start = None
                 st = flow.state_in.get(off)
                 rule = self._rule(flow, st, irq) if st is not None else None
                 if rule is None:
@@ -1327,6 +1357,7 @@ class CfiGenerator(object):
                         self.dw.fdes.append(FrameDescription(self.A(start), self.A(off), rows, cie))
                         start = None
                     continue
+                end = off + flow.insn_len[off]
                 if start is None:
                     start, rows = off, []
                     prev = (m.sp_dwarf, m.stackshift, {})
@@ -1338,4 +1369,4 @@ class CfiGenerator(object):
                     rows.append((self.A(off), ops))
                 prev = rule
             if start is not None:
-                self.dw.fdes.append(FrameDescription(self.A(start), self.A(lo) + (hi - lo), rows, cie))
+                self.dw.fdes.append(FrameDescription(self.A(start), self.A(lo) + (min(end, hi) - lo), rows, cie))

@@ -183,6 +183,17 @@ def _lines(path):
     return _read(path).split("\n")
 
 
+def source_line(sal):
+    """Text of a symtab-and-line's line in the generated C files."""
+    if sal is None or sal.symtab is None:
+        return ""
+    for path in SRC_FILES:
+        if os.path.basename(path) == os.path.basename(sal.symtab.filename):
+            lines = _lines(path)
+            return lines[sal.line - 1] if 0 < sal.line <= len(lines) else ""
+    return ""
+
+
 def line_of(pattern, after=None):
     """First line in the C files matching regex (after a Line)."""
     start = SRC_FILES.index(after.path) if isinstance(after, Line) else 0

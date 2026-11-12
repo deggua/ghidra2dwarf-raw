@@ -92,6 +92,16 @@ def check_shapes():
     cont_to("shape_fib", "n == 1")
     check_full_backtrace("fib", ["shape_fib", "shapes_main"])
     check("fib: recursion frames", frame_names().count("shape_fib") >= 3, frame_names())
+    # a caller frame shows the line of the call (MIPS: the PC is in the delay
+    # slot after the jal)
+    if re.search(r"\bshape_fib\(", func_text("shape_fib").split("{", 1)[-1]):
+        f1 = gdb.newest_frame().older()
+        text = source_line(f1.find_sal() if f1 is not None else None)
+        check("caller frame shows the call's line", "shape_fib(" in text, text)
+    else:
+        # (PPC64 ELFv2 -O0: the decompiler turns the recursive calls to the
+        # local entry point into a loop)
+        print("SKIP caller frame line (no call in the decompiled shape_fib)")
 
     # conditional move into a callee-saved register
     cont_to("shape_leaf", "v == 77")
@@ -197,6 +207,8 @@ def check_shapes_2():
     cont_to("shape_helper3", "x == 7")
     select_frame("shape_two")
     check_fp("indirect-call caller: fp", "fp", "shape_cb")
+    out = run("ptype fp")
+    check("function-pointer parameter type", "int (*)(int)" in out, out)
     check_correct_or_unavailable("indirect-call caller: n", "n", 1234)
     check_correct_or_unavailable("indirect-call caller: flag", "flag", 7)
     for _ in range(3):
@@ -223,6 +235,117 @@ def check_shapes_2():
     check_correct_or_unavailable("skipped function parameter *p", "*p", 7)
     out = run("info args")
     check("skipped function lists its parameters", "s = " in out and "p = " in out, out)
+
+
+def _assigned(func, callee):
+    """{argument text: variable} for the "var = callee(args);" lines of func."""
+    found = {}
+    for m in re.finditer(r"\b(\w+) = (?:\([\w ]+\))?%s\(([^;]*)\);" % callee, func_text(func)):
+        found[m.group(2).strip()] = m.group(1)
+    return found
+
+
+def check_kept_results(func, callee, leaf_v, expected, is_float):
+    """Call results (a register pair, an FPR) stored in variables and kept
+    across the next call: right or unavailable, while in that call."""
+    cont_to("shape_leaf", "v == %d" % leaf_v)
+    check_full_backtrace(func, ["shape_leaf", func, "shapes_main"])
+    select_frame(func)
+    found = _assigned(func, callee)
+    if not found:
+        print("SKIP %s results (no variable assigned from %s)" % (func, callee))
+    for arg, var in sorted(found.items()):
+        name = "%s: %s = %s(%s) after the next call" % (func, var, callee, arg)
+        exp = expected.get(arg)
+        try:
+            v = val(var)
+            if v.is_optimized_out:
+                print("SKIP %s (<optimized out>)" % name)
+                continue
+            if is_float:
+                got = float(v)
+                ok = any(abs(got - e) < 1e-6 for e in ([exp] if exp is not None else expected.values()))
+            else:
+                mask = (1 << (8 * v.type.sizeof)) - 1
+                got = int(v) & mask
+                ok = got in [e & mask for e in ([exp] if exp is not None else expected.values())]
+            check(name, ok, "%s = %r, expected %r" % (var, got, exp if exp is not None else expected))
+        except gdb.error as e:
+            check(name, False, "%s: %s" % (var, e))
+
+
+def step_lines(func, cond):
+    """Stops at func (if cond), steps it with nexti until it returns; the
+    (line, text) shown at each instruction."""
+    cont_to(func, cond)
+    seen = []
+    for _ in range(3000):
+        f = gdb.selected_frame()
+        if f.name() != func:
+            break
+        sal = f.find_sal()
+        seen.append((sal.line, source_line(sal).strip()))
+        run("nexti")
+    return seen
+
+
+def func_lines(func):
+    """[(file line, text)] of a function in the C files."""
+    first = line_of(r"/\* ---- %s @ [0-9a-f]+ ---- \*/" % re.escape(func))
+    return [(first + i, t) for i, t in enumerate(func_text(func).split("\n"))]
+
+
+def check_shapes_3():
+    """Shapes from the third review (firmware/shapes.c)."""
+    # call results kept across a call: a 64-bit result in a register pair,
+    # a float result in an FPR
+    check_kept_results("shape_keepll", "shape_get64", 6, {"a": (4 << 32) | 5, "a + 1": (5 << 32) | 6}, False)
+    check_finish("finish shape_keepll (64-bit return)", (1 << 32) | 3)
+    if os.environ.get("FP_ARGS_OK", "1") == "1":
+        check_kept_results("shape_keepf", "shape_getf", 4, {"a": 3.0, "a + 1": 4.5}, True)
+    else:
+        print("SKIP float results (unreadable in this GDB+QEMU setup even with GCC's DWARF)")
+        cont_to("shape_leaf", "v == 4")
+        select_frame("shape_keepf")
+    if os.environ.get("FP_RET_OK", "1") == "1":
+        check_finish("finish shape_keepf (float return)", 7.5)
+
+    # an early return in a loop: the shared return code is never shown as
+    # the early "return -1;" on the normal path
+    seen = step_lines("shape_phi3", None)
+    texts = [t for _, t in seen]
+    check("phi3: stepped through the function", len(seen) > 5, texts)
+    bad = [t for t in texts if re.match(r"^return -1;", t)]
+    check("phi3: early return never shown on the normal path", not bad, texts)
+
+    # switch: a breakpoint or stop on a case's statements is in that case;
+    # case labels have no code of their own
+    owner = {}
+    depth, sw_depth, cur = 0, None, None
+    for ln, t in func_lines("shape_switch"):
+        m = re.match(r"^\s*(?:case (\w+)|(default)):", t)
+        if sw_depth is not None and m:
+            cur = m.group(1) or "default"
+            owner[ln] = ("label", cur)
+        elif cur is not None:
+            owner[ln] = ("case", cur)
+        if re.match(r"^\s*switch\s*\(", t):
+            sw_depth = depth
+        depth += t.count("{") - t.count("}")
+        if sw_depth is not None and depth <= sw_depth and cur is not None:
+            owner.pop(ln, None)
+            sw_depth, cur = None, None
+    if not any(kind == "label" for kind, _ in owner.values()):
+        print("SKIP switch cases (no switch in the decompiled shape_switch)")
+        return
+    for k in (1, 2, 3, 6):
+        seen = step_lines("shape_switch", "op == %d" % k)
+        mine = [t for ln, t in seen if owner.get(ln) == ("case", str(k))]
+        other = [(ln, t) for ln, t in seen if ln in owner and owner[ln][0] == "case" and owner[ln][1] != str(k)]
+        labels = [(ln, t) for ln, t in seen if owner.get(ln, ("",))[0] == "label"]
+        check("switch op=%d: its case's statements are shown" % k, mine, seen)
+        check("switch op=%d: no other case's statement shown" % k, not other, other)
+        check("switch op=%d: case labels have no code" % k, not labels, labels)
 
 
 def main():
@@ -301,6 +424,12 @@ def main():
     out = run("info locals")
     check("locals with '?' names listed", LOC in out, out)
     check("stack array local content", "abcdefg" in out, out)
+    # declaration lines of parameters and locals (GDB's Python API)
+    blk = gdb.selected_frame().block()
+    while blk is not None and blk.function is None:
+        blk = blk.superblock
+    nolines = [sym.name for sym in blk if (sym.is_argument or sym.is_variable) and not sym.line] if blk else ["?"]
+    check("variables have declaration lines", not nolines, nolines)
     values = []
     for sym in gdb.selected_frame().block():
         if sym.is_variable and sym.name.startswith(LOC):
@@ -364,6 +493,7 @@ def main():
 
     check_shapes()
     check_shapes_2()
+    check_shapes_3()
 
     # --- globals at the end ----------------------------------------------------------
     cont_to("edge_done")
@@ -447,6 +577,10 @@ def main():
     check_eq("quote replaced in name", "it_s", 7)
     # struct/union/enum names without the tag keyword, as the pseudo-C uses them
     check_eq("bare struct name", "sizeof(packed_rec)", 7)
+    out = run("ptype struct msg")
+    check("flexible array member", "data[];" in out, out)
+    out = run("info types packed_rec")
+    check("types listed with their header line", re.search(r"types\.h:\s*\n\d+:", out) is not None, out)
     check_eq("bare struct name (union member)", "sizeof(reg)", 8)
     check_eq("bare enum name", "(int)(big)0", 0)
     check_eq("namespaced global Foo", Q(FOO_COUNTER), 100)

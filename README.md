@@ -215,15 +215,30 @@ Things to check in your Ghidra project, all found while testing:
     spec has no callee-pops convention.
   * `char` signedness follows the compiler spec, which for most processors is
     signed (GCC uses unsigned on ARM, AArch64 and PowerPC).
+* **Function-pointer types from parsed headers.** Ghidra's C parser names an
+  anonymous function-pointer type after its parameter, so `int (*fp)(int)`
+  in one prototype and `void (*fp)(void)` in another become one type `fp`,
+  and one of the functions gets the other's type. Use typedefs for
+  function-pointer parameters in headers you parse into Ghidra.
 * **Unrecovered switch tables.** If neither Ghidra nor its decompiler
   recovers a jump table ("Could not recover jumptable" in the decompiled
   code), the case code is not part of the function: it has no line info,
   CFI or variables, so stepping and backtraces there (and through calls made
-  from there) go wrong. Recover the table (e.g. the `SwitchOverride.java`
-  script with the case addresses), then re-export. Case code that is in the
-  function body but only reachable through an unresolved computed jump (not
-  a call, and not one made after the frame is popped, like an indirect tail
-  call) is analyzed with the state after the jump.
+  from there) go wrong. Common causes: the table's address is loaded from
+  a literal pool in writable memory (mark ROM blocks read-only: the
+  decompiler only treats loads from read-only memory as constants), or a
+  64-bit register index that the code only bounds with a 32-bit compare
+  (PPC64, MIPS n32 `switch` on an `int`). Recover the table (e.g. the
+  `SwitchOverride.java` script with the case addresses), or at least
+  disassemble the case code and add it to the function body, then
+  re-export. Case code that is in the function body but only reachable
+  through an unresolved computed jump (not a call, and not one made after
+  the frame is popped, like an indirect tail call) is analyzed with the
+  state after the jump. Bytes in a function body that aren't disassembled
+  get no CFI (GDB falls back to its prologue analyzer there). If the decompiler
+  recovers a table but the case code was never disassembled (it decodes
+  the bytes itself), the export warns ("switch cases at ... are not
+  disassembled"): disassemble them (`D` at each case) and re-export.
 * **Language variant.** Pick one that decodes all your instructions; e.g. POWER8+
   code needs `PowerPC:*:64:A2ALT`, since the `default` PPC64 languages lack VSX
   (`mtfprd`).
@@ -255,6 +270,14 @@ A function is treated as a handler when:
   0x100 has nothing to return to); or
 * one of the above jumps (not calls) to it. This covers vector stubs like
   `nop; nop; b handler`.
+
+A handler entered by a branch from another one (a shared exit path such as
+`b irq_exit`) is analyzed with the state at that branch, so its CFI still
+knows the exception frame and unwinds into the interrupted code, also when
+the handler changed the saved PC (e.g. +4 to skip a trapping instruction).
+`break handler` stops after the handler has stored the interrupt return
+register (if that happens before its first call or branch), so the
+backtrace there already reaches the interrupted code.
 
 With `irq_signal_frame=true` (default) the handler CIE has augmentation `S`,
 and GDB shows the handler as `<signal handler called>` and looks up the
@@ -327,8 +350,16 @@ code.
 * **Line table**: each decompiled line is mapped to the instructions behind its
   tokens. The frame setup maps to the signature line, and the first body
   instruction carries `prologue_end`, so `break func` stops before any argument
-  register is overwritten.
-* **Variable locations**: location lists, see below.
+  register is overwritten. A call instruction gets the call's line, also when
+  other code is folded into it (a MIPS delay slot, which takes its branch's
+  line). `case N:` labels get no code. Return code the decompiler duplicated
+  into several `return` statements (an epilogue shared by an early and the
+  final return) maps to the function's closing `}`, as with GCC, since which
+  return it belongs to depends on the path taken. An instruction no token
+  claims at a block start or jump target gets the line of the code that
+  follows it, not of whatever precedes it in memory.
+* **Variable locations**: location lists, see below. Parameters and locals
+  carry their declaration line, and types their line in `<name>.types.h`.
 * **Call frame information** (`.debug_frame`): see below.
 
 ### How variable locations and unwinding work
@@ -349,6 +380,9 @@ values, so the exporter combines two analyses:
    tracks the stack pointer as *entry SP + delta*, register entry values,
    per-instruction definitions, phi merges at joins, and stack slots, through
    copies, spills/reloads, zero/sign extensions and sub-register views,
+   values split over several registers (a 64-bit result in a register
+   pair, located piece by piece), floats stored with a precision
+   conversion (PPC `stfs` of an FPR, which holds a float in double format),
    constants built in pieces (`lis`/`ori`), conditionally executed p-code
    (ARM conditional instructions, x86 `cmov`, conditional returns such as
    PPC `beqlr`, MIPS branch-likely delay slots), and calls (call-clobbered
@@ -426,6 +460,11 @@ undefined return address, so backtraces end cleanly.
 * Values that only exist as an expression of other registers (e.g. `i` when
   only `i+1` is kept) are reported as `<optimized out>`. There's no
   `DW_OP_stack_value` synthesis.
+* A call is assumed to clobber every register the calling convention
+  doesn't preserve. Code from interprocedural register allocation (GCC
+  `-fipa-ra`, on by default at `-O2`) that keeps a value in such a register
+  across a call to a function known not to touch it shows the value as
+  `<optimized out>` from that call on.
 
 ## Performance
 
@@ -434,7 +473,12 @@ Exporting the stripped PPC32 glibc (`libc.so.6`, 2.3 MB, 3,687 functions,
 before the decompiler ran in parallel and the flow analysis was tuned). The
 decompiler runs in worker threads ahead of the export (`decompile_threads`,
 default min(8, CPUs - 1)); what remains is mostly the single-threaded flow
-and location analysis in Python. The 4.5 MB ELF loads in GDB in about 0.1 s
+and location analysis in Python. The output doesn't depend on the thread
+count: the decompiler's names for locals can depend on what its process
+decompiled before (values over several registers, or floats in wider
+registers, get storage in the order the process first meets them), so a
+function with two or more such locals is decompiled again in a fresh
+process. The 4.5 MB ELF loads in GDB in about 0.1 s
 and passes `llvm-dwarfdump --verify`. A small firmware exports in about a
 second.
 
@@ -558,8 +602,14 @@ The edge-case module (`firmware/edge.c`, `edge_asm.S`, `ghidra_setup_edge.py`,
   early return through a non-contiguous decompiler block, indirect calls
   (delay slots), a computed-goto dispatcher with 70 cases and an indirect
   tail call whose table is in RAM, and pointer parameters in prototypes the
-  exporter writes itself; on ppc32 also
-  out-of-line `_savegpr`/`_restgpr` helpers, a return address parked in r30,
+  exporter writes itself; from a third review 64-bit and float call results
+  kept across a later call, an early return in a loop whose epilogue the
+  decompiler duplicates (stepped instruction by instruction: the early
+  `return` line must never show on the normal path), and a jump-table
+  `switch` (stepping each case must show only that case's lines, and no
+  `case` label); on ppc32 also
+  out-of-line `_savegpr`/`_restgpr` helpers (including a backtrace from
+  inside `_restgpr_29_x`), a return address parked in r30,
   and an exception handler that leaves through a shared `rfi` exit;
 * a memory map without the X flag (ppc32-linux);
 * alias labels on a function and on data items.
