@@ -128,11 +128,7 @@ public final class CfiGenerator {
         }
         else {
             List<Map.Entry<Key, Val>> regs = new ArrayList<>();
-            for (Map.Entry<Key, Val> e : st.regs.entrySet()) {
-                if (!e.getKey().isU()) {
-                    regs.add(e);
-                }
-            }
+            flow.forEachReg(st, (k, v) -> regs.add(new java.util.AbstractMap.SimpleImmutableEntry<>(k, v)));
             regs.sort((x, y) -> x.getKey().compareTo(y.getKey()));
             for (Map.Entry<Key, Val> e : regs) {
                 Val v = e.getValue();
@@ -181,6 +177,7 @@ public final class CfiGenerator {
             }
             return new Rule(cfaReg, cfaOff, saved);
         }
+        Map<Val, int[]> holders = null;
         for (Key k : trackedRegs()) {
             Integer num = m.dwarfOf(k);
             if (num == null || k.equals(m.spKey)) {
@@ -196,7 +193,10 @@ public final class CfiGenerator {
                     saved.put(num, slot[0] - m.stackshift);
                     continue;
                 }
-                Integer other = registerHolding(flow, st, Val.init(k), true);
+                if (holders == null) {
+                    holders = entryHolders(st);
+                }
+                Integer other = registerHolding(holders, Val.init(k), true);
                 if (other != null && !other.equals(num)) {
                     saved.put(num, new RegSave(other));
                     continue;
@@ -207,7 +207,10 @@ public final class CfiGenerator {
                 continue;
             }
             if (!holdsEntry) {
-                Integer other = registerHolding(flow, st, Val.init(k), false);
+                if (holders == null) {
+                    holders = entryHolders(st);
+                }
+                Integer other = registerHolding(holders, Val.init(k), false);
                 if (other != null) {
                     saved.put(num, new RegSave(other));
                 }
@@ -216,30 +219,44 @@ public final class CfiGenerator {
         return new Rule(cfaReg, cfaOff, saved);
     }
 
-    Integer registerHolding(FunctionFlow flow, State st, Val value, boolean preservedOnly) {
-        int bestRank = Integer.MAX_VALUE, bestNum = Integer.MAX_VALUE;
-        boolean found = false;
-        for (Map.Entry<Key, Val> e : st.regs.entrySet()) {
-            Key k = e.getKey();
-            Val v = e.getValue();
-            if (!Objects.equals(v, value) || k.isU() || k.equals(m.spKey) || k.equals(value.key)) {
+    /**
+     * {entry value: [lowest DWARF number of a preserved register holding it,
+     * of a volatile one]} (MAX_VALUE: none), over the registers other than SP
+     * and the value's own.
+     */
+    Map<Val, int[]> entryHolders(State st) {
+        Map<Val, int[]> idx = new HashMap<>();
+        int lim = st.idLimit();
+        for (int i = 0; i < lim; i++) {
+            Val v = st.get(i);
+            if (v == State.ABSENT || v == null || v.kind != Val.INIT) {
                 continue;
             }
-            if (preservedOnly && !m.isPreserved(k)) {
+            Key k = m.keys.key(i);
+            if (k.equals(m.spKey) || k.equals(v.key)) {
                 continue;
             }
             Integer num = m.dwarfOf(k);
             if (num == null) {
                 continue;
             }
+            int[] best = idx.computeIfAbsent(v, x -> new int[] {Integer.MAX_VALUE, Integer.MAX_VALUE});
             int rank = m.isPreserved(k) ? 0 : 1;
-            if (!found || rank < bestRank || (rank == bestRank && num < bestNum)) {
-                bestRank = rank;
-                bestNum = num;
-                found = true;
-            }
+            best[rank] = Math.min(best[rank], num);
         }
-        return found ? bestNum : null;
+        return idx;
+    }
+
+    /** The register (DWARF number) holding value: preserved ones first, then the lowest number. */
+    static Integer registerHolding(Map<Val, int[]> holders, Val value, boolean preservedOnly) {
+        int[] best = holders.get(value);
+        if (best == null) {
+            return null;
+        }
+        if (best[0] != Integer.MAX_VALUE) {
+            return best[0];
+        }
+        return preservedOnly || best[1] == Integer.MAX_VALUE ? null : best[1];
     }
 
     List<Key> trackedRegs() {

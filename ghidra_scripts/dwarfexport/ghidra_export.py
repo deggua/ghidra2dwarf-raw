@@ -1867,7 +1867,10 @@ class Exporter(object):
                 return False
             if d[2] and d[8] is not None:
                 return True
-            return any(op[0] in (PcodeOp.CBRANCH, PcodeOp.BRANCH) and op[2] is not None and op[2][0] == "c"
+            # (a p-code-relative branch, or one to the instruction's own
+            # fall-through: Thumb IT-block predication)
+            return any(op[0] in (PcodeOp.CBRANCH, PcodeOp.BRANCH) and op[2] is not None
+                       and (op[2][0] == "c" or (op[2][0] == "a" and op[2][1] in d[6]))
                        for op in d[5])
         seen, rets = {}, set()
         for b in hf.getBasicBlocks():

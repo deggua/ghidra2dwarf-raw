@@ -86,8 +86,18 @@ public final class FunctionContext {
         return FunctionFlow.signedRaw(value, size);
     }
 
-    /** DWARF expression for register-space bytes [off, off+size). */
+    private static final byte[] NO_EXPR = new byte[0];
+
+    /** DWARF expression for register-space bytes [off, off+size) (cached per exporter). */
     public byte[] regExpr(long off, int size) {
+        byte[] e = exp.regExprCache.computeIfAbsent(Key.reg(off, size), k -> {
+            byte[] r = computeRegExpr(off, size);
+            return r != null ? r : NO_EXPR;
+        });
+        return e == NO_EXPR ? null : e;
+    }
+
+    private byte[] computeRegExpr(long off, int size) {
         long[] hit = exp.regs.lookup(off, size);
         if (hit == null) {
             return multiRegExpr(off, size);
@@ -636,6 +646,7 @@ public final class FunctionContext {
 
     private static final Integer TOP = Integer.MIN_VALUE;
     private static final Integer NONE = Integer.MIN_VALUE + 1;
+    private static final Integer CONFLICT = Integer.MIN_VALUE + 2;
 
     /** {instance index: [pc]}: where each SSA instance is the current value (null: not available). */
     Map<Integer, List<Long>> reachingPcs(List<Varnode> instances) {
@@ -714,7 +725,8 @@ public final class FunctionContext {
                 break;
             }
         }
-        TreeMap<Long, Set<Integer>> perPc = new TreeMap<>();
+        // {pc: the instance current there, CONFLICT if several (blocks sharing an instruction)}
+        HashMap<Long, Integer> perPc = new HashMap<>();
         for (Map.Entry<Integer, BlockInfo> e : bi.entrySet()) {
             BlockInfo info = e.getValue();
             if (info.bounds == null) {
@@ -731,18 +743,21 @@ public final class FunctionContext {
                     cur = ev.get(j).idx;
                     j++;
                 }
-                perPc.computeIfAbsent(pp[2], x -> new HashSet<>()).add(cur);
+                Integer prev = perPc.putIfAbsent(pp[2], cur);
+                if (prev != null && !prev.equals(cur)) {
+                    perPc.put(pp[2], CONFLICT);
+                }
             }
         }
         Map<Integer, List<Long>> result = new HashMap<>();
-        for (Map.Entry<Long, Set<Integer>> e : perPc.entrySet()) {
-            Set<Integer> insts = e.getValue();
-            if (insts.size() == 1) {
-                Integer cur = insts.iterator().next();
-                if (!cur.equals(NONE)) {
-                    result.computeIfAbsent(cur, x -> new ArrayList<>()).add(e.getKey());
-                }
+        for (Map.Entry<Long, Integer> e : perPc.entrySet()) {
+            Integer cur = e.getValue();
+            if (!cur.equals(NONE) && !cur.equals(CONFLICT)) {
+                result.computeIfAbsent(cur, x -> new ArrayList<>()).add(e.getKey());
             }
+        }
+        for (List<Long> pcs : result.values()) {
+            pcs.sort(null);
         }
         return result;
     }

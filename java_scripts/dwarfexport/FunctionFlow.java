@@ -2,14 +2,16 @@ package dwarfexport;
 
 import java.math.BigInteger;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.BitSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.TreeSet;
 
@@ -24,12 +26,14 @@ import ghidra.program.model.symbol.FlowType;
 
 /**
  * Machine-level data flow over raw p-code, shared by CFI generation and
- * variable location tracking (a port of flow.py's FunctionFlow; see there for
- * the design). For every instruction of a function: the abstract machine
- * state on entry ({@link #stateIn}) and after it ({@link #stateOut}).
+ * variable location tracking. For every instruction of a function: the
+ * abstract machine state on entry ({@link #stateIn}) and after it
+ * ({@link #stateOut}). (Originally a port of flow.py's FunctionFlow; states
+ * now hold registers in arrays indexed by the machine's key ids.)
  */
 public final class FunctionFlow {
     public static final int MAX_STEPS = 500000;
+    static final Val ABSENT = State.ABSENT;
 
     /** An instruction decoded once. */
     public static final class Insn {
@@ -37,7 +41,7 @@ public final class FunctionFlow {
         public boolean isJump;
         public boolean isTerminal;
         public int delay;
-        public final List<Long> succs = new ArrayList<>();
+        public final List<Long> succs = new ArrayList<>(2);
         public final List<Op> ops = new ArrayList<>();
         /** The next instruction's offset, and the fall-through (or next). */
         public long nxt, fallOrNext;
@@ -62,8 +66,15 @@ public final class FunctionFlow {
     public final Map<Long, Address> callTargets = new HashMap<>();
     public boolean isLeaf;
     boolean sideEffect;
-    private final Set<Key> universe = new LinkedHashSet<>();
-    private final Map<Key, List<Key>> ovl = new HashMap<>();
+
+    // per-id caches (this flow is single-threaded; the key table may grow)
+    private int[][] ovl = new int[0][];
+    private int[][] cont = new int[0][];
+    private byte[] preserved = new byte[0];
+    private int ovlTableSize = -1;
+    final int spId, raId;
+    final int[] volatileIds;
+    final BitSet volatileSet = new BitSet();
 
     public FunctionFlow(MachineInfo machine, Function func, Map<Long, List<Long>> extraEdges, State initState) {
         this.m = machine;
@@ -71,12 +82,98 @@ public final class FunctionFlow {
         this.extraEdges = extraEdges != null ? extraEdges : new HashMap<>();
         this.initState = initState;
         this.listing = machine.listing;
-        universe.addAll(machine.mapped);
-        universe.add(machine.spKey);
-        if (machine.raKey != null) {
-            universe.add(machine.raKey);
+        this.spId = machine.keys.id(machine.spKey);
+        this.raId = machine.raKey != null ? machine.keys.id(machine.raKey) : -1;
+        this.volatileIds = new int[machine.volatileRegs.size()];
+        for (int i = 0; i < volatileIds.length; i++) {
+            volatileIds[i] = machine.keys.id(machine.volatileRegs.get(i));
+            volatileSet.set(volatileIds[i]);
         }
         run();
+    }
+
+    // -- per-id facts ------------------------------------------------------------
+
+    Key key(int id) {
+        return m.keys.key(id);
+    }
+
+    int id(Key k) {
+        return m.keys.id(k);
+    }
+
+    private void refreshIdCaches() {
+        int n = m.keys.size();
+        if (n != ovlTableSize) {
+            // (registered keys only grow: rebuild the overlap lists)
+            ovl = new int[n][];
+            cont = Arrays.copyOf(cont, n);
+            preserved = Arrays.copyOf(preserved, n);
+            ovlTableSize = n;
+        }
+    }
+
+    /**
+     * Ids of registered keys overlapping id's bytes (itself included): the
+     * ones containing it first, narrowest first.
+     */
+    int[] overlaps(int id) {
+        if (m.keys.size() != ovlTableSize) {
+            refreshIdCaches(); // (new keys may overlap: the lists are rebuilt)
+        }
+        int[] hit = ovl[id];
+        if (hit == null) {
+            Key k = key(id);
+            List<Key> l = new ArrayList<>();
+            for (int i = 0; i < ovlTableSize; i++) {
+                Key o = key(i);
+                if (o.overlaps(k)) {
+                    l.add(o);
+                }
+            }
+            // views containing the register first, narrowest first; then the rest
+            l.sort((a, b) -> {
+                boolean ca = a.contains(k), cb = b.contains(k);
+                if (ca != cb) {
+                    return ca ? -1 : 1;
+                }
+                return a.size != b.size ? Integer.compare(a.size, b.size) : a.compareTo(b);
+            });
+            hit = new int[l.size()];
+            for (int i = 0; i < hit.length; i++) {
+                hit[i] = id(l.get(i));
+            }
+            ovl[id] = hit;
+        }
+        return hit;
+    }
+
+    int[] containers(int id) {
+        if (id >= ovlTableSize) {
+            refreshIdCaches();
+        }
+        int[] hit = cont[id];
+        if (hit == null) {
+            List<Key> c = m.containers(key(id));
+            hit = new int[c.size()];
+            for (int i = 0; i < hit.length; i++) {
+                hit[i] = id(c.get(i));
+            }
+            cont[id] = hit;
+        }
+        return hit;
+    }
+
+    boolean isPreserved(int id) {
+        if (id >= ovlTableSize) {
+            refreshIdCaches();
+        }
+        byte b = preserved[id];
+        if (b == 0) {
+            b = (byte) (m.isPreserved(key(id)) ? 1 : 2);
+            preserved[id] = b;
+        }
+        return b == 1;
     }
 
     // -- value access ---------------------------------------------------------
@@ -136,64 +233,34 @@ public final class FunctionFlow {
         return rekey(value, Key.reg(lo, size));
     }
 
-    private List<Key> overlaps(Key key) {
-        List<Key> hit = ovl.get(key);
-        if (hit == null) {
-            hit = new ArrayList<>();
-            for (Key rk : universe) {
-                if (rk.overlaps(key)) {
-                    hit.add(rk);
-                }
-            }
-            ovl.put(key, hit);
-        }
-        return hit;
-    }
-
-    private void noteKey(Key k) {
-        if (universe.add(k)) {
-            ovl.clear();
-        }
-    }
-
     public Val regValue(State st, Key key) {
-        LinkedHashMap<Key, Val> regs = st.regs;
-        if (regs.containsKey(key)) {
-            return regs.get(key);
+        return regValue(st, id(key));
+    }
+
+    public Val regValue(State st, int id) {
+        Val v = st.get(id);
+        if (v != ABSENT) {
+            return v;
         }
-        Key only = null;
-        int count = 0;
-        for (Key rk : overlaps(key)) {
-            if (regs.containsKey(rk)) {
-                count++;
-                only = rk;
-                if (count > 1) {
-                    break;
-                }
+        // Not in the state: from the narrowest containing view if one is
+        // present (writing a register keeps it current: see set()), unknown
+        // if only partly overlapping views are, else the default.
+        int[] ov = overlaps(id);
+        for (int o : ov) {
+            if (o == id) {
+                continue;
             }
-        }
-        if (count == 0) {
-            return defaultValue(key);
-        }
-        if (count == 1) {
-            Val v = regs.get(only);
-            if (v != null && only.contains(key) && isLowPart(key, only)) {
-                return narrow(v, key.size);
+            Val ovv = st.get(o);
+            if (ovv == ABSENT) {
+                continue;
+            }
+            Key key = key(id), rk = key(o);
+            if (ovv != null && rk.contains(key) && isLowPart(key, rk)) {
+                return narrow(ovv, key.size);
             }
             return null;
         }
-        for (Map.Entry<Key, Val> e : regs.entrySet()) {
-            Key rk = e.getKey();
-            if (!rk.isU() && rk.overlaps(key)) {
-                // overwritten through another view: the first in the state's order
-                Val v = e.getValue();
-                if (v != null && rk.contains(key) && isLowPart(key, rk)) {
-                    return narrow(v, key.size);
-                }
-                return null;
-            }
-        }
-        return defaultValue(key);
+        return defaultValue(key(id));
     }
 
     Val get(State st, Vn d) {
@@ -201,9 +268,9 @@ public final class FunctionFlow {
             case 'c':
                 return Val.cnst(d.off, d.size);
             case 'r':
-                return regValue(st, d.regKey());
+                return regValue(st, d.id(m));
             case 'u':
-                return st.regs.get(d.uKey());
+                return st.getU(d.key);
             default:
                 return null;
         }
@@ -211,37 +278,31 @@ public final class FunctionFlow {
 
     void set(State st, Vn d, Val value, long insOff) {
         if (d.kind == 'r') {
-            Key k = d.regKey();
-            if (!universe.contains(k)) {
-                noteKey(k);
-            }
+            int id = d.id(m);
+            Key k = d.key;
             if (value == null) {
                 value = Val.def(insOff, k);
             }
-            List<Key> others = new ArrayList<>();
-            for (Key o : st.regs.keySet()) {
-                if (!o.isU() && !o.equals(k) && o.overlaps(k)) {
-                    others.add(o);
+            for (int o : overlaps(id)) {
+                if (o == id || !st.has(o)) {
+                    continue;
                 }
-            }
-            for (Key other : others) {
-                if (k.contains(other)) {
-                    // a view inside the written register: regValue derives it from the new value
-                    st.regs.remove(other);
+                if (k.contains(key(o))) {
+                    st.remove(o); // a view inside the written register: derived from the new value
                 }
                 else {
-                    st.regs.put(other, null);
+                    st.put(o, null);
                 }
             }
-            for (Key mk : m.containers(k)) {
-                if (!st.regs.containsKey(mk)) {
-                    st.regs.put(mk, null);
+            for (int c : containers(id)) {
+                if (!st.has(c)) {
+                    st.put(c, null);
                 }
             }
-            st.regs.put(k, value);
+            st.put(id, value);
         }
         else if (d.kind == 'u') {
-            st.regs.put(d.uKey(), value);
+            st.putU(d.key, value);
         }
     }
 
@@ -383,17 +444,17 @@ public final class FunctionFlow {
     public void step(State st, long off) {
         Insn d = decoded.get(off);
         List<Op> ops = d.ops;
-        Val spBefore = regValue(st, m.spKey);
-        Set<Key> written = new HashSet<>();
+        Val spBefore = regValue(st, spId);
+        BitSet written = new BitSet();
         sideEffect = false;
-        Map<Integer, State> pend = new HashMap<>();
+        Map<Integer, State> pend = null;
         boolean alive = true;
         boolean left = false;
         int n = ops.size();
         for (int idx = 0; idx < n; idx++) {
             Op op = ops.get(idx);
             int opc = op.opc;
-            if (pend.containsKey(idx)) {
+            if (pend != null && pend.containsKey(idx)) {
                 State other = pend.remove(idx);
                 if (alive) {
                     st.assign(merge(st, other, Val.Join.pcode(off, idx)));
@@ -410,6 +471,9 @@ public final class FunctionFlow {
             if (opc == PcodeOp.CBRANCH || opc == PcodeOp.BRANCH) {
                 Integer tgt = localTarget(idx, op.i0, d, n);
                 if (tgt != null) {
+                    if (pend == null) {
+                        pend = new HashMap<>();
+                    }
                     State snap = st.copy();
                     if (pend.containsKey(tgt)) {
                         snap = merge(pend.get(tgt), snap, Val.Join.pcode(off, tgt));
@@ -433,7 +497,7 @@ public final class FunctionFlow {
         }
 
         taken = null;
-        State skipped = pend.remove(NEXT);
+        State skipped = pend != null ? pend.remove(NEXT) : null;
         if (skipped != null) {
             if (!alive || left) {
                 if (alive) {
@@ -446,7 +510,7 @@ public final class FunctionFlow {
             }
         }
 
-        st.regs.keySet().removeIf(Key::isU);
+        st.clearU();
 
         if (d.isCall) {
             Address target = callTargets.get(off);
@@ -455,7 +519,7 @@ public final class FunctionFlow {
                 for (Op op : body) {
                     apply(st, op, off, written);
                 }
-                st.regs.keySet().removeIf(Key::isU);
+                st.clearU();
             }
             else {
                 callEffects(st, off, target, spBefore, written);
@@ -463,10 +527,13 @@ public final class FunctionFlow {
         }
 
         // Registers reloaded with their entry value are "restored".
-        for (Iterator<Key> it = st.saved.keySet().iterator(); it.hasNext();) {
-            Key k = it.next();
-            if (written.contains(k) && Val.init(k).equals(st.regs.get(k))) {
-                it.remove();
+        for (Iterator<Map.Entry<Key, Long>> it = st.saved.entrySet().iterator(); it.hasNext();) {
+            Key k = it.next().getKey();
+            if (k.isReg()) {
+                int kid = id(k);
+                if (written.get(kid) && Val.init(k).equals(st.get(kid))) {
+                    it.remove();
+                }
             }
         }
     }
@@ -476,7 +543,7 @@ public final class FunctionFlow {
             return false;
         }
         Key k = value.key;
-        return k.kind == Key.RA || k.equals(m.raKey) || (k.isReg() && m.isPreserved(k));
+        return k.kind == Key.RA || k.equals(m.raKey) || (k.isReg() && isPreserved(id(k)));
     }
 
     void clobberEscaped(State st) {
@@ -487,11 +554,11 @@ public final class FunctionFlow {
         st.mem.entrySet().removeIf(e -> e.getKey() >= esc && !isSaveSlot(e.getValue().v));
     }
 
-    void callEffects(State st, long off, Address target, Val spBefore, Set<Key> written) {
-        for (Map.Entry<Key, Val> e : st.regs.entrySet()) {
-            Key k = e.getKey();
-            Val v = e.getValue();
-            if (v != null && v.kind == Val.SP && !k.isU() && !k.equals(m.spKey) && !m.isPreserved(k)) {
+    void callEffects(State st, long off, Address target, Val spBefore, BitSet written) {
+        int lim = st.idLimit();
+        for (int i = 0; i < lim; i++) {
+            Val v = st.get(i);
+            if (v != ABSENT && v != null && v.kind == Val.SP && i != spId && !isPreserved(i)) {
                 st.esc = State.minEsc(st.esc, v.n);
             }
         }
@@ -502,31 +569,32 @@ public final class FunctionFlow {
         clobberEscaped(st);
         if (spBefore != null) {
             if (spBefore.kind == Val.SP) {
-                st.regs.put(m.spKey, Val.sp(spBefore.n + m.stackPurge(target)));
+                st.put(spId, Val.sp(spBefore.n + m.stackPurge(target)));
             }
             else {
-                st.regs.put(m.spKey, spBefore);
+                st.put(spId, spBefore);
             }
         }
-        for (Key k : m.volatileRegs) {
-            st.regs.put(k, Val.def(off, k));
+        for (int k : volatileIds) {
+            st.put(k, Val.def(off, key(k)));
         }
-        for (Key k : new ArrayList<>(st.regs.keySet())) {
-            if (!k.isU() && !m.volatileSet.contains(k) && !k.equals(m.raKey) && !m.isPreserved(k)) {
-                st.regs.put(k, Val.def(off, k));
+        lim = st.idLimit();
+        for (int i = 0; i < lim; i++) {
+            if (st.get(i) != ABSENT && !volatileSet.get(i) && i != raId && !isPreserved(i)) {
+                st.put(i, Val.def(off, key(i)));
             }
         }
-        if (m.raKey != null && written.contains(m.raKey)) {
-            st.regs.put(m.raKey, Val.def(off, m.raKey));
+        if (raId >= 0 && written.get(raId)) {
+            st.put(raId, Val.def(off, m.raKey));
         }
     }
 
     /** One data p-code op (no control flow). */
-    void apply(State st, Op op, long off, Set<Key> written) {
+    void apply(State st, Op op, long off, BitSet written) {
         int opc = op.opc;
         Vn out = op.out, i0 = op.i0, i1 = op.i1, i2 = op.i2;
         if (out != null && out.kind == 'r') {
-            written.add(out.regKey());
+            written.set(out.id(m));
         }
         if (opc == PcodeOp.STORE) {
             Val addr = get(st, i1);
@@ -537,7 +605,9 @@ public final class FunctionFlow {
             if (addr != null && addr.kind == Val.SP) {
                 long soff = addr.n;
                 int size = i2.sized() ? i2.size : 0;
-                st.mem.entrySet().removeIf(e -> e.getKey() < soff + size && soff < e.getKey() + e.getValue().size);
+                if (!st.mem.isEmpty()) {
+                    st.mem.entrySet().removeIf(e -> e.getKey() < soff + size && soff < e.getKey() + e.getValue().size);
+                }
                 st.mem.put(soff, new State.Slot(size, val));
                 if (val != null && val.kind == Val.INIT && !st.saved.containsKey(val.key) &&
                     (m.dwarfOf(val.key) != null || m.irqKeys.contains(val.key))) {
@@ -586,9 +656,7 @@ public final class FunctionFlow {
             set(st, out, inner != null && inner.kind == Val.SP ? inner : null, off);
             if (inner != null && i0.size < out.size) {
                 long lo = !m.bigEndian ? out.off : out.off + out.size - i0.size;
-                Key lk = Key.reg(lo, i0.size);
-                noteKey(lk);
-                st.regs.put(lk, inner);
+                st.put(id(Key.reg(lo, i0.size)), inner);
             }
             return;
         }
@@ -601,22 +669,34 @@ public final class FunctionFlow {
     // -- join -------------------------------------------------------------------
 
     public State merge(State a, State b, Val.Join join) {
-        LinkedHashMap<Key, Val> regs = new LinkedHashMap<>();
-        LinkedHashMap<Key, Val> ar = a.regs, br = b.regs;
-        for (Map.Entry<Key, Val> e : ar.entrySet()) {
-            Key k = e.getKey();
-            Val va = e.getValue();
-            Val vb = br.containsKey(k) ? br.get(k) : (k.isU() ? null : regValue(b, k));
-            mergeOne(regs, k, va, vb, join);
-        }
-        for (Map.Entry<Key, Val> e : br.entrySet()) {
-            Key k = e.getKey();
-            if (ar.containsKey(k)) {
+        int lim = Math.max(a.idLimit(), b.idLimit());
+        Val[] r = new Val[lim];
+        Arrays.fill(r, ABSENT);
+        for (int i = 0; i < lim; i++) {
+            Val va = a.get(i), vb = b.get(i);
+            if (va == ABSENT && vb == ABSENT) {
                 continue;
             }
-            Val vb = e.getValue();
-            Val va = k.isU() ? null : regValue(a, k);
-            mergeOne(regs, k, va, vb, join);
+            if (va == ABSENT) {
+                va = regValue(a, i);
+            }
+            else if (vb == ABSENT) {
+                vb = regValue(b, i);
+            }
+            r[i] = mergeOne(i, va, vb, join);
+        }
+        HashMap<Key, Val> u = null;
+        if (a.u != null || b.u != null) {
+            u = new HashMap<>();
+            Map<Key, Val> au = a.u != null ? a.u : Map.of(), bu = b.u != null ? b.u : Map.of();
+            for (Map.Entry<Key, Val> e : au.entrySet()) {
+                u.put(e.getKey(), mergeU(e.getKey(), e.getValue(), bu.get(e.getKey()), join));
+            }
+            for (Map.Entry<Key, Val> e : bu.entrySet()) {
+                if (!au.containsKey(e.getKey())) {
+                    u.put(e.getKey(), mergeU(e.getKey(), null, e.getValue(), join));
+                }
+            }
         }
         LinkedHashMap<Long, State.Slot> mem = new LinkedHashMap<>();
         for (Map.Entry<Long, State.Slot> e : a.mem.entrySet()) {
@@ -629,7 +709,7 @@ public final class FunctionFlow {
             if (sa.size != sb.size) {
                 continue;
             }
-            if (java.util.Objects.equals(sa.v, sb.v)) {
+            if (Objects.equals(sa.v, sb.v)) {
                 mem.put(o, sa);
             }
             else if (sa.v != null && sb.v != null) {
@@ -642,61 +722,83 @@ public final class FunctionFlow {
                 saved.put(e.getKey(), e.getValue());
             }
         }
-        return new State(regs, mem, saved, State.minEsc(a.esc, b.esc));
+        return new State(r, u, mem, saved, State.minEsc(a.esc, b.esc));
     }
 
-    private static void mergeOne(LinkedHashMap<Key, Val> regs, Key k, Val va, Val vb, Val.Join join) {
-        if (java.util.Objects.equals(va, vb)) {
-            regs.put(k, va);
+    private Val mergeOne(int id, Val va, Val vb, Val.Join join) {
+        if (Objects.equals(va, vb)) {
+            return va;
         }
-        else if (va == null || vb == null) {
-            regs.put(k, null);
+        if (va == null || vb == null) {
+            return null;
         }
-        else {
-            regs.put(k, Val.phi(join, k));
+        return Val.phi(join, key(id));
+    }
+
+    private static Val mergeU(Key k, Val va, Val vb, Val.Join join) {
+        if (Objects.equals(va, vb)) {
+            return va;
         }
+        if (va == null || vb == null) {
+            return null;
+        }
+        return Val.phi(join, k);
     }
 
     /** Keeps a join's state monotone so the fixpoint iteration terminates. */
     public State stabilize(State old, State nw, Val.Join join) {
-        for (Map.Entry<Key, Val> e : old.regs.entrySet()) {
-            Key k = e.getKey();
-            Val ov = e.getValue();
-            Val nv = nw.regs.containsKey(k) ? nw.regs.get(k) : (!k.isU() ? regValue(nw, k) : null);
-            if (ov == null) {
-                nw.regs.put(k, null);
+        int lim = old.idLimit();
+        for (int i = 0; i < lim; i++) {
+            Val ov = old.get(i);
+            if (ov == ABSENT) {
+                continue;
             }
-            else if (ov.equals(Val.phi(join, k)) && nv != null) {
-                nw.regs.put(k, ov);
+            if (ov == null) {
+                nw.put(i, null);
+                continue;
+            }
+            Val nv = nw.get(i);
+            if (nv == ABSENT) {
+                nv = regValue(nw, i);
+            }
+            if (nv != null && ov.kind == Val.PHI && ov.equals(Val.phi(join, key(i)))) {
+                nw.put(i, ov);
             }
         }
-        for (Long o : new ArrayList<>(nw.mem.keySet())) {
+        if (old.u != null) {
+            for (Map.Entry<Key, Val> e : old.u.entrySet()) {
+                Val ov = e.getValue();
+                Val nv = nw.getU(e.getKey());
+                if (ov == null) {
+                    nw.putU(e.getKey(), null);
+                }
+                else if (ov.equals(Val.phi(join, e.getKey())) && nv != null) {
+                    nw.putU(e.getKey(), ov);
+                }
+            }
+        }
+        for (Iterator<Map.Entry<Long, State.Slot>> it = nw.mem.entrySet().iterator(); it.hasNext();) {
+            Map.Entry<Long, State.Slot> e = it.next();
+            Long o = e.getKey();
             State.Slot os = old.mem.get(o);
             if (os == null) {
-                nw.mem.remove(o);
+                it.remove();
+                continue;
             }
-            else {
-                State.Slot ns = nw.mem.get(o);
-                if (os.size != ns.size || os.v == null) {
-                    if (os.size == ns.size) {
-                        nw.mem.put(o, new State.Slot(ns.size, null));
-                    }
-                    else {
-                        nw.mem.remove(o);
-                    }
+            State.Slot ns = e.getValue();
+            if (os.size != ns.size || os.v == null) {
+                if (os.size == ns.size) {
+                    e.setValue(new State.Slot(ns.size, null));
                 }
-                else if (os.v.equals(Val.phi(join, Key.mem(o))) && ns.v != null) {
-                    nw.mem.put(o, new State.Slot(ns.size, os.v));
+                else {
+                    it.remove();
                 }
             }
-        }
-        LinkedHashMap<Key, Long> saved = new LinkedHashMap<>();
-        for (Map.Entry<Key, Long> e : nw.saved.entrySet()) {
-            if (e.getValue().equals(old.saved.get(e.getKey()))) {
-                saved.put(e.getKey(), e.getValue());
+            else if (ns.v != null && os.v.kind == Val.PHI && os.v.equals(Val.phi(join, Key.mem(o)))) {
+                e.setValue(new State.Slot(ns.size, os.v));
             }
         }
-        nw.saved = saved;
+        nw.saved.entrySet().removeIf(e -> !e.getValue().equals(old.saved.get(e.getKey())));
         nw.esc = State.minEsc(old.esc, nw.esc);
         return nw;
     }
@@ -719,18 +821,21 @@ public final class FunctionFlow {
             }
             Address[] flows = ins.getFlows();
             if (ft.isCall()) {
-                List<Address> tg = new ArrayList<>();
+                Address only = null;
+                int count = 0;
                 for (Address t : flows) {
                     if (t != null) {
-                        tg.add(t);
+                        only = t;
+                        count++;
                     }
                 }
-                if (tg.size() == 1) {
-                    callTargets.put(o, tg.get(0));
+                if (count == 1) {
+                    callTargets.put(o, only);
                 }
             }
             Address fall = ins.getFallThrough();
-            if (fall != null && body.contains(fall)) {
+            boolean fallIn = fall != null && body.contains(fall);
+            if (fallIn) {
                 d.succs.add(fall.getOffset());
             }
             boolean isCall = ft.isCall();
@@ -768,7 +873,7 @@ public final class FunctionFlow {
             d.fallOrNext = fall != null ? fall.getOffset() : nxt;
             d.openJump = ft.isComputed() && ft.isJump() && !isCall && !ft.isConditional() && !intoBody &&
                 (extra == null || extra.isEmpty());
-            d.fallInBody = fall != null && body.contains(fall) ? fall.getOffset() : null;
+            d.fallInBody = fallIn ? fall.getOffset() : null;
             decoded.put(o, d);
         }
         insns.sort(null);
@@ -890,7 +995,7 @@ public final class FunctionFlow {
     }
 
     private Long spDelta(State st) {
-        Val v = regValue(st, m.spKey);
+        Val v = regValue(st, spId);
         return v != null && v.kind == Val.SP ? v.n : null;
     }
 
@@ -967,18 +1072,22 @@ public final class FunctionFlow {
             return false;
         }
         boolean setup = false;
-        Set<Key> keys = new LinkedHashSet<>(st.regs.keySet());
-        keys.addAll(stIn.regs.keySet());
-        for (Key k : keys) {
-            if (k.isU() || (m.dwarfOf(k) == null && m.containers(k).isEmpty())) {
+        int lim = Math.max(st.idLimit(), stIn.idLimit());
+        for (int i = 0; i < lim; i++) {
+            Val bv = stIn.get(i), av = st.get(i);
+            if (bv == ABSENT && av == ABSENT) {
                 continue;
             }
-            Val before = stIn.regs.containsKey(k) ? stIn.regs.get(k) : defaultValue(k);
-            Val after = st.regs.containsKey(k) ? st.regs.get(k) : defaultValue(k);
-            if (java.util.Objects.equals(before, after)) {
+            Key k = key(i);
+            if (m.dwarfOf(k) == null && containers(i).length == 0) {
+                continue; // scratch / pseudo registers (ARM mult_addr, flags)
+            }
+            Val before = bv != ABSENT ? bv : defaultValue(k);
+            Val after = av != ABSENT ? av : defaultValue(k);
+            if (Objects.equals(before, after)) {
                 continue;
             }
-            if (after != null && after.kind == Val.SP && (k.equals(m.spKey) || m.isPreserved(k))) {
+            if (after != null && after.kind == Val.SP && (i == spId || isPreserved(i))) {
                 setup = true;
                 continue;
             }
@@ -1053,7 +1162,18 @@ public final class FunctionFlow {
         return st != null ? regValue(st, key) : null;
     }
 
-    /** Inverted index of a state, in the state's own order (cached). */
+    /** The registers present in a state ({id, value}), for callers outside the analysis. */
+    public void forEachReg(State st, java.util.function.BiConsumer<Key, Val> f) {
+        int lim = st.idLimit();
+        for (int i = 0; i < lim; i++) {
+            Val v = st.get(i);
+            if (v != ABSENT) {
+                f.accept(key(i), v);
+            }
+        }
+    }
+
+    /** Inverted index of a state (cached). */
     static final class Holders {
         final Map<Val, List<Key>> regs = new HashMap<>();
         final Map<Val, List<Long>> mem = new HashMap<>();
@@ -1066,17 +1186,13 @@ public final class FunctionFlow {
         if (h != null) {
             return h;
         }
-        h = new Holders();
-        for (Map.Entry<Key, Val> e : st.regs.entrySet()) {
-            if (!e.getKey().isU()) {
-                h.regs.computeIfAbsent(e.getValue(), x -> new ArrayList<>()).add(e.getKey());
-            }
-        }
+        Holders nh = new Holders();
+        forEachReg(st, (k, v) -> nh.regs.computeIfAbsent(v, x -> new ArrayList<>(2)).add(k));
         for (Map.Entry<Long, State.Slot> e : st.mem.entrySet()) {
-            h.mem.computeIfAbsent(e.getValue().v, x -> new ArrayList<>()).add(e.getKey());
+            nh.mem.computeIfAbsent(e.getValue().v, x -> new ArrayList<>(2)).add(e.getKey());
         }
-        holdersCache.put(st, h);
-        return h;
+        holdersCache.put(st, nh);
+        return nh;
     }
 
     /** A place holding a value: a register (key) or a stack slot (SP offset). */
@@ -1128,13 +1244,13 @@ public final class FunctionFlow {
                         }
                     }
                 }
-                if (wide.equals(Val.init(c)) && !st.regs.containsKey(c) && wide.equals(regValue(st, c))) {
+                if (wide.equals(Val.init(c)) && !st.has(id(c)) && wide.equals(regValue(st, c))) {
                     long lo = c.off + (m.bigEndian ? c.size - vkey.size : 0);
                     out.add(new Loc(Key.reg(lo, vkey.size), 0));
                 }
             }
         }
-        if (value.kind == Val.INIT && !st.regs.containsKey(value.key) && value.key.isReg()) {
+        if (value.kind == Val.INIT && value.key.isReg() && !st.has(id(value.key))) {
             if (value.equals(regValue(st, value.key))) {
                 out.add(new Loc(value.key, 0));
             }

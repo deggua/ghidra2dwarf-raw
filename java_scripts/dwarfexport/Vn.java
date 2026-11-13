@@ -13,6 +13,10 @@ public final class Vn {
     public final char kind;
     public final long off;
     public final int size;
+    /** The register or temporary key ('r', 'u'), else null. */
+    public final Key key;
+    /** The register's id in a MachineInfo key table (-1: not resolved yet). */
+    private volatile int id = -1;
 
     private static final ConcurrentHashMap<Integer, Character> SPACE_KIND = new ConcurrentHashMap<>();
     private static final Vn OTHER = new Vn('x', 0, 0);
@@ -21,6 +25,16 @@ public final class Vn {
         this.kind = kind;
         this.off = off;
         this.size = size;
+        this.key = kind == 'r' ? Key.reg(off, size) : kind == 'u' ? Key.u(off, size) : null;
+    }
+
+    /** The register's key id (kind 'r'). */
+    public int id(MachineInfo m) {
+        int i = id;
+        if (i < 0) {
+            i = id = m.keys.id(key);
+        }
+        return i;
     }
 
     public static void resetSpaces() {
@@ -63,11 +77,11 @@ public final class Vn {
     }
 
     public Key regKey() {
-        return Key.reg(off, size);
+        return key;
     }
 
     public Key uKey() {
-        return Key.u(off, size);
+        return key;
     }
 
     @Override

@@ -85,7 +85,19 @@ public final class RegisterIndex {
      * The smallest mapped register fully containing [offset, offset+size):
      * {dwarf number, register offset, register size}, or null.
      */
+    private final java.util.concurrent.ConcurrentHashMap<Key, long[]> lookupCache =
+        new java.util.concurrent.ConcurrentHashMap<>();
+    private static final long[] MISS = new long[0];
+
     public long[] lookup(long offset, int size) {
+        long[] hit = lookupCache.computeIfAbsent(Key.reg(offset, size), k -> {
+            long[] r = lookupUncached(offset, size);
+            return r != null ? r : MISS;
+        });
+        return hit == MISS ? null : hit;
+    }
+
+    private long[] lookupUncached(long offset, int size) {
         long[] best = null;
         for (Entry e : entries) {
             if (e.start > offset) {

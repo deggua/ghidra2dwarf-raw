@@ -1,6 +1,7 @@
 package dwarfexport;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -74,6 +75,47 @@ public final class MachineInfo {
     private final Map<Long, Optional<List<Op>>> inlineCache = new ConcurrentHashMap<>();
     private static final Integer NONE = Integer.MIN_VALUE;
 
+    /**
+     * Dense ids for register keys (shared by all functions' analyses, which
+     * run in several threads): a State holds register values in an array
+     * indexed by id.
+     */
+    public static final class KeyTable {
+        private final ConcurrentHashMap<Key, Integer> ids = new ConcurrentHashMap<>();
+        private volatile Key[] keys = new Key[64];
+        private volatile int size;
+
+        public int id(Key k) {
+            Integer i = ids.get(k);
+            return i != null ? i : add(k);
+        }
+
+        private synchronized int add(Key k) {
+            Integer i = ids.get(k);
+            if (i != null) {
+                return i;
+            }
+            int n = size;
+            if (n == keys.length) {
+                keys = Arrays.copyOf(keys, n * 2);
+            }
+            keys[n] = k;
+            size = n + 1;
+            ids.put(k, n);
+            return n;
+        }
+
+        public Key key(int id) {
+            return keys[id];
+        }
+
+        public int size() {
+            return size;
+        }
+    }
+
+    public final KeyTable keys = new KeyTable();
+
     public MachineInfo(Program program, RegisterIndex regIndex, long stackshift, Consumer<String> log) {
         this.program = program;
         this.listing = program.getListing();
@@ -135,6 +177,13 @@ public final class MachineInfo {
                     irqKeys.add(k);
                 }
             }
+        }
+        for (Key k : mapped) {
+            keys.id(k);
+        }
+        keys.id(spKey);
+        if (raKey != null) {
+            keys.id(raKey);
         }
         for (Key k : mapped) {
             if (!k.equals(spKey) && !unaffected.contains(k) && !k.equals(raKey)) {

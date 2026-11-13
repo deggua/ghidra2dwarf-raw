@@ -66,7 +66,7 @@ public class PortFlowDump extends GhidraScript {
                     " leaf=" + flow.isLeaf);
                 for (long o : flow.insns) {
                     State si = flow.stateIn.get(o), so = flow.stateOut.get(o);
-                    w.println("I " + o + " " + (si == null ? "-" : si.dump()) + " | " + (so == null ? "-" : so.dump()));
+                    w.println("I " + o + " " + (si == null ? "-" : si.dump(m)) + " | " + (so == null ? "-" : so.dump(m)));
                 }
             }
         }

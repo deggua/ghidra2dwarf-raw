@@ -96,6 +96,8 @@ public final class Exporter {
     final List<ElfSym> elfSymbols = new ArrayList<>();
     final TreeMap<String, Long> stats = new TreeMap<>();
     private final Map<Long, Long> insnEndCache = new java.util.concurrent.ConcurrentHashMap<>();
+    /** Register bytes -> DWARF expression (see FunctionContext.regExpr). */
+    final Map<Key, byte[]> regExprCache = new java.util.concurrent.ConcurrentHashMap<>();
     int srcDirNo;
     List<String[]> qualifiedRenames;
     Set<Long> interrupts;
@@ -113,6 +115,18 @@ public final class Exporter {
 
     void addTime(String k, long t0) {
         timers.merge(k, System.nanoTime() - t0, Long::sum);
+    }
+
+    /** Time (ns, summed over the worker threads) and counts per worker activity, for the log. */
+    final Map<String, long[]> workerTimers = new java.util.concurrent.ConcurrentHashMap<>();
+
+    void addWorkerTime(String k, long t0) {
+        long[] a = workerTimers.computeIfAbsent(k, x -> new long[2]);
+        long d = System.nanoTime() - t0;
+        synchronized (a) {
+            a[0] += d;
+            a[1]++;
+        }
     }
 
     static final class CFile {
@@ -378,6 +392,13 @@ public final class Exporter {
             tl.add(String.format("%s %.1fs", e.getKey(), e.getValue() / 1e9));
         }
         log("ghidra2dwarf-raw: time: " + String.join(", ", tl));
+        if (!workerTimers.isEmpty()) {
+            List<String> wl = new ArrayList<>();
+            for (Map.Entry<String, long[]> e : new java.util.TreeMap<>(workerTimers).entrySet()) {
+                wl.add(String.format("%s %.1fs (%d)", e.getKey(), e.getValue()[0] / 1e9, e.getValue()[1]));
+            }
+            log("ghidra2dwarf-raw: thread time: " + String.join(", ", wl));
+        }
         log(String.format("ghidra2dwarf-raw: wrote %s and %s/ (%d C files) in %.1fs", elfPath, srcDir, cFiles.size(),
             (System.nanoTime() - t0) / 1e9));
     }
@@ -556,10 +577,16 @@ public final class Exporter {
         Set<Long> eps = new HashSet<>(entryPoints);
         Set<Long> found = new HashSet<>();
         Set<Long> candidates = new HashSet<>();
+        List<Function> all = new ArrayList<>();
         for (Function f : fm.getFunctions(true)) {
-            if (f.isExternal() || !inSpace(f.getEntryPoint())) {
-                continue;
+            if (!f.isExternal() && inSpace(f.getEntryPoint())) {
+                all.add(f);
             }
+        }
+        // (every instruction of the program is read: in parallel)
+        Set<Long> foundC = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        Set<Long> candC = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        all.parallelStream().forEach(f -> {
             long entry = f.getEntryPoint().getOffset();
             boolean tagged = false;
             for (FunctionTag t : f.getTags()) {
@@ -568,16 +595,18 @@ public final class Exporter {
                 }
             }
             if (tagged || (eps.contains(entry) && isVectorAddress(entry))) {
-                found.add(entry);
-                continue;
+                foundC.add(entry);
+                return;
             }
             for (Instruction ins : listing.getInstructions(f.getBody(), true)) {
                 if (IRQ_RETURN.matcher(ins.getMnemonicString()).matches()) {
-                    candidates.add(entry);
+                    candC.add(entry);
                     break;
                 }
             }
-        }
+        });
+        found.addAll(foundC);
+        candidates.addAll(candC);
         boolean changed = true;
         while (changed) {
             changed = false;
@@ -854,8 +883,14 @@ public final class Exporter {
     private static final Object DECOMPILER_START = new Object();
 
     DecompInterface decompiler() {
-        synchronized (DECOMPILER_START) {
-            return newDecompiler();
+        long t0 = System.nanoTime();
+        try {
+            synchronized (DECOMPILER_START) {
+                return newDecompiler();
+            }
+        }
+        finally {
+            addWorkerTime("decompiler start", t0);
         }
     }
 
@@ -906,8 +941,10 @@ public final class Exporter {
             // between concurrent processes -- so it gets a second chance in a
             // fresh process, as does a history-dependent result)
             DecompInterface fresh = decompiler();
+            long t0 = System.nanoTime();
             try {
                 res = fresh.decompileFunction(func, timeout, monitor);
+                addWorkerTime(failed ? "decompile again (failed)" : "decompile again (history)", t0);
             }
             finally {
                 fresh.dispose();
@@ -967,8 +1004,13 @@ public final class Exporter {
                         local.set(ifc);
                         ifcs.add(ifc);
                     }
+                    long t0 = System.nanoTime();
                     DecompileResults res = skipped(func) ? null : decompile(ifc, func, timeout);
-                    return prepare(func, res);
+                    addWorkerTime("decompile", t0);
+                    t0 = System.nanoTime();
+                    Prepared p = prepare(func, res);
+                    addWorkerTime("analysis", t0);
+                    return p;
                 });
                 // Functions in flight: enough to keep the workers busy past a slow
                 // one, bounded by their code size (their decompilation and
@@ -1541,13 +1583,13 @@ public final class Exporter {
             return null;
         }
         State st = new State();
-        st.regs.put(r11, Val.sp(0));
-        st.regs.put(machine.spKey, null);
-        st.regs.put(lr, null);
+        st.put(machine, r11, Val.sp(0));
+        st.put(machine, machine.spKey, null);
+        st.put(machine, lr, null);
         st.mem.put(4L, new State.Slot(4, Val.init(lr)));
         for (int n = first; n < 32; n++) {
             Key k = regKey("r" + n);
-            st.regs.put(k, null);
+            st.put(machine, k, null);
             st.mem.put((long) (-4 * (32 - n)), new State.Slot(4, Val.init(k)));
         }
         return st;
@@ -1584,7 +1626,7 @@ public final class Exporter {
         State first = states.get(0);
         Key sp = machine.spKey;
         for (State s : states.subList(1, states.size())) {
-            if (!java.util.Objects.equals(s.regs.get(sp), first.regs.get(sp)) || !s.mem.equals(first.mem)) {
+            if (!java.util.Objects.equals(s.get(machine, sp), first.get(machine, sp)) || !s.mem.equals(first.mem)) {
                 return null;
             }
         }
@@ -1939,7 +1981,10 @@ public final class Exporter {
             return true;
         }
         for (Op op : d.ops) {
-            if ((op.opc == PcodeOp.CBRANCH || op.opc == PcodeOp.BRANCH) && op.i0 != null && op.i0.kind == 'c') {
+            // (a p-code-relative branch, or one to the instruction's own
+            // fall-through: Thumb IT-block predication)
+            if ((op.opc == PcodeOp.CBRANCH || op.opc == PcodeOp.BRANCH) && op.i0 != null && (op.i0.kind == 'c' ||
+                (op.i0.kind == 'a' && (op.i0.off == d.nxt || op.i0.off == d.fallOrNext)))) {
                 return true;
             }
         }
