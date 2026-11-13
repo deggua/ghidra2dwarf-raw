@@ -95,7 +95,7 @@ public final class Exporter {
     final List<long[]> funcRanges = new ArrayList<>();
     final List<ElfSym> elfSymbols = new ArrayList<>();
     final TreeMap<String, Long> stats = new TreeMap<>();
-    private final Map<Long, Long> insnEndCache = new HashMap<>();
+    private final Map<Long, Long> insnEndCache = new java.util.concurrent.ConcurrentHashMap<>();
     int srcDirNo;
     List<String[]> qualifiedRenames;
     Set<Long> interrupts;
@@ -108,6 +108,12 @@ public final class Exporter {
     List<Object[]> labels;
     private Boolean ppc64Ge;
     private int runsUsed;
+    /** Time spent per phase (ns), for the log. */
+    final Map<String, Long> timers = new LinkedHashMap<>();
+
+    void addTime(String k, long t0) {
+        timers.merge(k, System.nanoTime() - t0, Long::sum);
+    }
 
     static final class CFile {
         final String name;
@@ -122,6 +128,69 @@ public final class Exporter {
             this.lines = lines;
             this.bytes = bytes;
         }
+    }
+
+    /**
+     * A function's decompilation and machine-level analysis, prepared by a
+     * worker thread (the main thread then assembles the DWARF in order).
+     */
+    static final class Prepared {
+        DecompileResults res;
+        List<long[]> ranges;
+        final Map<Long, List<Long>> extra = new HashMap<>();
+        final List<Address> missing = new ArrayList<>();
+        FunctionFlow flow;
+        String flowError;
+        /** Variables in export order: {HighSymbol, Boolean is param, Location or null, error or null}. */
+        List<Object[]> vars;
+        CfiGenerator.Fdes fdes;
+    }
+
+    /** Decompiler-independent parts of a function's export, computable in any thread. */
+    Prepared prepare(Function func, DecompileResults res) {
+        Prepared p = new Prepared();
+        p.res = res;
+        p.ranges = functionRanges(func);
+        HighFunction hf = res != null ? res.getHighFunction() : null;
+        if (hf != null) {
+            try {
+                for (JumpTable jt : hf.getJumpTables()) {
+                    List<Long> cases = new ArrayList<>();
+                    for (Address c : jt.getCases()) {
+                        cases.add(c.getOffset());
+                        if (listing.getInstructionAt(c) == null) {
+                            p.missing.add(c);
+                        }
+                    }
+                    p.extra.put(jt.getSwitchAddress().getOffset(), cases);
+                }
+            }
+            catch (Exception e) {
+                // no jump tables
+            }
+        }
+        try {
+            State init = irqEntryState(func);
+            if (init == null) {
+                init = helperEntryState(func);
+            }
+            p.flow = new FunctionFlow(machine, func, p.extra, init);
+        }
+        catch (Exception e) {
+            p.flowError = String.valueOf(e);
+            p.flow = null;
+        }
+        ClangTokenGroup markup = res != null ? res.getCCodeMarkup() : null;
+        if (markup != null && hf != null) {
+            p.vars = variableLocations(func, hf, p.ranges, p.flow, thunkTarget(func) != null);
+        }
+        if (cfi != null && p.flow != null) {
+            p.fdes = cfi.compute(p.flow, p.ranges, interrupts.contains(func.getEntryPoint().getOffset()));
+        }
+        if (p.flow != null) {
+            p.flow.releaseAnalysisState();
+        }
+        return p;
     }
 
     static final class ElfSym {
@@ -270,7 +339,10 @@ public final class Exporter {
             log("Interrupt/exception handlers: " + String.join(", ", names));
         }
         writeTypesHeader();
+        long tfun = System.nanoTime();
         exportFunctions();
+        addTime("functions (all)", tfun);
+        long tg = System.nanoTime();
         exportGlobals();
         exportEquates();
         if (opts.all_types) {
@@ -289,14 +361,22 @@ public final class Exporter {
         cu.add(C.DW_AT_stmt_list, C.DW_FORM_sec_offset, 0L);
         dw.aranges.addAll(ranges);
 
+        addTime("globals, types", tg);
+        long tw = System.nanoTime();
         renameInTypesHeader();
         writeSources();
         writeElf();
+        addTime("writing", tw);
         List<String> st = new ArrayList<>();
         for (Map.Entry<String, Long> e : stats.entrySet()) {
             st.add(e.getKey() + "=" + e.getValue());
         }
         log("ghidra2dwarf-raw: " + String.join(", ", st));
+        List<String> tl = new ArrayList<>();
+        for (Map.Entry<String, Long> e : timers.entrySet()) {
+            tl.add(String.format("%s %.1fs", e.getKey(), e.getValue() / 1e9));
+        }
+        log("ghidra2dwarf-raw: time: " + String.join(", ", tl));
         log(String.format("ghidra2dwarf-raw: wrote %s and %s/ (%d C files) in %.1fs", elfPath, srcDir, cFiles.size(),
             (System.nanoTime() - t0) / 1e9));
     }
@@ -769,7 +849,16 @@ public final class Exporter {
         return decOpts;
     }
 
+    /** (decompiler start-up isn't thread-safe in Ghidra: concurrent openProgram calls can fail) */
+    private static final Object DECOMPILER_START = new Object();
+
     DecompInterface decompiler() {
+        synchronized (DECOMPILER_START) {
+            return newDecompiler();
+        }
+    }
+
+    private DecompInterface newDecompiler() {
         DecompInterface ifc = new DecompInterface();
         ifc.setOptions(decompileOptions());
         ifc.toggleCCode(true);
@@ -810,7 +899,11 @@ public final class Exporter {
 
     DecompileResults decompile(DecompInterface ifc, Function func, int timeout) {
         DecompileResults res = ifc.decompileFunction(func, timeout, monitor);
-        if (historyDependent(res) && !monitor.isCancelled()) {
+        boolean failed = res != null && !res.decompileCompleted() && !res.isTimedOut();
+        if ((failed || historyDependent(res)) && !monitor.isCancelled()) {
+            // (a failure may be transient -- Ghidra's decompiler has races
+            // between concurrent processes -- so it gets a second chance in a
+            // fresh process, as does a history-dependent result)
             DecompInterface fresh = decompiler();
             try {
                 res = fresh.decompileFunction(func, timeout, monitor);
@@ -844,7 +937,7 @@ public final class Exporter {
         decompileOptions();
         int n = (int) opts.decompile_threads;
         if (n < 0) {
-            n = Math.max(1, Math.min(8, Runtime.getRuntime().availableProcessors() - 1));
+            n = Math.max(1, Math.min(16, Runtime.getRuntime().availableProcessors() - 1));
         }
         int timeout = (int) opts.decompile_timeout;
         DecompInterface[] serial = new DecompInterface[1];
@@ -856,7 +949,7 @@ public final class Exporter {
                         serial[0] = decompiler();
                     }
                     DecompileResults res = skipped(func) ? null : decompile(serial[0], func, timeout);
-                    exportOne(i, funcs, func, res);
+                    exportOne(i, funcs, func, prepare(func, res));
                 }
                 return;
             }
@@ -866,36 +959,53 @@ public final class Exporter {
             try {
                 ArrayDeque<Object[]> window = new ArrayDeque<>();
                 Iterator<Function> it = funcs.iterator();
-                java.util.function.Function<Function, Future<DecompileResults>> submit = func -> ex.submit(() -> {
+                java.util.function.Function<Function, Future<Prepared>> submit = func -> ex.submit(() -> {
                     DecompInterface ifc = local.get();
                     if (ifc == null) {
                         ifc = decompiler();
                         local.set(ifc);
                         ifcs.add(ifc);
                     }
-                    return skipped(func) ? null : decompile(ifc, func, timeout);
+                    DecompileResults res = skipped(func) ? null : decompile(ifc, func, timeout);
+                    return prepare(func, res);
                 });
-                while (it.hasNext() && window.size() < 2 * n) {
-                    Function func = it.next();
-                    window.add(new Object[] {func, submit.apply(func)});
+                // Functions in flight: enough to keep the workers busy past a slow
+                // one, bounded by their code size (their decompilation and
+                // per-instruction states are held until exported in order).
+                int ahead = Integer.getInteger("dwarfexport.window", 16) * n;
+                // (about 4 KB of heap per code byte in flight: 1/4096 of the heap)
+                long budget = Long.getLong("dwarfexport.inflight", Math.max(64 * 1024, Runtime.getRuntime().maxMemory() / 4096));
+                long[] inflight = {0};
+                final int nThreads = n;
+                java.util.function.Predicate<Integer> room = size -> window.size() < nThreads + 1 ||
+                    (window.size() < ahead && inflight[0] + size <= budget);
+                Function pendingF = it.hasNext() ? it.next() : null;
+                while (pendingF != null && room.test(bodySize(pendingF))) {
+                    inflight[0] += bodySize(pendingF);
+                    window.add(new Object[] {pendingF, submit.apply(pendingF)});
+                    pendingF = it.hasNext() ? it.next() : null;
                 }
                 int i = 0;
                 while (!window.isEmpty()) {
                     Object[] w = window.poll();
-                    if (it.hasNext()) {
-                        Function nx = it.next();
-                        window.add(new Object[] {nx, submit.apply(nx)});
-                    }
                     Function func = (Function) w[0];
+                    inflight[0] -= bodySize(func);
+                    while (pendingF != null && room.test(bodySize(pendingF))) {
+                        inflight[0] += bodySize(pendingF);
+                        window.add(new Object[] {pendingF, submit.apply(pendingF)});
+                        pendingF = it.hasNext() ? it.next() : null;
+                    }
+                    long tw = System.nanoTime();
                     @SuppressWarnings("unchecked")
-                    DecompileResults res = ((Future<DecompileResults>) w[1]).get();
-                    if (res != null && res.isTimedOut() && !monitor.isCancelled()) {
+                    Prepared prep = ((Future<Prepared>) w[1]).get();
+                    addTime("worker wait", tw);
+                    if (prep.res != null && prep.res.isTimedOut() && !monitor.isCancelled()) {
                         if (serial[0] == null) {
                             serial[0] = decompiler();
                         }
-                        res = decompile(serial[0], func, timeout);
+                        prep = prepare(func, decompile(serial[0], func, timeout));
                     }
-                    exportOne(i++, funcs, func, res);
+                    exportOne(i++, funcs, func, prep);
                 }
             }
             finally {
@@ -925,13 +1035,17 @@ public final class Exporter {
         }
     }
 
-    private void exportOne(int i, List<Function> funcs, Function func, DecompileResults res) throws Exception {
+    static int bodySize(Function f) {
+        return (int) Math.min(f.getBody().getNumAddresses(), 1 << 24);
+    }
+
+    private void exportOne(int i, List<Function> funcs, Function func, Prepared prep) throws Exception {
         monitor.checkCancelled();
         monitor.setProgress(i);
         if (i % 200 == 0) {
             log("[" + i + "/" + funcs.size() + "] " + func.getName());
         }
-        exportFunction(res, func);
+        exportFunction(prep, func);
     }
 
     List<long[]> functionRanges(Function func) {
@@ -976,11 +1090,12 @@ public final class Exporter {
 
     // -- one function ---------------------------------------------------------------------
 
-    void exportFunction(DecompileResults res, Function func) {
+    void exportFunction(Prepared prep, Function func) {
         stat("functions");
+        DecompileResults res = prep.res;
         String name = Names.qualified(func);
         long entry = func.getEntryPoint().getOffset();
-        List<long[]> ranges = functionRanges(func);
+        List<long[]> ranges = prep.ranges;
         boolean isSkipped = skipped(func);
         HighFunction hf = res != null ? res.getHighFunction() : null;
         ClangTokenGroup markup = res != null ? res.getCCodeMarkup() : null;
@@ -1006,52 +1121,27 @@ public final class Exporter {
             funcRanges.add(new long[] {A(r[0]), A(r[0]) + (r[1] - r[0])});
         }
         long size = ranges.get(0)[1] - entry;
-        Map<Long, List<Long>> extra = new HashMap<>();
-        if (hf != null) {
-            List<Address> missing = new ArrayList<>();
-            try {
-                for (JumpTable jt : hf.getJumpTables()) {
-                    long sw = jt.getSwitchAddress().getOffset();
-                    List<Long> cases = new ArrayList<>();
-                    for (Address c : jt.getCases()) {
-                        cases.add(c.getOffset());
-                        if (listing.getInstructionAt(c) == null) {
-                            missing.add(c);
-                        }
-                    }
-                    extra.put(sw, cases);
+        if (!prep.missing.isEmpty()) {
+            TreeSet<Address> ms = new TreeSet<>(prep.missing);
+            List<String> shown = new ArrayList<>();
+            for (Address a : ms) {
+                if (shown.size() < 4) {
+                    shown.add(a.toString());
                 }
             }
-            catch (Exception e) {
-                // no jump tables
-            }
-            if (!missing.isEmpty()) {
-                TreeSet<Address> ms = new TreeSet<>(missing);
-                List<String> shown = new ArrayList<>();
-                for (Address a : ms) {
-                    if (shown.size() < 4) {
-                        shown.add(a.toString());
-                    }
-                }
-                log("WARNING: " + name + ": switch cases at " + String.join(", ", shown) +
-                    " are not disassembled: no CFI or variable locations there. Disassemble them and re-export.");
-            }
+            log("WARNING: " + name + ": switch cases at " + String.join(", ", shown) +
+                " are not disassembled: no CFI or variable locations there. Disassemble them and re-export.");
         }
-        FunctionFlow flow;
-        try {
-            State init = irqEntryState(func);
-            if (init == null) {
-                init = helperEntryState(func);
-            }
-            flow = new FunctionFlow(machine, func, extra, init);
+        FunctionFlow flow = prep.flow;
+        if (prep.flowError != null) {
+            log("WARNING: flow analysis failed for " + name + ": " + prep.flowError);
         }
-        catch (Exception e) {
-            log("WARNING: flow analysis failed for " + name + ": " + e);
-            flow = null;
+
+        long tc = System.nanoTime();
+        if (cfi != null) {
+            cfi.add(prep.fdes);
         }
-        if (cfi != null && flow != null) {
-            cfi.addFunction(flow, ranges, interrupts.contains(entry));
-        }
+        addTime("cfi", tc);
         List<String> aliases = aliases(func.getEntryPoint(), func.getSymbol());
         if (isThumb(func.getEntryPoint())) {
             elfSymbols.add(new ElfSym(name, A(entry) | 1, size, C.STT_FUNC, 0, C.STB_GLOBAL));
@@ -1133,7 +1223,7 @@ public final class Exporter {
             }
             FunctionPrototype proto = hf.getFunctionPrototype();
             types.ref(die, proto != null ? proto.getReturnType() : ret);
-            exportVariables(die, func, hf, ranges, flow, true);
+            exportVariables(die, prep.vars);
         }
         else {
             codeDecls = findCodeDecls(markup);
@@ -1291,7 +1381,7 @@ public final class Exporter {
             sigLine = sig != null ? sig : base + 1;
             FunctionPrototype proto = hf.getFunctionPrototype();
             types.ref(die, proto != null ? proto.getReturnType() : func.getReturnType());
-            exportVariables(die, func, hf, ranges, flow, false);
+            exportVariables(die, prep.vars);
         }
         if (func.hasVarArgs()) {
             die.child(C.DW_TAG_unspecified_parameters);
@@ -1745,7 +1835,12 @@ public final class Exporter {
         return target;
     }
 
-    void exportVariables(Die funcDie, Function func, HighFunction hf, List<long[]> ranges, FunctionFlow flow,
+    /**
+     * The function's variables in export order (parameters, then the other
+     * symbols sorted by name and storage), each with its location or the
+     * error computing it: {HighSymbol, Boolean is param, Location, error}.
+     */
+    List<Object[]> variableLocations(Function func, HighFunction hf, List<long[]> ranges, FunctionFlow flow,
             boolean paramsOnly) {
         LocalSymbolMap lsm = hf.getLocalSymbolMap();
         List<HighSymbol> params = new ArrayList<>();
@@ -1772,15 +1867,37 @@ public final class Exporter {
             return c != 0 ? c : pyCompare(String.valueOf(a.getStorage()), String.valueOf(b.getStorage()));
         });
         FunctionContext ctx = new FunctionContext(this, func, hf, ranges, flow);
+        List<Object[]> out = new ArrayList<>();
+        List<Object[]> order = new ArrayList<>();
         for (HighSymbol sym : params) {
-            exportVariable(funcDie, sym, ctx, true);
+            order.add(new Object[] {sym, true});
         }
-        if (paramsOnly) {
-            return;
+        if (!paramsOnly) {
+            for (HighSymbol sym : others) {
+                order.add(new Object[] {sym, sym.isParameter()});
+            }
         }
-        for (HighSymbol sym : others) {
-            exportVariable(funcDie, sym, ctx, sym.isParameter());
+        for (Object[] o : order) {
+            HighSymbol sym = (HighSymbol) o[0];
+            FunctionContext.Location loc = null;
+            String err = null;
+            try {
+                loc = ctx.symbolLocation(sym);
+            }
+            catch (Exception e) {
+                err = String.valueOf(e);
+            }
+            out.add(new Object[] {sym, o[1], loc, err});
         }
+        return out;
+    }
+
+    void exportVariables(Die funcDie, List<Object[]> vars) {
+        long tv = System.nanoTime();
+        for (Object[] v : vars) {
+            exportVariable(funcDie, (HighSymbol) v[0], (Boolean) v[1], (FunctionContext.Location) v[2], (String) v[3]);
+        }
+        addTime("variables", tv);
     }
 
     static Set<Long> duplicatedReturnCode(HighFunction hf, FunctionFlow flow) {
@@ -1855,7 +1972,7 @@ public final class Exporter {
         return out;
     }
 
-    void exportVariable(Die funcDie, HighSymbol sym, FunctionContext ctx, boolean isParam) {
+    void exportVariable(Die funcDie, HighSymbol sym, boolean isParam, FunctionContext.Location loc, String err) {
         stat("variables");
         int tag = isParam ? C.DW_TAG_formal_parameter : C.DW_TAG_variable;
         Die die = funcDie.child(tag);
@@ -1868,13 +1985,10 @@ public final class Exporter {
         else {
             types.ref(die, sym.getDataType());
         }
-        FunctionContext.Location loc;
-        try {
-            loc = ctx.symbolLocation(sym);
-        }
-        catch (Exception e) {
-            log("WARNING: " + ctx.func.getName() + "/" + sym.getName() + ": location failed: " + e);
-            loc = null;
+        if (err != null) {
+            log("WARNING: " + sym.getHighFunction().getFunction().getName() + "/" + sym.getName() +
+                ": location failed: " + err);
+            return;
         }
         if (loc == null) {
             return;

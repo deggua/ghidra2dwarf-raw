@@ -1029,6 +1029,13 @@ public final class FunctionFlow {
         return off;
     }
 
+    /** Drops what only the worker-side analysis needs (out-states, the holder index). */
+    public void releaseAnalysisState() {
+        stateOut.clear();
+        stateTaken.clear();
+        holdersCache.clear();
+    }
+
     // -- queries ------------------------------------------------------------------
 
     public long insnEnd(long off) {

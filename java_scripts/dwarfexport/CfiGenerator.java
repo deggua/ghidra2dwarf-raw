@@ -295,12 +295,39 @@ public final class CfiGenerator {
         return ops.bytes();
     }
 
+    /** A function's FDEs, computed in a worker; the CIE (an interrupt column or -1) is resolved later. */
+    public static final class Fdes {
+        final List<FrameDescription> fdes = new ArrayList<>();
+        int irqCol = -1;
+    }
+
     public void addFunction(FunctionFlow flow, List<long[]> ranges, boolean interrupt) {
-        if (!ok) {
+        add(compute(flow, ranges, interrupt));
+    }
+
+    /** Appends computed FDEs, in order, with their CIE (main thread). */
+    public void add(Fdes f) {
+        if (!ok || f == null) {
             return;
         }
+        int cie = f.irqCol >= 0 ? irqCie(f.irqCol) : 0;
+        for (FrameDescription fd : f.fdes) {
+            dw.fdes.add(cie == 0 ? fd : new FrameDescription(fd.start, fd.end, fd.instructions, cie));
+        }
+    }
+
+    /** The FDEs of a function (any thread: reads the flow and the machine only). */
+    public Fdes compute(FunctionFlow flow, List<long[]> ranges, boolean interrupt) {
+        Fdes outF = new Fdes();
+        if (!ok) {
+            return outF;
+        }
         Object[] irq = interrupt ? irqReturnReg(flow) : null;
-        int cie = irq != null ? irqCie((Integer) irq[1]) : 0;
+        int cie = 0;
+        if (irq != null) {
+            outF.irqCol = (Integer) irq[1];
+        }
+        List<FrameDescription> sink = outF.fdes;
         Set<Integer> undefinedCols = new HashSet<>();
         if (irq != null) {
             undefinedCols.add((Integer) irq[1]);
@@ -317,14 +344,14 @@ public final class CfiGenerator {
                     continue;
                 }
                 if (start != null && off != end) {
-                    dw.fdes.add(new FrameDescription(A.applyAsLong(start), A.applyAsLong(end), rows, cie));
+                    sink.add(new FrameDescription(A.applyAsLong(start), A.applyAsLong(end), rows, cie));
                     start = null;
                 }
                 State st = flow.stateIn.get(off);
                 Rule rl = st != null ? rule(flow, st, irq) : null;
                 if (rl == null) {
                     if (start != null) {
-                        dw.fdes.add(new FrameDescription(A.applyAsLong(start), A.applyAsLong(off), rows, cie));
+                        sink.add(new FrameDescription(A.applyAsLong(start), A.applyAsLong(off), rows, cie));
                         start = null;
                     }
                     continue;
@@ -346,9 +373,10 @@ public final class CfiGenerator {
                 prev = rl;
             }
             if (start != null) {
-                dw.fdes.add(new FrameDescription(A.applyAsLong(start), A.applyAsLong(lo) + (Math.min(end, hi) - lo), rows,
+                sink.add(new FrameDescription(A.applyAsLong(start), A.applyAsLong(lo) + (Math.min(end, hi) - lo), rows,
                     cie));
             }
         }
+        return outF;
     }
 }

@@ -5,7 +5,9 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
 
@@ -64,11 +66,12 @@ public final class MachineInfo {
     public final List<Key> volatileRegs = new ArrayList<>();
     public final Set<Key> volatileSet = new HashSet<>();
 
-    private final Map<Key, Integer> dwarfCache = new HashMap<>();
-    private final Map<Key, List<Key>> containersCache = new HashMap<>();
-    private final Map<Long, Integer> purgeCache = new HashMap<>();
-    private final Map<Long, Integer> argsCache = new HashMap<>();
-    private final Map<Long, List<Op>> inlineCache = new HashMap<>();
+    // (concurrent: the analysis of several functions runs in worker threads)
+    private final Map<Key, Integer> dwarfCache = new ConcurrentHashMap<>();
+    private final Map<Key, List<Key>> containersCache = new ConcurrentHashMap<>();
+    private final Map<Long, Integer> purgeCache = new ConcurrentHashMap<>();
+    private final Map<Long, Integer> argsCache = new ConcurrentHashMap<>();
+    private final Map<Long, Optional<List<Op>>> inlineCache = new ConcurrentHashMap<>();
     private static final Integer NONE = Integer.MIN_VALUE;
 
     public MachineInfo(Program program, RegisterIndex regIndex, long stackshift, Consumer<String> log) {
@@ -248,8 +251,9 @@ public final class MachineInfo {
             return null;
         }
         long off = target.getOffset();
-        if (inlineCache.containsKey(off)) {
-            return inlineCache.get(off);
+        Optional<List<Op>> hit = inlineCache.get(off);
+        if (hit != null) {
+            return hit.orElse(null);
         }
         List<Op> body = null;
         Function f = program.getFunctionManager().getFunctionAt(target);
@@ -283,7 +287,7 @@ public final class MachineInfo {
                 body = ops;
             }
         }
-        inlineCache.put(off, body);
+        inlineCache.put(off, Optional.ofNullable(body));
         return body;
     }
 
