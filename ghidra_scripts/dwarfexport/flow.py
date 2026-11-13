@@ -762,7 +762,7 @@ class FunctionFlow(object):
             else:
                 regs[k] = (PHI, join_off, k)
         mem = {}
-        for o in set(a.mem) & set(b.mem):
+        for o in [o for o in a.mem if o in b.mem]:     # (a's order: deterministic, portable)
             sa, va = a.mem[o]
             sb, vb = b.mem[o]
             if sa != sb:
