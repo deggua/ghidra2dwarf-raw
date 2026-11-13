@@ -34,7 +34,6 @@ import ghidra.app.decompiler.component.DecompilerUtils;
 import ghidra.app.util.NamespaceUtils;
 import ghidra.app.util.viewer.field.Annotation;
 import ghidra.app.util.viewer.field.CommentUtils;
-import ghidra.framework.plugintool.PluginTool;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressIterator;
 import ghidra.program.model.address.AddressRange;
@@ -64,7 +63,8 @@ public final class Exporter {
 
     final Program program;
     final TaskMonitor monitor;
-    final PluginTool tool;
+    /** The tool's options by name ("Decompiler", ...) when run from the GUI, else null. */
+    final java.util.function.Function<String, ghidra.framework.options.ToolOptions> toolOptions;
     final Options opts;
     final Consumer<String> logger;
     private DecompileOptions decOpts;
@@ -208,11 +208,12 @@ public final class Exporter {
         }
     }
 
-    public Exporter(Program program, TaskMonitor monitor, String outDir, Options options, PluginTool tool,
+    public Exporter(Program program, TaskMonitor monitor, String outDir, Options options,
+            java.util.function.Function<String, ghidra.framework.options.ToolOptions> toolOptions,
             Consumer<String> logger) {
         this.program = program;
         this.monitor = monitor;
-        this.tool = tool;
+        this.toolOptions = toolOptions;
         this.opts = options != null ? options : new Options();
         this.logger = logger != null ? logger : System.out::println;
         this.outDir = Path.of(outDir).toAbsolutePath().normalize();
@@ -838,8 +839,8 @@ public final class Exporter {
     synchronized DecompileOptions decompileOptions() {
         if (decOpts == null) {
             DecompileOptions o = new DecompileOptions();
-            if (tool != null) {
-                o.grabFromToolAndProgram(tool.getOptions("Listing Fields"), tool.getOptions("Decompiler"), program);
+            if (toolOptions != null) {
+                o.grabFromToolAndProgram(toolOptions.apply("Listing Fields"), toolOptions.apply("Decompiler"), program);
             }
             else {
                 o.grabFromProgram(program);

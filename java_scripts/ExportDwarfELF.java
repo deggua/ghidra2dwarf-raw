@@ -28,6 +28,7 @@ import docking.widgets.values.ValuesMapValidator;
 import dwarfexport.Exporter;
 import dwarfexport.Options;
 import ghidra.app.script.GhidraScript;
+import ghidra.framework.options.ToolOptions;
 import ghidra.features.base.values.GhidraValuesMap;
 import ghidra.util.StatusListener;
 import ghidra.util.exception.CancelledException;
@@ -152,7 +153,7 @@ public class ExportDwarfELF extends GhidraScript {
             }
         }
         if (outDir == null) {
-            if (isRunningHeadless()) {
+            if (headless()) {
                 outDir = defaultDir();
             }
             else {
@@ -171,6 +172,16 @@ public class ExportDwarfELF extends GhidraScript {
             System.out.flush();
         } : this::println;
         // (in the GUI, the CodeBrowser's decompiler display options shape the C)
-        new Exporter(currentProgram, monitor, outDir, opts, isRunningHeadless() ? null : state.getTool(), log).run();
+        new Exporter(currentProgram, monitor, outDir, opts, headless() ? null : toolOptions(), log).run();
+    }
+
+    /** Running without a GUI? (overridable: the dialog test) */
+    protected boolean headless() {
+        return isRunningHeadless();
+    }
+
+    /** The CodeBrowser's options by name (overridable: the dialog test). */
+    protected java.util.function.Function<String, ToolOptions> toolOptions() {
+        return state.getTool()::getOptions;
     }
 }

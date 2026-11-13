@@ -19,6 +19,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 
 
+def exporter_args():
+    """The exporter to test: the Java one (default), or the Python one with
+    DWARFEXPORT_IMPL=python."""
+    if os.environ.get("DWARFEXPORT_IMPL", "java") == "python":
+        return ["-postScript", os.path.join(REPO, "ghidra_scripts", "ExportDwarfELF.py")]
+    java_dir = os.environ.get("DWARFEXPORT_JAVA_DIR", os.path.join(REPO, "java_scripts"))
+    return ["-scriptPath", java_dir, "-postScript", "ExportDwarfELF.java"]
+
+
 def export(build, work, opts=()):
     ghidra = os.environ.get("GHIDRA_INSTALL_DIR", os.path.join(os.path.dirname(REPO), "ghidra_12.2_PUBLIC"))
     with open(os.path.join(build, "layout.json")) as f:
@@ -36,8 +45,7 @@ def export(build, work, opts=()):
           ([os.path.join(fw, "irq.h")] if layout.get("irq") else []) + \
           ["-postScript", os.path.join(HERE, "ghidra_setup_edge.py"), build] + \
           (["-postScript", os.path.join(HERE, "ghidra_setup_irq.py"), build] if layout.get("irq") else []) + [
-           "-postScript", os.path.join(REPO, "ghidra_scripts", "ExportDwarfELF.py"),
-           os.path.join(work, "out")] + list(opts) + [
+           ] + exporter_args() + [os.path.join(work, "out")] + list(opts) + [
            # what the DWARF round trip (test/roundtrip.py) compares against
            "-postScript", os.path.join(HERE, "ghidra_dump.py"), os.path.join(work, "original.json")]
     log_path = os.path.join(work, "ghidra.log")

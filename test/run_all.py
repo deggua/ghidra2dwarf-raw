@@ -243,9 +243,13 @@ def main():
         ghidra = os.environ.get("GHIDRA_INSTALL_DIR", os.path.join(os.path.dirname(REPO), "ghidra_12.2_PUBLIC"))
         scratch = os.path.join(work, "gui-check")
         os.makedirs(scratch, exist_ok=True)
+        if os.environ.get("DWARFEXPORT_IMPL", "java") == "python":
+            check = ["-postScript", os.path.join(HERE, "check_gui_options.py"), scratch]
+        else:
+            java_dir = os.environ.get("DWARFEXPORT_JAVA_DIR", os.path.join(REPO, "java_scripts"))
+            check = ["-scriptPath", java_dir, "-postScript", "CheckExportDialog.java", scratch]
         r = subprocess.run([os.path.join(ghidra, "support", "pyghidraRun"), "-H", proj, "fwtest", "-process",
-                            "fw.bin", "-noanalysis", "-readOnly", "-postScript",
-                            os.path.join(HERE, "check_gui_options.py"), scratch],
+                            "fw.bin", "-noanalysis", "-readOnly"] + check,
                            input="y\n", capture_output=True, text=True)
         summary = [l for l in r.stdout.splitlines() if l.startswith("GUI SUMMARY")]
         gui_ok = bool(summary) and " 0 failed" in summary[0]
