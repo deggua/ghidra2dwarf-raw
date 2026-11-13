@@ -69,4 +69,18 @@ public final class Vn {
     public Key uKey() {
         return Key.u(off, size);
     }
+
+    @Override
+    public boolean equals(Object o) {
+        if (!(o instanceof Vn)) {
+            return false;
+        }
+        Vn v = (Vn) o;
+        return v.kind == kind && v.off == off && v.size == size;
+    }
+
+    @Override
+    public int hashCode() {
+        return kind * 31 + Long.hashCode(off) * 17 + size;
+    }
 }
