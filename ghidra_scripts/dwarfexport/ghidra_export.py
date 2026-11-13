@@ -899,7 +899,7 @@ class Exporter(object):
         # Handlers entered by a branch from another handler (a shared exit
         # path "b irq_exit"): {target entry: [(source entry, branch offset)]}
         self.irq_jumps = {}
-        for src in found:
+        for src in sorted(found):   # (in address order: the first source's state is used)
             f = fm.getFunctionAt(self.space.getAddress(src))
             if f is None:
                 continue

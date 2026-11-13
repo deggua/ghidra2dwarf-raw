@@ -84,7 +84,7 @@ public class ExportDwarfELF extends GhidraScript {
             throw new IllegalArgumentException("choose an output directory");
         }
         String d = f.getPath().strip();
-        if (d.startsWith("~")) {
+        if (d.equals("~") || d.startsWith("~/") || d.startsWith("~" + File.separator)) {
             d = System.getProperty("user.home") + d.substring(1);
         }
         Path p = Path.of(d);

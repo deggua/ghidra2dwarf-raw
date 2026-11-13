@@ -747,22 +747,42 @@ public final class FunctionFlow {
 
     /** Keeps a join's state monotone so the fixpoint iteration terminates. */
     public State stabilize(State old, State nw, Val.Join join) {
+        // (decided on the merged state as it is, then applied: the result
+        // must not depend on the order of the register ids, which the
+        // worker threads assign first come, first served)
         int lim = old.idLimit();
+        Val[] put = null;
         for (int i = 0; i < lim; i++) {
             Val ov = old.get(i);
             if (ov == ABSENT) {
                 continue;
             }
+            Val v = ABSENT;
             if (ov == null) {
-                nw.put(i, null);
-                continue;
+                v = null;
             }
-            Val nv = nw.get(i);
-            if (nv == ABSENT) {
-                nv = regValue(nw, i);
+            else if (ov.kind == Val.PHI && ov.equals(Val.phi(join, key(i)))) {
+                Val nv = nw.get(i);
+                if (nv == ABSENT) {
+                    nv = regValue(nw, i);
+                }
+                if (nv != null) {
+                    v = ov;
+                }
             }
-            if (nv != null && ov.kind == Val.PHI && ov.equals(Val.phi(join, key(i)))) {
-                nw.put(i, ov);
+            if (v != ABSENT) {
+                if (put == null) {
+                    put = new Val[lim];
+                    Arrays.fill(put, ABSENT);
+                }
+                put[i] = v;
+            }
+        }
+        if (put != null) {
+            for (int i = 0; i < lim; i++) {
+                if (put[i] != ABSENT) {
+                    nw.put(i, put[i]);
+                }
             }
         }
         if (old.u != null) {

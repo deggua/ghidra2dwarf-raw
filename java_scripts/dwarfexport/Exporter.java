@@ -290,6 +290,16 @@ public final class Exporter {
         return (off + opts.address_offset) & addrMask;
     }
 
+    /**
+     * Target address of the end of [off, off + len): an end past the top of
+     * a 64-bit address space is the last address (as the DWARF writer does
+     * for 32 bits).
+     */
+    long endA(long off, long len) {
+        long end = A(off) + len;
+        return len > 0 && Long.compareUnsigned(end, A(off)) <= 0 ? -1L : end;
+    }
+
     public boolean inSpace(Address addr) {
         return addr != null && addr.getAddressSpace().equals(space);
     }
@@ -608,7 +618,7 @@ public final class Exporter {
             }
         }
         for (Instruction ins : listing.getInstructions(true)) {
-            if (IRQ_RETURN.matcher(ins.getMnemonicString()).matches()) {
+            if (inSpace(ins.getAddress()) && IRQ_RETURN.matcher(ins.getMnemonicString()).matches()) {
                 Iterator<Function> fs = fm.getFunctionsOverlapping(new AddressSet(ins.getAddress()));
                 while (fs.hasNext()) {
                     Function f = fs.next();
@@ -649,7 +659,7 @@ public final class Exporter {
             }
         }
         irqJumps = new HashMap<>();
-        for (long src : found) {
+        for (long src : new TreeSet<>(found)) { // (in address order: the first source's state is used)
             Function f = fm.getFunctionAt(space.getAddress(src));
             if (f == null) {
                 continue;
@@ -955,10 +965,13 @@ public final class Exporter {
         return n >= 2;
     }
 
+    /** Set when the worker pool is torn down (its decompilers stopped: no retries). */
+    private volatile boolean shuttingDown;
+
     DecompileResults decompile(DecompInterface ifc, Function func, int timeout) {
         DecompileResults res = ifc.decompileFunction(func, timeout, monitor);
         boolean failed = res != null && !res.decompileCompleted() && !res.isTimedOut();
-        if ((failed || historyDependent(res)) && !monitor.isCancelled()) {
+        if ((failed || historyDependent(res)) && !monitor.isCancelled() && !shuttingDown) {
             // (a failure may be transient -- Ghidra's decompiler has races
             // between concurrent processes -- so it gets a second chance in a
             // fresh process, as does a history-dependent result)
@@ -999,7 +1012,7 @@ public final class Exporter {
         if (n < 0) {
             n = Math.max(1, Math.min(16, Runtime.getRuntime().availableProcessors() - 1));
         }
-        int timeout = (int) opts.decompile_timeout;
+        int timeout = (int) Math.min(opts.decompile_timeout, Integer.MAX_VALUE);
         DecompInterface[] serial = new DecompInterface[1];
         try {
             if (n <= 1) {
@@ -1038,7 +1051,8 @@ public final class Exporter {
                 // one, bounded by their code size (their decompilation and
                 // per-instruction states are held until exported in order).
                 int ahead = Integer.getInteger("dwarfexport.window", 256) * n;
-                // (about 4 KB of heap per code byte in flight: 1/4096 of the heap)
+                // (code bytes in flight up to 1/4096 of the heap: measured on glibc,
+                // 1/2048 already caused full GCs with a 1 GB heap)
                 long budget = Long.getLong("dwarfexport.inflight", Math.max(64 * 1024, Runtime.getRuntime().maxMemory() / 4096));
                 long[] inflight = {0};
                 final int nThreads = n;
@@ -1074,6 +1088,7 @@ public final class Exporter {
                 }
             }
             finally {
+                shuttingDown = true;
                 synchronized (ifcs) {
                     for (DecompInterface ifc : ifcs) {
                         try {
@@ -1177,13 +1192,13 @@ public final class Exporter {
         else {
             List<long[]> rs = new ArrayList<>();
             for (long[] r : ranges) {
-                rs.add(new long[] {A(r[0]), A(r[0]) + (r[1] - r[0])});
+                rs.add(new long[] {A(r[0]), endA(r[0], r[1] - r[0])});
             }
             die.add(C.DW_AT_ranges, C.DW_FORM_sec_offset, (long) dw.addRanges(rs));
         }
         die.add(C.DW_AT_frame_base, C.DW_FORM_exprloc, dw.expr().callFrameCfa().bytes());
         for (long[] r : ranges) {
-            funcRanges.add(new long[] {A(r[0]), A(r[0]) + (r[1] - r[0])});
+            funcRanges.add(new long[] {A(r[0]), endA(r[0], r[1] - r[0])});
         }
         long size = ranges.get(0)[1] - entry;
         if (!prep.missing.isEmpty()) {
@@ -1561,7 +1576,7 @@ public final class Exporter {
                 outRows.add(0, new Row(A(entry), sigLine, 0));
             }
             stats.merge("line_rows", (long) outRows.size(), Long::sum);
-            dw.addSequence(outRows, A(lo) + (hi - lo), cfile.fileNo);
+            dw.addSequence(outRows, endA(lo, hi - lo), cfile.fileNo);
         }
     }
 

@@ -58,7 +58,8 @@ public final class CfiGenerator {
     final Set<Long> entryPoints;
     public boolean ok;
     private final Map<Integer, Integer> irqCies = new HashMap<>();
-    private List<Key> tracked;
+    /** (built by the first worker that needs it: volatile, immutable) */
+    private volatile List<Key> tracked;
 
     public CfiGenerator(MachineInfo machine, DwarfBuilder dw, LongUnaryOperator addressMapper, List<Long> entryPoints,
             boolean irqSignalFrame) {
@@ -260,7 +261,8 @@ public final class CfiGenerator {
     }
 
     List<Key> trackedRegs() {
-        if (tracked == null) {
+        List<Key> t = tracked;
+        if (t == null) {
             TreeSet<Key> keys = new TreeSet<>();
             for (Key k : m.unaffected) {
                 if (m.dwarfOf(k) != null) {
@@ -270,9 +272,10 @@ public final class CfiGenerator {
             if (m.raKey != null) {
                 keys.add(m.raKey);
             }
-            tracked = new ArrayList<>(keys);
+            t = List.copyOf(keys);
+            tracked = t;
         }
-        return tracked;
+        return t;
     }
 
     static byte[] encode(Rule prev, Rule cur, Set<Integer> undefinedCols) {
