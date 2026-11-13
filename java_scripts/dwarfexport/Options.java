@@ -35,7 +35,7 @@ public final class Options {
     public long c_max_bytes = 100000;
     /** The same limit in lines. */
     public long c_max_lines = 100000;
-    /** Decompiler worker threads; -1 = min(8, CPUs - 1). */
+    /** Decompiler worker threads; -1 = min(16, CPUs - 1), 1 = serial. */
     public long decompile_threads = -1;
     /** ELF header e_flags; -1 = derive. */
     public long elf_flags = -1;

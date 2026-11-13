@@ -4,7 +4,7 @@ Source-level debugging of **reverse-engineered, non-ELF programs** (raw
 firmware / memory dumps, ROMs, ...) in GDB, using what you've annotated in
 Ghidra.
 
-A PyGhidra script exports a Ghidra program as:
+A Ghidra script (`ExportDwarfELF.java`) exports a Ghidra program as:
 
 | File | Contents |
 |------|----------|
@@ -31,38 +31,50 @@ line info + variables, but only for programs that *are* ELF files, since it
 patches the original binary) and
 [ghidra-ExportDwarfELFSymbols](https://github.com/aldelaro5/ghidra-ExportDwarfELFSymbols)
 (builds an ELF from scratch for any format, but only function ranges). It has
-no native dependencies: the DWARF and ELF writers are pure Python.
+no dependencies beyond Ghidra: the DWARF and ELF writers are part of the
+script.
+
+The exporter was first written in Python (PyGhidra); that version is still in
+`ghidra_scripts/` and produces the same output, but the Java version is about
+7 times faster on large programs and needs no PyGhidra.
 
 ## Requirements
 
-* Ghidra 12.x with PyGhidra (bundled). Developed and tested against
-  Ghidra 12.2.
+* Ghidra 12.x. Developed and tested against Ghidra 12.2. (The Python version
+  needs PyGhidra, which Ghidra bundles.)
 * `gdb-multiarch` (or a GDB for your target) to use the output. GDB >= 13 is
   recommended (it honors the `prologue_end` markers). Developed with GDB 16.
 
 ## Install
 
-1. Ghidra's Script Manager -> *Manage Script Directories* -> add
-   `ghidra2dwarf-raw/ghidra_scripts`.
-2. Start Ghidra with **`support/pyghidraRun`** so Python 3 scripts can run (the
-   first launch offers to install PyGhidra into Ghidra's own virtualenv from
-   the bundled wheels).
+Ghidra's Script Manager -> *Manage Script Directories* -> add
+`ghidra2dwarf-raw/java_scripts`. Ghidra compiles the script (and its
+`dwarfexport` package next to it) the first time it runs.
+
+For large programs, give Ghidra more memory; see [Performance](#performance).
+
+(The Python version: add `ghidra2dwarf-raw/ghidra_scripts` instead and start
+Ghidra with `support/pyghidraRun`, which offers to install PyGhidra into
+Ghidra's own virtualenv on first launch.)
 
 ## Export
 
-**GUI:** run `ExportDwarfELF.py` (category *DWARF*). A dialog asks for the
+**GUI:** run `ExportDwarfELF.java` (category *DWARF*). A dialog asks for the
 output directory and every option below, prefilled with the defaults (and
 rejects invalid values before it closes).
 
 **Headless:**
 
 ```sh
-$GHIDRA/support/pyghidraRun -H <project dir> <project name> -process <program> -noanalysis \
-    -postScript ghidra2dwarf-raw/ghidra_scripts/ExportDwarfELF.py <out dir> [key=value ...]
+$GHIDRA/support/analyzeHeadless <project dir> <project name> -process <program> -noanalysis \
+    -scriptPath ghidra2dwarf-raw/java_scripts -postScript ExportDwarfELF.java <out dir> [key=value ...]
 ```
 
+(Python version: `$GHIDRA/support/pyghidraRun -H` with the same arguments,
+`-postScript ghidra2dwarf-raw/ghidra_scripts/ExportDwarfELF.py`.)
+
 Options (`key=value` script arguments in headless mode, the dialog in the
-GUI; defaults in `dwarfexport/ghidra_export.py:Options`):
+GUI; defaults in `java_scripts/dwarfexport/Options.java`):
 
 | Option | Default | Meaning |
 |--------|---------|---------|
@@ -78,7 +90,7 @@ GUI; defaults in `dwarfexport/ghidra_export.py:Options`):
 | `sanitize_names` | `false` | Rewrite every name into a plain C identifier (`Get?Value` → `Get_Value`, `Foo::init` → `Foo__init`, a variable named `switch` → `switch_`), consistently in the DWARF, the ELF symbols and the source files. See [Names](#names). |
 | `skip_decompile` | | Comma-separated function names (or entry addresses) not to decompile, e.g. ones that hang the decompiler. They still get symbols, address ranges, CFI and a one-line prototype. |
 | `elf_flags` | `-1` (auto) | ELF header `e_flags`. By default derived from the language and compiler spec (ARM EABI5, BE8 and float ABI; MIPS o32/n32/o64/EABI/n64 and ISA; PPC64 ELFv1/ELFv2). GDB uses it to pick the ABI. |
-| `decompile_threads` | `-1` | Decompiler worker threads; `-1` = min(8, CPUs - 1), `1` = decompile serially. |
+| `decompile_threads` | `-1` | Worker threads (each with its own decompiler process); `-1` = min(16, CPUs - 1), `1` = decompile serially. |
 | `irq_signal_frame` | `true` | Mark interrupt/exception handler frames as signal frames, see [Interrupt and exception handlers](#interrupt-and-exception-handlers). |
 
 The `.c` files are laid out the way the Decompiler window shows the code:
@@ -404,8 +416,9 @@ values, so the exporter combines two analyses:
    branches back to the shared epilogue). A variable is shown until it is
    reassigned, not just while the decompiler still needs it.
 2. **Where that value physically is** at each PC: a small abstract
-   interpretation over the raw p-code of every instruction (`flow.py`). It
-   tracks the stack pointer as *entry SP + delta*, register entry values,
+   interpretation over the raw p-code of every instruction
+   (`FunctionFlow.java`; `flow.py` in the Python version). It tracks the
+   stack pointer as *entry SP + delta*, register entry values,
    per-instruction definitions, phi merges at joins, and stack slots, through
    copies, spills/reloads, zero/sign extensions and sub-register views,
    values split over several registers (a 64-bit result in a register
@@ -497,29 +510,64 @@ undefined return address, so backtraces end cleanly.
 ## Performance
 
 Exporting the stripped PPC32 glibc (`libc.so.6`, 2.3 MB, 3,687 functions,
-9,687 globals) takes about 2 minutes on a 16-core VM (it took 3.4 minutes
-before the decompiler ran in parallel and the flow analysis was tuned). The
-decompiler runs in worker threads ahead of the export (`decompile_threads`,
-default min(8, CPUs - 1)); what remains is mostly the single-threaded flow
-and location analysis in Python. The output doesn't depend on the thread
-count: the decompiler's names for locals can depend on what its process
-decompiled before (values over several registers, or floats in wider
-registers, get storage in the order the process first meets them), so a
-function with two or more such locals is decompiled again in a fresh
-process. The 4.5 MB ELF loads in GDB in about 0.1 s
-and passes `llvm-dwarfdump --verify`. A small firmware exports in about a
-second.
+9,687 globals) on a 16-core VM takes 20 s with Ghidra's default headless
+settings, and 16 s with the JVM settings below (the Python version takes
+about 140 s). A small firmware exports in about a second. The 4.5 MB ELF
+loads in GDB in about 0.1 s and passes `llvm-dwarfdump --verify`.
+
+Functions are decompiled and analyzed in worker threads (`decompile_threads`,
+default min(16, CPUs - 1), each with its own decompiler process), while the
+main thread assembles the DWARF and the C files in address order. Most of the
+time is the decompiler itself. The output doesn't depend on the thread count:
+the decompiler's names for locals can depend on what its process decompiled
+before (values over several registers, or floats in wider registers, get
+storage in the order the process first meets them), so a function with two or
+more such locals is decompiled again in a fresh process.
+
+**JVM settings.** The workers run ahead of the main thread, past slow
+functions, by as many functions as the memory budget allows (code bytes in
+flight up to 1/4096 of the maximum heap), so a larger heap is faster:
+
+| glibc export | time |
+|--------------|------|
+| headless defaults (2 GB heap, 2 GC threads, 2 JIT compiler threads) | 20 s |
+| 8 GB heap | 17 s |
+| 8 GB heap, 8 GC threads, 4 JIT compiler threads | 16 s |
+| 1 GB heap | 21.5 s |
+
+Recommended, if the machine has the memory: a maximum heap of 8 GB or more.
+
+* **GUI** (`ghidraRun`): set `MAXMEM_DEFAULT=8G` in `ghidraRun` (or export
+  `GHIDRA_GUI_MAXMEM=8G` before starting it). Without it the JVM takes 1/4 of
+  the physical memory. The GUI doesn't limit the GC or JIT threads.
+* **Headless** (`support/analyzeHeadless`): set `MAXMEM_DEFAULT=8G` there (or
+  `GHIDRA_HEADLESS_MAXMEM=8G`; the default is 2 GB), and raise the GC and JIT
+  threads it pins to 2 each, either in its `VMARG_LIST` or with
+  `GHIDRA_HEADLESS_JAVA_OPTIONS="-XX:ParallelGCThreads=8 -XX:CICompilerCount=4"`
+  (later flags override the earlier ones).
+* `pyghidraRun` (which the Java script doesn't need) takes JVM flags from
+  `PYGHIDRA_JAVA_OPTIONS`, e.g. `PYGHIDRA_JAVA_OPTIONS=-Xmx8G`.
+
+More decompiler threads than cores is slower (glibc: 15 threads 14.6 s, 24
+threads 16.4 s on 16 cores); fewer is slower too (8 threads: 20 s).
 
 ## Layout
 
 ```
-ghidra_scripts/ExportDwarfELF.py        the Ghidra script (entry point, options)
-ghidra_scripts/dwarfexport/
-    ghidra_export.py   Ghidra -> DWARF: types, functions, line table, variables, globals, ELF
-    flow.py            p-code data flow: CFI + physical value locations
-    dwarf.py           pure-Python DWARF 4 producer
-    elf.py             pure-Python ELF writer
-    consts.py          DWARF/ELF constants
+java_scripts/ExportDwarfELF.java        the Ghidra script (entry point, options dialog)
+java_scripts/CheckExportDialog.java     test of the GUI path (run by test/run_all.py)
+java_scripts/dwarfexport/
+    Exporter.java      Ghidra -> DWARF: functions, line table, globals, C files, worker threads
+    FunctionContext.java  variable locations of a decompiled function
+    TypeBuilder.java   Ghidra data types -> DWARF types and the types header
+    FunctionFlow.java, State.java, MachineInfo.java  p-code data flow: CFI + physical value locations
+    CfiGenerator.java  .debug_frame from the data flow
+    DwarfBuilder.java  DWARF 4 producer
+    ElfWriter.java     ELF writer
+    Options.java, Names.java, RegisterIndex.java, Key.java, Val.java, Vn.java, Op.java, C.java
+java_scripts/PortFlowDump.java          development check: dumps the flow states (vs test/port/flow_dump.py)
+ghidra_scripts/                          the Python version (same output; PyGhidra)
+    ExportDwarfELF.py, dwarfexport/{ghidra_export,flow,dwarf,elf,consts}.py
 test/
     run_all.py         full test suite (parallel; targets x -O levels)
     targets.py         the 20 targets: toolchain, flags, Ghidra language, QEMU
@@ -538,14 +586,16 @@ test/
     ghidra_setup_irq.py   INTERRUPT tag / entry points for the exception vectors
     roundtrip.py       re-imports the exported ELF into Ghidra (DWARF only) and diffs it
     difftrace.py, gdb_trace.py  unwinding at every instruction vs GCC's own CFI
-    check_gui_options.py  the GUI options dialog, headless (askValues stubbed)
+    check_gui_options.py  the GUI options dialog of the Python version, headless (askValues stubbed)
+    port/flow_dump.py  development check: the Python flow states (vs PortFlowDump.java)
     ghidra_dump.py, ghidra_dwarf_only.py  helpers for the round trip
 ```
 
 ## Tests
 
 Needs `gdb-multiarch`, `llvm` (for `llvm-dwarfdump`), Ghidra at
-`../ghidra_12.2_PUBLIC` (or set `GHIDRA_INSTALL_DIR`), and for each target its
+`../ghidra_12.2_PUBLIC` (or set `GHIDRA_INSTALL_DIR`) with PyGhidra (the
+harness's Ghidra scripts are Python), and for each target its
 cross GCC and QEMU: `qemu-system-ppc` (ppc32), `qemu-user` (the rest),
 `gcc-powerpc-linux-gnu`, `gcc-powerpc64-linux-gnu`, `gcc-powerpc64le-linux-gnu`,
 `gcc-mips-linux-gnu`, `gcc-mipsel-linux-gnu`, `gcc-mips64-linux-gnuabi64`,
@@ -555,6 +605,7 @@ and the host GCC (`-m32`/`-m64`).
 ```sh
 test/run_all.py                         # 20 targets x -O0/-O1/-O2 + sanitized names
 test/run_all.py -t armle-thumb,mips32be -O O1
+DWARFEXPORT_IMPL=python test/run_all.py   # the same tests on the Python version
 ```
 
 | Target | Ghidra language | Runs under |
@@ -647,9 +698,10 @@ The edge-case module (`firmware/edge.c`, `edge_asm.S`, `ghidra_setup_edge.py`,
   (`break func:label`), and equates (in code, unused, literal-named, named
   like a global).
 
-The GUI check also runs the script's `main()` down its GUI path with a
-stand-in tool whose decompiler options set a 50-character line width, C++
-comments and end-of-line comments, and checks the C files follow them.
+The GUI check (`CheckExportDialog.java`) also runs the script down its GUI
+path with a stand-in tool whose decompiler options set a 50-character line
+width, C++ comments and end-of-line comments, and checks the C files follow
+them.
 
 **Differential unwinding test** (`test/difftrace.py`): the firmware is
 single-stepped twice from the same point (5,000 instructions from
