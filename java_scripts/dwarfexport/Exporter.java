@@ -342,8 +342,12 @@ public final class Exporter {
         srcDirNo = dw.addDir(srcDirName);
         newCFile();
 
+        long ts = System.nanoTime();
         qualifiedRenames = collectQualifiedRenames();
+        addTime("renames", ts);
+        ts = System.nanoTime();
         interrupts = findInterruptHandlers();
+        addTime("interrupt handlers", ts);
         if (!interrupts.isEmpty()) {
             FunctionManager fm = program.getFunctionManager();
             List<String> names = new ArrayList<>();
@@ -353,7 +357,9 @@ public final class Exporter {
             Collections.sort(names);
             log("Interrupt/exception handlers: " + String.join(", ", names));
         }
+        ts = System.nanoTime();
         writeTypesHeader();
+        addTime("types header", ts);
         long tfun = System.nanoTime();
         exportFunctions();
         addTime("functions (all)", tfun);
@@ -583,11 +589,14 @@ public final class Exporter {
                 all.add(f);
             }
         }
-        // (every instruction of the program is read: in parallel)
-        Set<Long> foundC = java.util.concurrent.ConcurrentHashMap.newKeySet();
-        Set<Long> candC = java.util.concurrent.ConcurrentHashMap.newKeySet();
-        all.parallelStream().forEach(f -> {
+        // (one pass over the program's instructions: functions with an
+        // interrupt return are candidates)
+        Set<Long> foundC = new HashSet<>();
+        Set<Long> candC = new HashSet<>();
+        Set<Long> all0 = new HashSet<>();
+        for (Function f : all) {
             long entry = f.getEntryPoint().getOffset();
+            all0.add(entry);
             boolean tagged = false;
             for (FunctionTag t : f.getTags()) {
                 if (t.getName().toUpperCase().equals("INTERRUPT")) {
@@ -596,15 +605,20 @@ public final class Exporter {
             }
             if (tagged || (eps.contains(entry) && isVectorAddress(entry))) {
                 foundC.add(entry);
-                return;
             }
-            for (Instruction ins : listing.getInstructions(f.getBody(), true)) {
-                if (IRQ_RETURN.matcher(ins.getMnemonicString()).matches()) {
-                    candC.add(entry);
-                    break;
+        }
+        for (Instruction ins : listing.getInstructions(true)) {
+            if (IRQ_RETURN.matcher(ins.getMnemonicString()).matches()) {
+                Iterator<Function> fs = fm.getFunctionsOverlapping(new AddressSet(ins.getAddress()));
+                while (fs.hasNext()) {
+                    Function f = fs.next();
+                    long entry = f.getEntryPoint().getOffset();
+                    if (all0.contains(entry) && !foundC.contains(entry)) {
+                        candC.add(entry);
+                    }
                 }
             }
-        });
+        }
         found.addAll(foundC);
         candidates.addAll(candC);
         boolean changed = true;
@@ -879,15 +893,23 @@ public final class Exporter {
         return decOpts;
     }
 
-    /** (decompiler start-up isn't thread-safe in Ghidra: concurrent openProgram calls can fail) */
-    private static final Object DECOMPILER_START = new Object();
+    /** The first decompiler start runs alone (it initializes the program's lazily built state). */
+    private final Object firstStart = new Object();
+    private volatile boolean started;
 
     DecompInterface decompiler() {
         long t0 = System.nanoTime();
         try {
-            synchronized (DECOMPILER_START) {
-                return newDecompiler();
+            if (!started) {
+                synchronized (firstStart) {
+                    if (!started) {
+                        DecompInterface ifc = newDecompiler();
+                        started = true;
+                        return ifc;
+                    }
+                }
             }
+            return newDecompiler();
         }
         finally {
             addWorkerTime("decompiler start", t0);
@@ -1015,7 +1037,7 @@ public final class Exporter {
                 // Functions in flight: enough to keep the workers busy past a slow
                 // one, bounded by their code size (their decompilation and
                 // per-instruction states are held until exported in order).
-                int ahead = Integer.getInteger("dwarfexport.window", 16) * n;
+                int ahead = Integer.getInteger("dwarfexport.window", 256) * n;
                 // (about 4 KB of heap per code byte in flight: 1/4096 of the heap)
                 long budget = Long.getLong("dwarfexport.inflight", Math.max(64 * 1024, Runtime.getRuntime().maxMemory() / 4096));
                 long[] inflight = {0};
