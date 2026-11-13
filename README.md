@@ -548,6 +548,19 @@ Recommended, if the machine has the memory: a maximum heap of 8 GB or more.
 * `pyghidraRun` (which the Java script doesn't need) takes JVM flags from
   `PYGHIDRA_JAVA_OPTIONS`, e.g. `PYGHIDRA_JAVA_OPTIONS=-Xmx8G`.
 
+**Ghidra settings.** None of Ghidra's own options speeds up the export
+noticeably. The decompiler's *Cache Size (Functions)* only applies to the
+Decompiler window, and the program database's buffer cache (a fixed 4 MB)
+hits 99.95% of the time during a glibc export (512 MB made no difference).
+In the GUI, the export uses the CodeBrowser's decompiler limits (*Edit → Tool
+Options → Decompiler*: *Max Instructions per Function*, default 100,000;
+*Decompiler Max-Payload (MBytes)*, default 50; *Max Entries per Jumptable*,
+default 1024). A function over them isn't decompiled (or its switch isn't
+recovered), so for very large functions raise them there; headless runs use
+the defaults. The per-function timeout is the `decompile_timeout` option, not
+the tool's. Don't run auto-analysis or another export on the same program
+at the same time: they compete for the program's database.
+
 More decompiler threads than cores is slower (glibc: 15 threads 14.6 s, 24
 threads 16.4 s on 16 cores); fewer is slower too (8 threads: 20 s).
 
